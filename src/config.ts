@@ -201,7 +201,7 @@ export function loadConfig(argv = process.argv.slice(2)): LeastConfig {
   const toolModeArg = typeof args["tool-mode"] === "string" ? args["tool-mode"] : undefined;
   const widgetDomainArg = typeof args["widget-domain"] === "string" ? args["widget-domain"] : undefined;
   const extraBlockedGlobs = splitList(process.env.LEAST_BLOCKED_GLOBS, ",");
-  const host = hostArg ?? process.env.HOST ?? process.env.LEAST_HOST ?? "127.0.0.1";
+  const host = hostArg ?? process.env.LEAST_HOST ?? process.env.HOST ?? "127.0.0.1";
   const authToken = process.env.LEAST_HTTP_TOKEN;
   const allowNoToken = boolFrom(process.env.LEAST_ALLOW_NO_HTTP_TOKEN, false);
   const requireHttpToken =
@@ -213,7 +213,7 @@ export function loadConfig(argv = process.argv.slice(2)): LeastConfig {
     defaultRoot,
     allowedRoots,
     host,
-    port: numberFrom(portArg ?? process.env.PORT ?? process.env.LEAST_PORT, 8787, 1, 65535),
+    port: numberFrom(portArg ?? process.env.LEAST_PORT ?? process.env.PORT, 8787, 1, 65535),
     widgetDomain: widgetDomainFrom(widgetDomainArg ?? process.env.LEAST_WIDGET_DOMAIN),
     authToken,
     requireHttpToken,

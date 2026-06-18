@@ -56,7 +56,7 @@ Options:
                              minimal = open/read/write/edit/bash/show_changes only.
                              full = expose every compatibility and advanced tool.
   --widget-domain <origin>   Dedicated HTTPS origin for ChatGPT widget iframes.
-                             Required for app submission. Default: https://Zykairotis.github.io.
+                             Required for app submission. Default: https://Zykairotis.github.io
   --tunnel <none|cloudflare|cloudflare-named|ngrok>
                              Expose local MCP. Default: cloudflare.
                              cloudflare = quick tunnel with a new URL each restart.

@@ -6,7 +6,7 @@ export const toolCardWidgetHtml = String.raw`
   <article class="card pending">
     <div class="rail"></div>
     <header class="head">
-      <span class="glyph">C</span>
+      <span class="glyph">L</span>
       <div class="headline">
         <div class="title">Least</div>
         <div class="subtitle">Waiting for tool result...</div>
@@ -475,7 +475,7 @@ export const toolCardWidgetHtml = String.raw`
     if (tool === "bash") return "$";
     if (tool === "search") return "S";
     if (tool === "read") return "R";
-    return "C";
+    return "L";
   }
 
   function subtitleFor(data) {
@@ -722,7 +722,7 @@ export const toolCardWidgetHtml = String.raw`
       '<article class="card pending">',
       '<div class="rail"></div>',
       '<header class="head">',
-      '<span class="glyph">C</span>',
+      '<span class="glyph">L</span>',
       '<div class="headline"><div class="title">Least</div><div class="subtitle">Waiting for tool result...</div></div>',
       '<span class="pill info">waiting</span>',
       '</header>',
