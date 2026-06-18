@@ -1,6 +1,6 @@
 # AGENTS.md example
 
-This repo is connected through CodexPro.
+This repo is connected through Least.
 
 Rules for ChatGPT or another planning model:
 

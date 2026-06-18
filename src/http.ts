@@ -5,8 +5,8 @@ import express from "express";
 import cors from "cors";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { loadConfig, type CodexProConfig } from "./config.js";
-import { createCodexProServer } from "./server.js";
+import { loadConfig, type LeastConfig } from "./config.js";
+import { createLeastServer } from "./server.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -16,7 +16,7 @@ function escapeHtml(value: unknown): string {
     .replaceAll('"', "&quot;");
 }
 
-function onboardingPage(config: CodexProConfig): string {
+function onboardingPage(config: LeastConfig): string {
   const localMcp = `http://${config.host}:${config.port}/mcp`;
   const allowedRoots = config.allowedRoots.map((root) => `<li>${escapeHtml(root)}</li>`).join("");
   const authLabel = config.authToken ? "Token protected" : "Disabled";
@@ -26,7 +26,7 @@ function onboardingPage(config: CodexProConfig): string {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CodexPro Local Setup</title>
+  <title>Least Local Setup</title>
   <style>
     :root {
       color-scheme: dark;
@@ -204,7 +204,7 @@ function onboardingPage(config: CodexProConfig): string {
 <body>
   <main>
     <section class="hero">
-      <div class="brand"><span class="logo">C</span><span>CodexPro local bridge</span></div>
+      <div class="brand"><span class="logo">C</span><span>Least local bridge</span></div>
       <h1>Local server is ready.</h1>
       <p class="lead">Use the Server URL copied by the terminal in ChatGPT Developer Mode. Keep the terminal running while ChatGPT edits, searches, or runs commands in this workspace.</p>
     </section>
@@ -214,9 +214,9 @@ function onboardingPage(config: CodexProConfig): string {
         <ol class="steps">
           <li><span class="num">1</span><span>Open ChatGPT settings, Apps, then Create app.</span></li>
           <li><span class="num">2</span><span>Set Connection to <code>Server URL</code>.</span></li>
-          <li><span class="num">3</span><span>Paste the copied CodexPro URL into the Server URL field.</span></li>
+          <li><span class="num">3</span><span>Paste the copied Least URL into the Server URL field.</span></li>
           <li><span class="num">4</span><span>Use <code>No Authentication / None</code>. The private token is already inside the copied URL.</span></li>
-          <li><span class="num">5</span><span>Start with: <code>Use CodexPro as a coding agent. Call server_config, then open_current_workspace.</code></span></li>
+          <li><span class="num">5</span><span>Start with: <code>Use Least as a coding agent. Call server_config, then open_current_workspace.</code></span></li>
         </ol>
       </article>
       <article class="card">
@@ -235,7 +235,7 @@ function onboardingPage(config: CodexProConfig): string {
     <section class="card" style="margin-top:18px">
       <h2>Allowed roots</h2>
       <ul class="roots">${allowedRoots}</ul>
-      <p class="footer">This page does not print the CodexPro token. Use the terminal control panel to copy the full Server URL again.</p>
+      <p class="footer">This page does not print the Least token. Use the terminal control panel to copy the full Server URL again.</p>
     </section>
   </main>
 </body>
@@ -246,14 +246,14 @@ async function main(): Promise<void> {
   const config = loadConfig();
   if (config.requireHttpToken && !config.authToken) {
     throw new Error(
-      "CODEXPRO_HTTP_TOKEN is required for this HTTP binding. " +
-        "Set CODEXPRO_HTTP_TOKEN, use `codexpro start` to generate one, " +
-        "or set CODEXPRO_ALLOW_NO_HTTP_TOKEN=1 only for a trusted local-only setup."
+      "LEAST_HTTP_TOKEN is required for this HTTP binding. " +
+        "Set LEAST_HTTP_TOKEN, use `least start` to generate one, " +
+        "or set LEAST_ALLOW_NO_HTTP_TOKEN=1 only for a trusted local-only setup."
     );
   }
 
   const app = express();
-  const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
+  const logRequests = process.env.LEAST_LOG_REQUESTS === "1";
 
   function tokenMatches(value: unknown): boolean {
     if (!config.authToken || typeof value !== "string") return false;
@@ -269,7 +269,7 @@ async function main(): Promise<void> {
     }
     const started = Date.now();
     res.on("finish", () => {
-      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
+      console.error(`[Least] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
     });
     next();
   });
@@ -282,8 +282,8 @@ async function main(): Promise<void> {
     const bearer = req.headers.authorization?.startsWith("Bearer ")
       ? req.headers.authorization.slice("Bearer ".length)
       : undefined;
-    const queryToken = typeof req.query.codexpro_token === "string"
-      ? req.query.codexpro_token
+    const queryToken = typeof req.query.least_token === "string"
+      ? req.query.least_token
       : typeof req.query.token === "string"
         ? req.query.token
         : undefined;
@@ -347,7 +347,7 @@ async function main(): Promise<void> {
   app.get("/healthz", (_req, res) => {
     res.json({
       ok: true,
-      name: "CodexPro",
+      name: "Least",
       defaultRoot: config.defaultRoot,
       allowedRoots: config.allowedRoots,
       bashMode: config.bashMode,
@@ -387,7 +387,7 @@ async function main(): Promise<void> {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createCodexProServer(config);
+        const server = createLeastServer(config);
         await server.connect(transport);
       } else {
         res.status(400).json({
@@ -425,12 +425,12 @@ async function main(): Promise<void> {
   app.delete("/mcp", handleSessionRequest);
 
   app.listen(config.port, config.host, () => {
-    console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
-    console.error(`[CodexPro] defaultRoot=${config.defaultRoot}`);
-    console.error(`[CodexPro] allowedRoots=${config.allowedRoots.join(", ")}`);
-    console.error(`[CodexPro] bashMode=${config.bashMode}`);
-    console.error(`[CodexPro] writeMode=${config.writeMode}`);
-    console.error(`[CodexPro] widgetDomain=${config.widgetDomain}`);
+    console.error(`[Least] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
+    console.error(`[Least] defaultRoot=${config.defaultRoot}`);
+    console.error(`[Least] allowedRoots=${config.allowedRoots.join(", ")}`);
+    console.error(`[Least] bashMode=${config.bashMode}`);
+    console.error(`[Least] writeMode=${config.writeMode}`);
+    console.error(`[Least] widgetDomain=${config.widgetDomain}`);
   });
 }
 

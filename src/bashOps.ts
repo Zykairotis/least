@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type { CodexProConfig } from "./config.js";
+import type { LeastConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
-import { CodexProError, PathGuard } from "./guard.js";
+import { LeastError, PathGuard } from "./guard.js";
 import { redactSensitiveText } from "./redact.js";
 
 export interface BashResult {
@@ -127,33 +127,47 @@ function isAllowedPackageScript(command: string): boolean {
   return packageScriptPattern.test(command);
 }
 
-function assertSafeCommand(config: CodexProConfig, command: string): void {
+function assertSafeCommand(config: LeastConfig, command: string): void {
   if (config.bashMode === "off") {
-    throw new CodexProError("bash tool is disabled. Start with CODEXPRO_BASH_MODE=safe or CODEXPRO_BASH_MODE=full to enable it.");
+    throw new LeastError("bash tool is disabled. Start with LEAST_BASH_MODE=safe or LEAST_BASH_MODE=full to enable it.");
   }
   if (config.bashMode === "full") return;
 
   const normalized = compact(command);
   for (const pattern of SAFE_BLOCKED_PATTERNS) {
     if (pattern.test(normalized)) {
-      throw new CodexProError(
-        `Command is blocked in CODEXPRO_BASH_MODE=safe: ${normalized}\n` +
-          "Use separate read/search/git tools, or restart with CODEXPRO_BASH_MODE=full only for trusted repos."
+      throw new LeastError(
+        `Command is blocked in LEAST_BASH_MODE=safe: ${normalized}\n` +
+          "Use separate read/search/git tools, or restart with LEAST_BASH_MODE=full only for trusted repos."
       );
     }
   }
   if (!startsWithAllowedPrefix(normalized)) {
-    throw new CodexProError(
+    throw new LeastError(
       `Command is not in the safe bash allowlist: ${normalized}\n` +
         "Allowed examples: ls, find, git status, git diff, npm test, npm run typecheck, npm run build:clients, pytest, go test, cargo test. Use read/search tools for file contents. " +
-        "Use CODEXPRO_BASH_MODE=full for trusted local automation."
+        "Use LEAST_BASH_MODE=full for trusted local automation."
     );
   }
 }
 
-function makeEnv(config: CodexProConfig): NodeJS.ProcessEnv {
+function makeEnv(config: LeastConfig): NodeJS.ProcessEnv {
   if (config.inheritEnv) {
     return { ...process.env, NO_COLOR: "1", CI: process.env.CI ?? "1" };
+  }
+  if (process.platform === "win32") {
+    return {
+      PATH: process.env.PATH ?? "",
+      HOME: process.env.HOME ?? process.env.USERPROFILE ?? "",
+      USERPROFILE: process.env.USERPROFILE ?? "",
+      SystemRoot: process.env.SystemRoot ?? "",
+      ComSpec: process.env.ComSpec ?? "cmd.exe",
+      PATHEXT: process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD",
+      TEMP: process.env.TEMP ?? process.env.TMP ?? "",
+      TMP: process.env.TMP ?? process.env.TEMP ?? "",
+      NO_COLOR: "1",
+      CI: "1"
+    };
   }
   return {
     PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
@@ -167,8 +181,11 @@ function makeEnv(config: CodexProConfig): NodeJS.ProcessEnv {
   };
 }
 
-function bashExecutable(): string {
-  return fs.existsSync("/bin/bash") ? "/bin/bash" : "bash";
+function shellSpec(): { command: string; args: string[] } {
+  if (process.platform === "win32") {
+    return { command: process.env.ComSpec ?? "cmd.exe", args: ["/d", "/s", "/c"] };
+  }
+  return { command: fs.existsSync("/bin/bash") ? "/bin/bash" : "bash", args: ["-lc"] };
 }
 
 function trimOutput(value: string, maxBytes: number): { value: string; truncated: boolean } {
@@ -179,13 +196,13 @@ function trimOutput(value: string, maxBytes: number): { value: string; truncated
 }
 
 export async function runBash(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   command: string,
   options: { cwd?: string; timeoutMs?: number } = {}
 ): Promise<BashResult> {
-  if (!command?.trim()) throw new CodexProError("command is required.");
+  if (!command?.trim()) throw new LeastError("command is required.");
   assertSafeCommand(config, command);
   const cwdResolved = guard.resolve(workspace, options.cwd ?? ".");
   const cwd = cwdResolved.absPath;
@@ -193,7 +210,8 @@ export async function runBash(
   const start = Date.now();
 
   return new Promise((resolve, reject) => {
-    const child = spawn(bashExecutable(), ["-lc", command], {
+    const shell = shellSpec();
+    const child = spawn(shell.command, [...shell.args, command], {
       cwd,
       env: makeEnv(config),
       stdio: ["ignore", "pipe", "pipe"]
@@ -224,7 +242,7 @@ export async function runBash(
     child.on("close", (exitCode, signal) => {
       clearTimeout(timer);
       if (killedByTimeout) {
-        stderr += `\n[codexpro] Command timed out after ${timeoutMs} ms.`;
+        stderr += `\n[least] Command timed out after ${timeoutMs} ms.`;
       }
       const out = trimOutput(redactSensitiveText(stdout), config.maxOutputBytes);
       const err = trimOutput(redactSensitiveText(stderr), config.maxOutputBytes);

@@ -1,4 +1,4 @@
-export const TOOL_CARD_URI = "ui://widget/codexpro-tool-card-v8.html";
+export const TOOL_CARD_URI = "ui://widget/least-tool-card-v8.html";
 export const TOOL_CARD_MIME_TYPE = "text/html;profile=mcp-app";
 
 export const toolCardWidgetHtml = String.raw`
@@ -8,7 +8,7 @@ export const toolCardWidgetHtml = String.raw`
     <header class="head">
       <span class="glyph">C</span>
       <div class="headline">
-        <div class="title">CodexPro</div>
+        <div class="title">Least</div>
         <div class="subtitle">Waiting for tool result...</div>
       </div>
       <span class="pill info">waiting</span>
@@ -389,13 +389,13 @@ export const toolCardWidgetHtml = String.raw`
     max-width: 78%;
     border-radius: 999px;
     background: linear-gradient(90deg, rgba(148, 163, 184, 0.12), rgba(148, 163, 184, 0.22), rgba(148, 163, 184, 0.12));
-    animation: codexpro-sheen 1.55s ease-in-out infinite;
+    animation: least-sheen 1.55s ease-in-out infinite;
   }
 
   .skeleton span:nth-child(2) { max-width: 52%; animation-delay: 0.12s; }
   .skeleton span:nth-child(3) { max-width: 66%; animation-delay: 0.24s; }
 
-  @keyframes codexpro-sheen {
+  @keyframes least-sheen {
     0%, 100% { opacity: 0.46; transform: translateX(0); }
     50% { opacity: 1; transform: translateX(2px); }
   }
@@ -460,7 +460,7 @@ export const toolCardWidgetHtml = String.raw`
       search: "Search",
       read: "Read file"
     };
-    return titles[tool] || "CodexPro";
+    return titles[tool] || "Least";
   }
 
   function iconFor(tool) {
@@ -479,16 +479,16 @@ export const toolCardWidgetHtml = String.raw`
   }
 
   function subtitleFor(data) {
-    if (data?.codexpro_tool === "open_current_workspace" || data?.codexpro_tool === "open_workspace") {
+    if (data?.least_tool === "open_current_workspace" || data?.least_tool === "open_workspace") {
       return data?.root || "Workspace opened";
     }
-    if (data?.codexpro_tool === "show_changes") {
+    if (data?.least_tool === "show_changes") {
       if (data?.status_error || data?.diff_error) return "Git state unavailable";
       const count = Array.isArray(data?.changed_files) ? data.changed_files.length : 0;
       if (!count && !data?.changed) return "Workspace is clean";
       return count === 1 ? "1 changed file" : count + " changed files";
     }
-    if (data?.codexpro_tool === "handoff_to_agent" && data?.agent_name) return data.agent_name;
+    if (data?.least_tool === "handoff_to_agent" && data?.agent_name) return data.agent_name;
     if (data?.path) return data.path;
     if (data?.plan_path) return data.plan_path;
     if (data?.root) return data.root;
@@ -501,7 +501,7 @@ export const toolCardWidgetHtml = String.raw`
   }
 
   function header(data, pills) {
-    const tool = data?.codexpro_tool;
+    const tool = data?.least_tool;
     return [
       '<div class="rail"></div>',
       '<header class="head">',
@@ -703,7 +703,7 @@ export const toolCardWidgetHtml = String.raw`
   }
 
   function renderGeneric(data) {
-    const keys = Object.keys(data || {}).filter((key) => !key.startsWith("codexpro_"));
+    const keys = Object.keys(data || {}).filter((key) => !key.startsWith("least_"));
     const metrics = keys.slice(0, 3).map((key) => metric(key, typeof data[key] === "object" ? JSON.stringify(data[key]) : data[key])).join("");
     return '<article class="card">' + header(data, pill("structured", "info")) +
       '<div class="body">' + (metrics ? '<div class="metrics">' + metrics + '</div>' : '') +
@@ -714,7 +714,7 @@ export const toolCardWidgetHtml = String.raw`
   function isPlaceholderPayload(data) {
     if (!data || typeof data !== "object") return true;
     const keys = Object.keys(data);
-    return !keys.length || (keys.length === 1 && data.codexpro_tool === "codexpro");
+    return !keys.length || (keys.length === 1 && data.least_tool === "least");
   }
 
   function renderPending() {
@@ -723,7 +723,7 @@ export const toolCardWidgetHtml = String.raw`
       '<div class="rail"></div>',
       '<header class="head">',
       '<span class="glyph">C</span>',
-      '<div class="headline"><div class="title">CodexPro</div><div class="subtitle">Waiting for tool result...</div></div>',
+      '<div class="headline"><div class="title">Least</div><div class="subtitle">Waiting for tool result...</div></div>',
       '<span class="pill info">waiting</span>',
       '</header>',
       '<div class="skeleton"><span></span><span></span><span></span></div>',
@@ -736,7 +736,7 @@ export const toolCardWidgetHtml = String.raw`
       renderPending();
       return;
     }
-    const tool = data.codexpro_tool;
+    const tool = data.least_tool;
     if (tool === "open_current_workspace" || tool === "open_workspace") {
       root.innerHTML = renderWorkspace(data);
     } else if (tool === "show_changes") {

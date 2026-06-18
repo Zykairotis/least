@@ -59,7 +59,7 @@ class McpStdioClient {
   }
 }
 
-const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-smoke-'));
+const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'least-smoke-'));
 await fs.writeFile(path.join(tmp, 'demo.txt'), 'alpha\nread\nread\nomega\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'config.txt'), 'OPENAI_API_KEY=sk-realSecretValue123\n', 'utf8');
 await fs.writeFile(path.join(tmp, 'AGENTS.md'), '# Smoke Agents\n\n- Preserve demo.txt.\n', 'utf8');
@@ -88,7 +88,7 @@ await fs.writeFile(path.join(tmp, 'package.json'), JSON.stringify({
     'build:clients': "node -e \"console.log('clients ok')\""
   }
 }, null, 2), 'utf8');
-const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-outside-'));
+const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'least-outside-'));
 await fs.writeFile(path.join(outside, 'secret.txt'), 'do-not-read', 'utf8');
 let symlinkEscapePath = 'secret-link.txt';
 try {
@@ -111,21 +111,21 @@ if (commitResult.status !== 0) {
 
 const client = new McpStdioClient('node', ['dist/stdio.js', '--root', tmp, '--allow-root', tmp, '--bash', 'safe', '--tool-mode', 'full'], {
   cwd: path.resolve('.'),
-  env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test' }
+  env: { ...process.env, LEAST_ROOT: tmp, LEAST_ALLOWED_ROOTS: tmp, LEAST_WIDGET_DOMAIN: 'https://widgets.least.test' }
 });
 
 await client.request('initialize', {
   protocolVersion: '2024-11-05',
   capabilities: {},
-  clientInfo: { name: 'codexpro-smoke', version: '0.1.0' }
+  clientInfo: { name: 'least-smoke', version: '0.1.0' }
 });
 client.notify('notifications/initialized');
 const tools = await client.request('tools/list', {});
 const toolNames = tools.tools.map((tool) => tool.name);
-for (const expected of ['server_config', 'codexpro_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'tree', 'search', 'load_skill', 'read', 'write', 'edit', 'bash', 'show_changes', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
+for (const expected of ['server_config', 'least_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'tree', 'search', 'load_skill', 'read', 'write', 'edit', 'bash', 'show_changes', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
   if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
 }
-const toolCardUri = 'ui://widget/codexpro-tool-card-v8.html';
+const toolCardUri = 'ui://widget/least-tool-card-v8.html';
 const toolsByName = new Map(tools.tools.map((tool) => [tool.name, tool]));
 function hasWidgetMeta(name) {
   const meta = toolsByName.get(name)?._meta ?? {};
@@ -142,9 +142,9 @@ async function expectToolError(name, args, pattern) {
   }
 }
 for (const visualTool of ['open_current_workspace', 'open_workspace', 'write', 'edit', 'show_changes', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex']) {
-  if (!hasWidgetMeta(visualTool)) throw new Error(`${visualTool} should render the CodexPro widget`);
+  if (!hasWidgetMeta(visualTool)) throw new Error(`${visualTool} should render the Least widget`);
 }
-for (const quietTool of ['server_config', 'codexpro_inventory', 'list_workspaces', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'read', 'bash', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
+for (const quietTool of ['server_config', 'least_inventory', 'list_workspaces', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'read', 'bash', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
   if (hasWidgetMeta(quietTool)) throw new Error(`${quietTool} should stay data-only without widget metadata`);
 }
 const resources = await client.request('resources/list', {});
@@ -160,13 +160,13 @@ if (!widgetText.includes('Waiting for tool result') || !widgetText.includes('ren
 if (!widgetMeta.ui?.csp || !widgetMeta['openai/widgetCSP']) {
   throw new Error('tool-card widget resource did not expose standard and ChatGPT CSP metadata');
 }
-if (widgetMeta.ui?.domain !== 'https://widgets.codexpro.test' || widgetMeta['openai/widgetDomain'] !== 'https://widgets.codexpro.test') {
+if (widgetMeta.ui?.domain !== 'https://widgets.least.test' || widgetMeta['openai/widgetDomain'] !== 'https://widgets.least.test') {
   throw new Error('tool-card widget resource did not expose standard and ChatGPT widget domain metadata');
 }
 const current = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
 const realTmp = await fs.realpath(tmp);
 if (current.structuredContent.root !== realTmp) throw new Error(`open_current_workspace opened ${current.structuredContent.root}, expected ${realTmp}`);
-if (current.structuredContent.codexpro_tool !== 'open_current_workspace') throw new Error('tool result was not tagged for widget rendering');
+if (current.structuredContent.least_tool !== 'open_current_workspace') throw new Error('tool result was not tagged for widget rendering');
 if (current.structuredContent.tool_mode !== 'full') throw new Error(`open_current_workspace did not expose tool_mode: ${current.structuredContent.tool_mode}`);
 if (!current.structuredContent.skill_inventory?.some?.((skill) => skill.name === 'smoke-skill')) {
   throw new Error('open_current_workspace did not discover workspace skill inventory');
@@ -184,8 +184,8 @@ if (loadedSkill.structuredContent.skill?.name !== 'smoke-skill' || !loadedSkill.
   throw new Error('load_skill did not return bounded SKILL.md content for smoke-skill');
 }
 await expectToolError('load_skill', { name: 'missing-skill' }, /Skill not found/);
-const inventory = await client.request('tools/call', { name: 'codexpro_inventory', arguments: { include_global_skills: false, include_mcp_servers: false } });
-if (inventory.structuredContent.codexpro_tool !== 'codexpro_inventory') throw new Error('inventory result was not tagged for widget rendering');
+const inventory = await client.request('tools/call', { name: 'least_inventory', arguments: { include_global_skills: false, include_mcp_servers: false } });
+if (inventory.structuredContent.least_tool !== 'least_inventory') throw new Error('inventory result was not tagged for widget rendering');
 const opened = await client.request('tools/call', { name: 'open_workspace', arguments: { root: tmp, include_tree: true } });
 const ws = opened.structuredContent.workspace_id;
 const openedByPath = await client.request('tools/call', { name: 'open_workspace', arguments: { path: tmp, include_tree: false } });
@@ -298,12 +298,12 @@ async function assertToolMode(mode, expected, hidden) {
   if (mode) args.push('--tool-mode', mode);
   const modeClient = new McpStdioClient('node', args, {
     cwd: path.resolve('.'),
-    env: { ...process.env, CODEXPRO_ROOT: tmp, CODEXPRO_ALLOWED_ROOTS: tmp, CODEXPRO_TOOL_MODE: '' }
+    env: { ...process.env, LEAST_ROOT: tmp, LEAST_ALLOWED_ROOTS: tmp, LEAST_TOOL_MODE: '' }
   });
   await modeClient.request('initialize', {
     protocolVersion: '2024-11-05',
     capabilities: {},
-    clientInfo: { name: `codexpro-${mode || 'default'}-smoke`, version: '0.1.0' }
+    clientInfo: { name: `least-${mode || 'default'}-smoke`, version: '0.1.0' }
   });
   modeClient.notify('notifications/initialized');
   const modeTools = await modeClient.request('tools/list', {});
@@ -317,21 +317,21 @@ async function assertToolMode(mode, expected, hidden) {
   modeClient.close();
 }
 
-await assertToolMode('', ['server_config', 'open_current_workspace', 'open_workspace', 'tree', 'search', 'load_skill', 'read', 'write', 'edit', 'bash', 'show_changes', 'read_handoff', 'export_pro_context', 'handoff_to_agent'], ['codexpro_inventory', 'workspace_snapshot', 'git_status', 'git_diff', 'codex_context', 'handoff_to_codex']);
+await assertToolMode('', ['server_config', 'open_current_workspace', 'open_workspace', 'tree', 'search', 'load_skill', 'read', 'write', 'edit', 'bash', 'show_changes', 'read_handoff', 'export_pro_context', 'handoff_to_agent'], ['least_inventory', 'workspace_snapshot', 'git_status', 'git_diff', 'codex_context', 'handoff_to_codex']);
 await assertToolMode('minimal', ['server_config', 'open_current_workspace', 'open_workspace', 'read', 'write', 'edit', 'bash', 'show_changes'], ['tree', 'search', 'load_skill', 'read_handoff', 'export_pro_context', 'handoff_to_agent', 'codex_context']);
 
-const lowerAgentsRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-lower-agents-'));
+const lowerAgentsRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'least-lower-agents-'));
 await fs.writeFile(path.join(lowerAgentsRoot, 'agents.md'), '# Lowercase agents\n\n- Lowercase instruction file loaded.\n', 'utf8');
 await fs.mkdir(path.join(lowerAgentsRoot, 'src'));
 await fs.writeFile(path.join(lowerAgentsRoot, 'src', 'demo.ts'), 'export const demo = true;\n', 'utf8');
 const lowerClient = new McpStdioClient('node', ['dist/stdio.js', '--root', lowerAgentsRoot, '--allow-root', lowerAgentsRoot, '--tool-mode', 'full'], {
   cwd: path.resolve('.'),
-  env: { ...process.env, CODEXPRO_ROOT: lowerAgentsRoot, CODEXPRO_ALLOWED_ROOTS: lowerAgentsRoot }
+  env: { ...process.env, LEAST_ROOT: lowerAgentsRoot, LEAST_ALLOWED_ROOTS: lowerAgentsRoot }
 });
 await lowerClient.request('initialize', {
   protocolVersion: '2024-11-05',
   capabilities: {},
-  clientInfo: { name: 'codexpro-lower-agents-smoke', version: '0.1.0' }
+  clientInfo: { name: 'least-lower-agents-smoke', version: '0.1.0' }
 });
 lowerClient.notify('notifications/initialized');
 const lowerOpened = await lowerClient.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });

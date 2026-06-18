@@ -2,9 +2,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { minimatch } from "minimatch";
-import type { CodexProConfig } from "./config.js";
+import type { LeastConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
-import { CodexProError, PathGuard, normalizeRelPath } from "./guard.js";
+import { LeastError, PathGuard, normalizeRelPath } from "./guard.js";
 import { listFiles, readTextFile, repoTree, writeTextFile, ensureAiBridge } from "./fsOps.js";
 import { gitDiff, gitLog, gitStatus } from "./gitOps.js";
 import { readAiBridgeContext } from "./workspaceOps.js";
@@ -154,12 +154,12 @@ function appendSection(parts: string[], heading: string, body: string): void {
 }
 
 export async function buildProContext(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   options: ProContextOptions = {}
 ): Promise<ProContextResult> {
-  const title = options.title?.trim() || "CodexPro Context Bundle";
+  const title = options.title?.trim() || "Least Context Bundle";
   const maxDepth = clamp(options.maxDepth, 3, 1, 6);
   const maxFiles = clamp(options.maxFiles, 24, 1, 80);
   const maxFileBytes = clamp(options.maxFileBytes, Math.min(config.maxReadBytes, 60_000), 1_000, Math.min(config.maxReadBytes, 250_000));
@@ -201,7 +201,7 @@ export async function buildProContext(
       `Bash mode: ${config.bashMode}`,
       `Tool mode: ${config.toolMode}`,
       "",
-      "Purpose: paste this bundle into a high-context ChatGPT model when that model cannot call the CodexPro MCP tools directly.",
+      "Purpose: paste this bundle into a high-context ChatGPT model when that model cannot call the Least MCP tools directly.",
       "Instruction for ChatGPT: use this as repository context, produce a narrow Codex execution plan, and avoid inventing files or runtime facts not shown here."
     ].join("\n")
   );
@@ -292,7 +292,7 @@ export async function buildProContext(
 }
 
 export async function exportProContext(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   options: ProContextOptions = {}

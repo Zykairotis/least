@@ -5,13 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 
 function run(args, env) {
-  const result = spawnSync(process.execPath, ['scripts/codexpro.mjs', ...args], {
+  const result = spawnSync(process.execPath, ['scripts/least.mjs', ...args], {
     cwd: path.resolve('.'),
     env,
     encoding: 'utf8'
   });
   if (result.status !== 0) {
-    throw new Error(`codexpro ${args.join(' ')} failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    throw new Error(`Lst ${args.join(' ')} failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
   }
   return `${result.stdout}\n${result.stderr}`;
 }
@@ -22,10 +22,10 @@ async function readProfile(root, home) {
   return JSON.parse(await fs.readFile(path.join(home, 'profiles', `${id}.json`), 'utf8'));
 }
 
-const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-root-'));
-const reuseRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-reuse-'));
-const home = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-home-'));
-const env = { ...process.env, CODEXPRO_HOME: home };
+const root = await fs.mkdtemp(path.join(os.tmpdir(), 'least-settings-root-'));
+const reuseRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'least-settings-reuse-'));
+const home = await fs.mkdtemp(path.join(os.tmpdir(), 'least-settings-home-'));
+const env = { ...process.env, LEAST_HOME: home };
 
 const empty = run(['settings', 'show', '--root', root], env);
 if (!empty.includes('No saved settings')) {
@@ -40,7 +40,7 @@ const saved = run([
   '--tunnel',
   'ngrok',
   '--hostname',
-  'codexpro-test.ngrok-free.app',
+  'least-test.ngrok-free.app',
   '--port',
   '19087',
   '--mode',
@@ -48,30 +48,30 @@ const saved = run([
   '--tool-mode',
   'full',
   '--widget-domain',
-  'https://widgets.codexpro.test',
+  'https://widgets.least.test',
   '--token',
-  'codexpro-settings-token'
+  'least-settings-token'
 ], env);
 if (!saved.includes('Saved workspace settings')) {
   throw new Error(`expected settings save output, got:\n${saved}`);
 }
 
 const shown = run(['settings', 'show', '--root', root], env);
-for (const expected of ['Tunnel', 'ngrok', 'codexpro-test.ngrok-free.app', '19087', '<saved>']) {
+for (const expected of ['Tunnel', 'ngrok', 'least-test.ngrok-free.app', '19087', '<saved>']) {
   if (!shown.includes(expected)) {
     throw new Error(`settings show missing ${expected}\n${shown}`);
   }
 }
-if (shown.includes('codexpro-settings-token')) {
+if (shown.includes('least-settings-token')) {
   throw new Error(`settings show leaked token\n${shown}`);
 }
 const profile = await readProfile(root, home);
-if (profile.toolMode !== 'full' || profile.widgetDomain !== 'https://widgets.codexpro.test') {
+if (profile.toolMode !== 'full' || profile.widgetDomain !== 'https://widgets.least.test') {
   throw new Error(`settings profile did not persist tool/widget options: ${JSON.stringify(profile)}`);
 }
 
 const listed = run(['settings', 'list'], env);
-if (!listed.includes(root) || !listed.includes('codexpro-test.ngrok-free.app')) {
+if (!listed.includes(root) || !listed.includes('least-test.ngrok-free.app')) {
   throw new Error(`settings list missing saved profile\n${listed}`);
 }
 
@@ -81,7 +81,7 @@ if (!reused.includes('Saved workspace settings from')) {
 }
 
 const reusedShown = run(['settings', 'show', '--root', reuseRoot], env);
-for (const expected of ['ngrok', 'codexpro-test.ngrok-free.app', '<saved>']) {
+for (const expected of ['ngrok', 'least-test.ngrok-free.app', '<saved>']) {
   if (!reusedShown.includes(expected)) {
     throw new Error(`reused settings show missing ${expected}\n${reusedShown}`);
   }

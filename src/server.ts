@@ -2,15 +2,15 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { CodexProConfig } from "./config.js";
-import { WorkspaceManager, PathGuard, CodexProError, type Workspace } from "./guard.js";
+import type { LeastConfig } from "./config.js";
+import { WorkspaceManager, PathGuard, LeastError, type Workspace } from "./guard.js";
 import { repoTree, readTextFile, writeTextFile, editTextFile, ensureAiBridge } from "./fsOps.js";
 import { searchWorkspace } from "./searchOps.js";
 import { runBash } from "./bashOps.js";
 import { gitDiff, gitLog, gitStatus } from "./gitOps.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { exportProContext } from "./proContext.js";
-import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
+import { leastInventory, loadSkill } from "./capabilitiesOps.js";
 import { TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 
@@ -43,8 +43,8 @@ function tagToolResult(result: any, name: string, options: Record<string, unknow
       ? structured
       : {};
   result.structuredContent = {
-    codexpro_tool: name,
-    codexpro_title: options.title ?? name,
+    least_tool: name,
+    least_title: options.title ?? name,
     ...base
   };
   return result;
@@ -58,23 +58,23 @@ function toolCardMeta(): Record<string, unknown> {
 }
 
 function toolCallLoggingEnabled(): boolean {
-  return process.env.CODEXPRO_LOG_TOOL_CALLS === "1" || process.env.CODEXPRO_LOG_REQUESTS === "1";
+  return process.env.LEAST_LOG_TOOL_CALLS === "1" || process.env.LEAST_LOG_REQUESTS === "1";
 }
 
 function logToolCall(name: string, status: "ok" | "error", started: number): void {
   if (!toolCallLoggingEnabled()) return;
-  console.error(`[CodexProTool] ${name} ${status} ${Date.now() - started}ms`);
+  console.error(`[LeastTool] ${name} ${status} ${Date.now() - started}ms`);
 }
 
-function registerToolCardResource(server: McpServer, config: CodexProConfig): void {
+function registerToolCardResource(server: McpServer, config: LeastConfig): void {
   const s = server as any;
   if (typeof s.registerResource !== "function") return;
   s.registerResource(
-    "codexpro-tool-card",
+    "least-tool-card",
     TOOL_CARD_URI,
     {
-      title: "CodexPro Tool Card",
-      description: "Compact visual renderer for CodexPro workspace orientation, source changes, and handoffs.",
+      title: "Least Tool Card",
+      description: "Compact visual renderer for Least workspace orientation, source changes, and handoffs.",
       mimeType: TOOL_CARD_MIME_TYPE
     },
     async () => ({
@@ -92,7 +92,7 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
                 resourceDomains: []
               }
             },
-            "openai/widgetDescription": "Renders CodexPro workspace orientation, file diffs, change reviews, Pro context exports, and handoff plans as compact developer cards. Bash stays data-only.",
+            "openai/widgetDescription": "Renders Least workspace orientation, file diffs, change reviews, Pro context exports, and handoff plans as compact developer cards. Bash stays data-only.",
             "openai/widgetPrefersBorder": true,
             "openai/widgetDomain": config.widgetDomain,
             "openai/widgetCSP": {
@@ -107,22 +107,22 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
 }
 
 
-function isContextPath(config: CodexProConfig, relPath: string): boolean {
+function isContextPath(config: LeastConfig, relPath: string): boolean {
   const normalized = relPath.split(path.sep).join("/").replace(/^\.\//, "");
   const contextDir = config.contextDir.replace(/^\.\//, "").replace(/\/$/, "");
   return normalized === contextDir || normalized.startsWith(`${contextDir}/`);
 }
 
-function assertWriteToolAllowed(config: CodexProConfig, relPath: string): void {
+function assertWriteToolAllowed(config: LeastConfig, relPath: string): void {
   if (config.writeMode === "workspace") return;
   if (config.writeMode === "handoff" && isContextPath(config, relPath)) return;
   if (config.writeMode === "handoff") {
-    throw new CodexProError(
-      `Source writes are disabled because CODEXPRO_WRITE_MODE=handoff. ` +
+    throw new LeastError(
+      `Source writes are disabled because LEAST_WRITE_MODE=handoff. ` +
         `Use handoff_to_agent or handoff_to_codex, or write/edit only inside ${config.contextDir}/.`
     );
   }
-  throw new CodexProError("write/edit tools are disabled because CODEXPRO_WRITE_MODE=off. handoff_to_agent and handoff_to_codex are still available for planning.");
+  throw new LeastError("write/edit tools are disabled because LEAST_WRITE_MODE=off. handoff_to_agent and handoff_to_codex are still available for planning.");
 }
 
 function registerToolCompat(
@@ -189,14 +189,14 @@ const STANDARD_TOOLS = new Set([
   "handoff_to_agent"
 ]);
 
-function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
+function shouldRegisterTool(config: LeastConfig, name: string): boolean {
   if (config.toolMode === "full") return true;
   if (config.toolMode === "minimal") return MINIMAL_TOOLS.has(name);
   return STANDARD_TOOLS.has(name);
 }
 
 function registerCodexTool(
-  config: CodexProConfig,
+  config: LeastConfig,
   server: McpServer,
   name: string,
   options: Record<string, unknown>,
@@ -206,9 +206,9 @@ function registerCodexTool(
   registerToolCompat(server, name, options, handler);
 }
 
-function serverInstructions(config: CodexProConfig): string {
+function serverInstructions(config: LeastConfig): string {
   return [
-    "CodexPro connects ChatGPT to one local development workspace.",
+    "Least connects ChatGPT to one local development workspace.",
     "",
     "Preferred workflow:",
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different root or asks to switch folders.",
@@ -276,7 +276,7 @@ function cleanOneLine(value: unknown, fallback: string, maxLength = 120): string
 function normalizeAgentId(value: unknown): string {
   const agent = cleanOneLine(value, "custom", 64).toLowerCase();
   if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(agent)) {
-    throw new CodexProError("agent must use only lowercase letters, numbers, dots, underscores, or hyphens.");
+    throw new LeastError("agent must use only lowercase letters, numbers, dots, underscores, or hyphens.");
   }
   return agent;
 }
@@ -303,7 +303,7 @@ function agentCommandHint(agent: string, planPath: string, model?: string): stri
   return `Run your local implementation agent manually with ${planPath} as the task input.`;
 }
 
-async function readRawTextFileBounded(config: CodexProConfig, guard: PathGuard, workspace: Workspace, filePath: string): Promise<string> {
+async function readRawTextFileBounded(config: LeastConfig, guard: PathGuard, workspace: Workspace, filePath: string): Promise<string> {
   const resolved = guard.resolve(workspace, filePath);
   await guard.assertTextFile(resolved.absPath, config.maxReadBytes);
   return fsp.readFile(resolved.absPath, "utf8");
@@ -343,7 +343,7 @@ ${options.plan.trim()}
 }
 
 async function writeAgentHandoff(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   options: {
@@ -373,7 +373,7 @@ async function writeAgentHandoff(
   const agentName = displayAgentName(agent, options.agentName);
   const model = options.model ? cleanOneLine(options.model, "", 120) : undefined;
   const plan = String(options.plan ?? "").trim();
-  if (!plan) throw new CodexProError("plan must not be empty.");
+  if (!plan) throw new LeastError("plan must not be empty.");
   const planPath = `${config.contextDir}/current-plan.md`;
   const statusPath = `${config.contextDir}/agent-status.md`;
   const legacyCodexStatusPath = `${config.contextDir}/codex-status.md`;
@@ -447,7 +447,7 @@ const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, d
 
 const workspaceManagers = new Map<string, WorkspaceManager>();
 
-function workspaceManagerKey(config: CodexProConfig): string {
+function workspaceManagerKey(config: LeastConfig): string {
   return JSON.stringify({
     defaultRoot: config.defaultRoot,
     allowedRoots: [...config.allowedRoots].sort(),
@@ -455,7 +455,7 @@ function workspaceManagerKey(config: CodexProConfig): string {
   });
 }
 
-function getSharedWorkspaceManager(config: CodexProConfig): WorkspaceManager {
+function getSharedWorkspaceManager(config: LeastConfig): WorkspaceManager {
   const key = workspaceManagerKey(config);
   const existing = workspaceManagers.get(key);
   if (existing) return existing;
@@ -464,10 +464,10 @@ function getSharedWorkspaceManager(config: CodexProConfig): WorkspaceManager {
   return manager;
 }
 
-export function createCodexProServer(config: CodexProConfig): McpServer {
+export function createLeastServer(config: LeastConfig): McpServer {
   const workspaces = getSharedWorkspaceManager(config);
   const guard = new PathGuard(config);
-  const server = new McpServer({ name: "CodexPro", version: "0.28.4" }, { instructions: serverInstructions(config) });
+  const server = new McpServer({ name: "Least", version: "0.28.4" }, { instructions: serverInstructions(config) });
   registerToolCardResource(server, config);
 
   registerCodexTool(
@@ -476,12 +476,12 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     "server_config",
     {
       title: "Server Config",
-      description: "Show CodexPro server configuration, safety modes, limits, and blocked paths. Does not reveal auth tokens.",
+      description: "Show Least server configuration, safety modes, limits, and blocked paths. Does not reveal auth tokens.",
       inputSchema: {},
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
-        "openai/toolInvocation/invoking": "Reading CodexPro server config...",
-        "openai/toolInvocation/invoked": "CodexPro server config ready"
+        "openai/toolInvocation/invoking": "Reading Least server config...",
+        "openai/toolInvocation/invoked": "Least server config ready"
       }
     },
     async () => {
@@ -503,18 +503,18 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         maxSearchResults: config.maxSearchResults,
         blockedGlobs: config.blockedGlobs
       };
-      return textResult(`# CodexPro Server Config\n\n${JSON.stringify(safeConfig, null, 2)}`, safeConfig);
+      return textResult(`# Least Server Config\n\n${JSON.stringify(safeConfig, null, 2)}`, safeConfig);
     }
   );
 
   registerCodexTool(
     config,
     server,
-    "codexpro_inventory",
+    "least_inventory",
     {
-      title: "CodexPro Inventory",
+      title: "Least Inventory",
       description:
-        "List CodexPro modes plus discovered skill names and configured MCP server names. Use this early when planning needs local agent capabilities.",
+        "List Least modes plus discovered skill names and configured MCP server names. Use this early when planning needs local agent capabilities.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
         include_global_skills: z.boolean().optional().describe("Include user and plugin skill folders. Default: true."),
@@ -523,13 +523,13 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
-        "openai/toolInvocation/invoking": "Reading CodexPro inventory...",
-        "openai/toolInvocation/invoked": "CodexPro inventory ready"
+        "openai/toolInvocation/invoking": "Reading Least inventory...",
+        "openai/toolInvocation/invoked": "Least inventory ready"
       }
     },
     async (args) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const inventory = await codexproInventory(config, workspace, {
+      const inventory = await leastInventory(config, workspace, {
         includeGlobalSkills: parseBool(args.include_global_skills, true),
         includeMcpServers: parseBool(args.include_mcp_servers, true),
         maxSkills: limitInt(args.max_skills, 120, 1, 500)
@@ -556,7 +556,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         "Load the bounded SKILL.md body for a discovered workspace, user, or plugin skill by name. Does not accept arbitrary paths; use after open_current_workspace/open_workspace shows skill_inventory.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
-        name: z.string().describe("Exact skill name from skill_inventory or codexpro_inventory."),
+        name: z.string().describe("Exact skill name from skill_inventory or least_inventory."),
         source: z.enum(["workspace", "user", "plugin", "other"]).optional().describe("Optional source when multiple skills share a name."),
         path: z.string().optional().describe("Exact sanitized path from skill_inventory when name/source are still ambiguous."),
         include_global_skills: z.boolean().optional().describe("Also scan installed user/plugin skills. Default: true."),
@@ -597,12 +597,12 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     "list_workspaces",
     {
       title: "List Workspaces",
-      description: "List currently opened CodexPro workspaces for this MCP session.",
+      description: "List currently opened Least workspaces for this MCP session.",
       inputSchema: {},
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
-        "openai/toolInvocation/invoking": "Listing CodexPro workspaces...",
-        "openai/toolInvocation/invoked": "CodexPro workspaces listed"
+        "openai/toolInvocation/invoking": "Listing Least workspaces...",
+        "openai/toolInvocation/invoked": "Least workspaces listed"
       }
     },
     async () => {
@@ -631,8 +631,8 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       annotations: SESSION_READ_ANNOTATIONS,
       _meta: {
         ...toolCardMeta(),
-        "openai/toolInvocation/invoking": "Opening current CodexPro workspace...",
-        "openai/toolInvocation/invoked": "Current CodexPro workspace opened"
+        "openai/toolInvocation/invoking": "Opening current Least workspace...",
+        "openai/toolInvocation/invoked": "Current Least workspace opened"
       }
     },
     async (args) => {
@@ -668,9 +668,9 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Open Workspace",
       description:
-        "Open a local project directory as a CodexPro workspace. Returns a workspace_id plus git status, AGENTS.md, skills, and a compact file tree.",
+        "Open a local project directory as a Least workspace. Returns a workspace_id plus git status, AGENTS.md, skills, and a compact file tree.",
       inputSchema: {
-        root: z.string().optional().describe("Project directory to open. Omit to use CODEXPRO_ROOT/current working directory. Supports ~/ paths."),
+        root: z.string().optional().describe("Project directory to open. Omit to use LEAST_ROOT/current working directory. Supports ~/ paths."),
         path: z.string().optional().describe("Alias for root. Useful for clients that naturally send path instead of root."),
         include_tree: z.boolean().optional().describe("Include a compact file tree. Default: true."),
         max_depth: z.number().int().min(1).max(8).optional().describe("Tree depth. Default: 3."),
@@ -681,13 +681,13 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
       annotations: SESSION_READ_ANNOTATIONS,
       _meta: {
         ...toolCardMeta(),
-        "openai/toolInvocation/invoking": "Opening CodexPro workspace...",
-        "openai/toolInvocation/invoked": "CodexPro workspace opened"
+        "openai/toolInvocation/invoking": "Opening Least workspace...",
+        "openai/toolInvocation/invoked": "Least workspace opened"
       }
     },
     async (args) => {
       if (args.root && args.path && args.root !== args.path) {
-        throw new CodexProError("open_workspace accepts either root or path. If both are provided, they must match.");
+        throw new LeastError("open_workspace accepts either root or path. If both are provided, they must match.");
       }
       const workspace = workspaces.openWorkspace(args.root ?? args.path);
       const summary = await workspaceSummary(config, guard, workspace, {
@@ -1183,7 +1183,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         maxFileBytes: args.max_file_bytes,
         maxTotalBytes: args.max_total_bytes
       });
-      const text = `# Export Pro Context\n\nWrote ${result.path}.\nBytes: ${result.bytes}\nFiles included: ${result.filesIncluded.length}\nFiles skipped: ${result.filesSkipped.length}\nTruncated: ${result.truncated}\n\nPaste ${result.path} into a high-context planning model when MCP tools are unavailable, then save the returned plan with codexpro pro-apply.`;
+      const text = `# Export Pro Context\n\nWrote ${result.path}.\nBytes: ${result.bytes}\nFiles included: ${result.filesIncluded.length}\nFiles skipped: ${result.filesSkipped.length}\nTruncated: ${result.truncated}\n\nPaste ${result.path} into a high-context planning model when MCP tools are unavailable, then save the returned plan with least pro-apply.`;
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,

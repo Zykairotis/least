@@ -6,7 +6,7 @@ export type BashMode = "off" | "safe" | "full";
 export type WriteMode = "off" | "handoff" | "workspace";
 export type ToolMode = "minimal" | "standard" | "full";
 
-export interface CodexProConfig {
+export interface LeastConfig {
   defaultRoot: string;
   allowedRoots: string[];
   host: string;
@@ -151,18 +151,18 @@ function toolModeFrom(value: string | undefined): ToolMode {
 }
 
 function widgetDomainFrom(value: string | undefined): string {
-  const raw = value?.trim() || "https://rebel0789.github.io";
+  const raw = value?.trim() || "https://Zykairotis.github.io";
   let parsed: URL;
   try {
     parsed = new URL(raw);
   } catch {
-    throw new Error(`CODEXPRO_WIDGET_DOMAIN must be a valid origin URL, got: ${raw}`);
+    throw new Error(`LEAST_WIDGET_DOMAIN must be a valid origin URL, got: ${raw}`);
   }
   if (parsed.protocol !== "https:") {
-    throw new Error("CODEXPRO_WIDGET_DOMAIN must use https.");
+    throw new Error("LEAST_WIDGET_DOMAIN must use https.");
   }
   if (parsed.pathname !== "/" || parsed.search || parsed.hash) {
-    throw new Error("CODEXPRO_WIDGET_DOMAIN must be an origin only, for example https://widgets.example.com.");
+    throw new Error("LEAST_WIDGET_DOMAIN must be an origin only, for example https://widgets.example.com.");
   }
   return parsed.origin;
 }
@@ -176,11 +176,11 @@ function isLoopbackHost(host: string): boolean {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
 
-export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
+export function loadConfig(argv = process.argv.slice(2)): LeastConfig {
   const args = parseArgs(argv);
 
   const rootFromArgs = typeof args.root === "string" ? args.root : undefined;
-  const root = rootFromArgs ?? process.env.CODEXPRO_ROOT ?? process.env.CODEBASE_BRIDGE_REPO_ROOT ?? process.cwd();
+  const root = rootFromArgs ?? process.env.LEAST_ROOT ?? process.cwd();
   const defaultRoot = toRealDir(root);
 
   const allowRootArgs = Array.isArray(args["allow-root"])
@@ -188,12 +188,9 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     : typeof args["allow-root"] === "string"
       ? [args["allow-root"]]
       : [];
-  const envAllowedRoots = [
-    ...splitRoots(process.env.CODEXPRO_ALLOWED_ROOTS),
-    ...splitRoots(process.env.CODEBASE_BRIDGE_ALLOWED_ROOTS)
-  ];
+  const envAllowedRoots = splitRoots(process.env.LEAST_ALLOWED_ROOTS);
 
-  const allowHome = process.env.CODEXPRO_ALLOW_HOME === "1" || args["allow-home"] === true;
+  const allowHome = process.env.LEAST_ALLOW_HOME === "1" || args["allow-home"] === true;
   const requestedAllowed = [defaultRoot, ...allowRootArgs, ...envAllowedRoots, ...(allowHome ? [os.homedir()] : [])];
   const allowedRoots = [...new Set(requestedAllowed.map(toRealDir))];
 
@@ -203,34 +200,34 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
   const writeArg = typeof args.write === "string" ? args.write : undefined;
   const toolModeArg = typeof args["tool-mode"] === "string" ? args["tool-mode"] : undefined;
   const widgetDomainArg = typeof args["widget-domain"] === "string" ? args["widget-domain"] : undefined;
-  const extraBlockedGlobs = splitList(process.env.CODEXPRO_BLOCKED_GLOBS, ",");
-  const host = hostArg ?? process.env.HOST ?? process.env.CODEXPRO_HOST ?? "127.0.0.1";
-  const authToken = process.env.CODEXPRO_HTTP_TOKEN ?? process.env.CODEBASE_BRIDGE_HTTP_TOKEN;
-  const allowNoToken = boolFrom(process.env.CODEXPRO_ALLOW_NO_HTTP_TOKEN, false);
+  const extraBlockedGlobs = splitList(process.env.LEAST_BLOCKED_GLOBS, ",");
+  const host = hostArg ?? process.env.HOST ?? process.env.LEAST_HOST ?? "127.0.0.1";
+  const authToken = process.env.LEAST_HTTP_TOKEN;
+  const allowNoToken = boolFrom(process.env.LEAST_ALLOW_NO_HTTP_TOKEN, false);
   const requireHttpToken =
-    boolFrom(process.env.CODEXPRO_REQUIRE_HTTP_TOKEN, false) ||
-    boolFrom(process.env.CODEXPRO_TUNNEL_MODE, false) ||
+    boolFrom(process.env.LEAST_REQUIRE_HTTP_TOKEN, false) ||
+    boolFrom(process.env.LEAST_TUNNEL_MODE, false) ||
     (!isLoopbackHost(host) && !allowNoToken);
 
   return {
     defaultRoot,
     allowedRoots,
     host,
-    port: numberFrom(portArg ?? process.env.PORT ?? process.env.CODEXPRO_PORT, 8787, 1, 65535),
-    widgetDomain: widgetDomainFrom(widgetDomainArg ?? process.env.CODEXPRO_WIDGET_DOMAIN),
+    port: numberFrom(portArg ?? process.env.PORT ?? process.env.LEAST_PORT, 8787, 1, 65535),
+    widgetDomain: widgetDomainFrom(widgetDomainArg ?? process.env.LEAST_WIDGET_DOMAIN),
     authToken,
     requireHttpToken,
-    bashMode: bashModeFrom(bashArg ?? process.env.CODEXPRO_BASH_MODE),
-    writeMode: writeModeFrom(writeArg ?? process.env.CODEXPRO_WRITE_MODE),
-    toolMode: toolModeFrom(toolModeArg ?? process.env.CODEXPRO_TOOL_MODE),
-    inheritEnv: process.env.CODEXPRO_INHERIT_ENV === "1",
-    maxReadBytes: numberFrom(process.env.CODEXPRO_MAX_READ_BYTES, 180_000, 4_000, 2_000_000),
-    maxWriteBytes: numberFrom(process.env.CODEXPRO_MAX_WRITE_BYTES, 1_000_000, 1_000, 10_000_000),
-    maxOutputBytes: numberFrom(process.env.CODEXPRO_MAX_OUTPUT_BYTES, 120_000, 4_000, 2_000_000),
-    maxSearchResults: numberFrom(process.env.CODEXPRO_MAX_SEARCH_RESULTS, 200, 5, 2_000),
-    maxHttpSessions: numberFrom(process.env.CODEXPRO_MAX_HTTP_SESSIONS, 64, 1, 512),
-    httpSessionTtlMs: numberFrom(process.env.CODEXPRO_HTTP_SESSION_TTL_MS, 30 * 60_000, 60_000, 24 * 60 * 60_000),
+    bashMode: bashModeFrom(bashArg ?? process.env.LEAST_BASH_MODE),
+    writeMode: writeModeFrom(writeArg ?? process.env.LEAST_WRITE_MODE),
+    toolMode: toolModeFrom(toolModeArg ?? process.env.LEAST_TOOL_MODE),
+    inheritEnv: process.env.LEAST_INHERIT_ENV === "1",
+    maxReadBytes: numberFrom(process.env.LEAST_MAX_READ_BYTES, 180_000, 4_000, 2_000_000),
+    maxWriteBytes: numberFrom(process.env.LEAST_MAX_WRITE_BYTES, 1_000_000, 1_000, 10_000_000),
+    maxOutputBytes: numberFrom(process.env.LEAST_MAX_OUTPUT_BYTES, 120_000, 4_000, 2_000_000),
+    maxSearchResults: numberFrom(process.env.LEAST_MAX_SEARCH_RESULTS, 200, 5, 2_000),
+    maxHttpSessions: numberFrom(process.env.LEAST_MAX_HTTP_SESSIONS, 64, 1, 512),
+    httpSessionTtlMs: numberFrom(process.env.LEAST_HTTP_SESSION_TTL_MS, 30 * 60_000, 60_000, 24 * 60 * 60_000),
     blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...extraBlockedGlobs],
-    contextDir: process.env.CODEXPRO_CONTEXT_DIR ?? ".ai-bridge"
+    contextDir: process.env.LEAST_CONTEXT_DIR ?? ".ai-bridge"
   };
 }
