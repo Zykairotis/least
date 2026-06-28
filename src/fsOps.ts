@@ -2,11 +2,16 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
+import { createInterface } from "node:readline";
 import { minimatch } from "minimatch";
 import type { LeastConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { LeastError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
+import { recordFsTiming, recordGuardTiming, recordPartial } from "./perf.js";
 import { hasSecretValue, redactSensitiveText } from "./redact.js";
+import { ToolTimeoutError, throwIfAborted } from "./timeout.js";
+import { offloadedUnifiedDiff, shouldOffloadUnifiedDiff } from "./workerOps.js";
 
 export interface TreeOptions {
   path?: string;
@@ -26,10 +31,32 @@ export interface ReadFileResult {
   text: string;
   startLine: number;
   endLine: number;
-  totalLines: number;
+  totalLines?: number;
+  /** Returned model-visible bytes for the selected range. */
   bytes: number;
-  sha256: string;
+  /** Full on-disk file bytes. */
+  fileBytes?: number;
+  /** Alias for bytes — returned range bytes. */
+  returnedBytes?: number;
+  sha256?: string;
   truncated: boolean;
+  partial?: boolean;
+  timedOut?: boolean;
+}
+
+export interface ReadManyItem {
+  path: string;
+  startLine?: number;
+  endLine?: number;
+}
+
+export interface ReadManyResult {
+  text: string;
+  files: ReadFileResult[];
+  totalBytes: number;
+  truncated: boolean;
+  partial?: boolean;
+  timedOut?: boolean;
 }
 
 export interface DiffResult {
@@ -100,8 +127,137 @@ export function makeUnifiedDiff(oldText: string, newText: string, relPath: strin
   return { diff: redactSensitiveText(diff), additions, deletions, changed: true };
 }
 
+export async function makeUnifiedDiffMaybeOffloaded(oldText: string, newText: string, relPath: string, maxChars = 60_000): Promise<DiffResult> {
+  if (!shouldOffloadUnifiedDiff(oldText, newText)) {
+    return makeUnifiedDiff(oldText, newText, relPath, maxChars);
+  }
+  const diff = await offloadedUnifiedDiff(oldText, newText, relPath, maxChars);
+  return { ...diff, diff: redactSensitiveText(diff.diff) };
+}
+
 function isHiddenName(name: string): boolean {
   return name.startsWith(".") && name !== "." && name !== "..";
+}
+
+async function measureFs<T>(fn: () => Promise<T>): Promise<T> {
+  const started = performance.now();
+  try {
+    return await fn();
+  } finally {
+    recordFsTiming(performance.now() - started);
+  }
+}
+
+function measureGuard<T>(fn: () => T): T {
+  const started = performance.now();
+  try {
+    return fn();
+  } finally {
+    recordGuardTiming(performance.now() - started);
+  }
+}
+
+function renderedLineBytes(line: string, lineNumber: number, includeLineNumbers: boolean, lineNumberWidth: number): number {
+  if (!includeLineNumbers) {
+    return Buffer.byteLength(line, "utf8");
+  }
+  return Buffer.byteLength(`${String(lineNumber).padStart(lineNumberWidth, " ")} | ${line}`, "utf8");
+}
+
+async function readRangeFromStream(
+  absPath: string,
+  startLine: number,
+  requestedEndLine: number,
+  includeTotalLines: boolean,
+  options: {
+    signal?: AbortSignal;
+    maxReturnedBytes?: number;
+    includeLineNumbers?: boolean;
+  } = {}
+): Promise<{ lines: string[]; totalLines?: number; timedOut: boolean; partial: boolean; truncatedByBudget: boolean }> {
+  const lines: string[] = [];
+  const stream = fs.createReadStream(absPath, { encoding: "utf8" });
+  const reader = createInterface({ input: stream, crlfDelay: Infinity });
+  let totalLines = 0;
+  let timedOut = false;
+  let partial = false;
+  let truncatedByBudget = false;
+  const includeLineNumbers = options.includeLineNumbers !== false;
+  const lineNumberWidth = String(requestedEndLine).length;
+  const maxReturnedBytes = options.maxReturnedBytes;
+  let collectedBytes = 0;
+
+  const onAbort = () => {
+    timedOut = options.signal?.reason instanceof ToolTimeoutError;
+    partial = true;
+    reader.close();
+    stream.destroy(options.signal?.reason instanceof Error ? options.signal.reason : undefined);
+  };
+
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for await (const line of reader) {
+      totalLines += 1;
+      if (totalLines >= startLine && totalLines <= requestedEndLine) {
+        const lineBytes = renderedLineBytes(line, totalLines, includeLineNumbers, lineNumberWidth);
+        const separatorBytes = lines.length > 0 ? 1 : 0;
+        if (maxReturnedBytes !== undefined && collectedBytes + separatorBytes + lineBytes > maxReturnedBytes) {
+          truncatedByBudget = true;
+          partial = true;
+          break;
+        }
+        lines.push(line);
+        collectedBytes += separatorBytes + lineBytes;
+      }
+      if (!includeTotalLines && totalLines >= requestedEndLine && !truncatedByBudget) {
+        break;
+      }
+      if (options.signal?.aborted) {
+        timedOut = options.signal.reason instanceof ToolTimeoutError;
+        partial = true;
+        break;
+      }
+      if (truncatedByBudget) break;
+    }
+  } catch (error) {
+    if (!(options.signal?.aborted && options.signal.reason instanceof ToolTimeoutError)) {
+      throw error;
+    }
+    timedOut = true;
+    partial = true;
+  } finally {
+    options.signal?.removeEventListener("abort", onAbort);
+    reader.close();
+    if (!stream.destroyed) stream.destroy();
+  }
+
+  if (timedOut || truncatedByBudget) {
+    recordPartial();
+  }
+  return {
+    lines,
+    totalLines: includeTotalLines ? totalLines : undefined,
+    timedOut,
+    partial: partial || truncatedByBudget,
+    truncatedByBudget
+  };
+}
+
+export async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const concurrency = Math.max(1, Math.min(limit, items.length || 1));
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const current = nextIndex;
+      nextIndex += 1;
+      results[current] = await fn(items[current] as T, current);
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  return results;
 }
 
 export async function repoTree(config: LeastConfig, guard: PathGuard, workspace: Workspace, options: TreeOptions): Promise<TreeResult> {
@@ -195,36 +351,177 @@ export async function listFiles(
   return files;
 }
 
+export async function fileContentSha256(
+  config: LeastConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  filePath: string
+): Promise<{ exists: boolean; sha256?: string }> {
+  const resolved = guard.resolve(workspace, filePath);
+  if (!fs.existsSync(resolved.absPath)) {
+    return { exists: false };
+  }
+  await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
+  const text = await fsp.readFile(resolved.absPath, "utf8");
+  return { exists: true, sha256: sha256(text) };
+}
+
+export async function readManyTextFiles(
+  config: LeastConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  items: ReadManyItem[],
+  options: {
+    maxTotalBytes?: number;
+    concurrency?: number;
+    includeSha256?: boolean;
+    includeLineNumbers?: boolean;
+    includeTotalLines?: boolean;
+    signal?: AbortSignal;
+  } = {}
+): Promise<ReadManyResult> {
+  if (!items.length) throw new LeastError("items must include at least one file.");
+  const maxTotalBytes = Math.min(options.maxTotalBytes ?? config.maxReadBytes * 3, config.maxReadBytes * 10);
+  const deduped = new Map<string, Promise<ReadFileResult>>();
+  const concurrency = Math.max(1, Math.min(options.concurrency ?? 8, 16));
+
+  const resolved = await mapWithConcurrency(items, concurrency, async (item) => {
+    const key = `${item.path}\u0000${item.startLine ?? ""}\u0000${item.endLine ?? ""}\u0000${options.includeSha256 ? "sha" : "no-sha"}\u0000${options.includeLineNumbers === false ? "plain" : "numbered"}\u0000${options.includeTotalLines ? "totals" : "fast"}`;
+    const existing = deduped.get(key);
+    if (existing) return existing;
+    const promise = readTextFile(config, guard, workspace, item.path, {
+      startLine: item.startLine,
+      endLine: item.endLine,
+      maxBytes: config.maxReadBytes,
+      includeSha256: options.includeSha256,
+      includeLineNumbers: options.includeLineNumbers,
+      includeTotalLines: options.includeTotalLines,
+      signal: options.signal
+    });
+    deduped.set(key, promise);
+    return promise;
+  });
+
+  const files: ReadFileResult[] = [];
+  let totalBytes = 0;
+  let truncated = false;
+  let partial = false;
+  let timedOut = false;
+
+  for (const result of resolved) {
+    if (options.signal?.aborted) {
+      partial = true;
+      timedOut = options.signal.reason instanceof ToolTimeoutError;
+      truncated = true;
+      break;
+    }
+    const returnedBytes = result.returnedBytes ?? result.bytes;
+    if (totalBytes + returnedBytes > maxTotalBytes) {
+      truncated = true;
+      break;
+    }
+    files.push(result);
+    totalBytes += returnedBytes;
+    partial = partial || result.partial === true;
+    timedOut = timedOut || result.timedOut === true;
+    if (result.truncated && result.totalLines !== undefined) {
+      truncated = true;
+    }
+  }
+
+  const text = files
+    .map(
+      (file) =>
+        `### ${file.path}\nLines: ${file.startLine}-${file.endLine}${file.totalLines !== undefined ? ` of ${file.totalLines}` : ""}\n${file.sha256 ? `SHA-256: ${file.sha256}\n` : ""}${file.partial ? "Partial: true\n" : ""}\n\`\`\`text\n${file.text}\n\`\`\``
+    )
+    .join("\n\n");
+  if (partial) recordPartial();
+  return { text, files, totalBytes, truncated, partial, timedOut };
+}
+
 export async function readTextFile(
   config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   filePath: string,
-  options: { startLine?: number; endLine?: number; maxBytes?: number } = {}
+  options: {
+    startLine?: number;
+    endLine?: number;
+    maxBytes?: number;
+    includeSha256?: boolean;
+    includeLineNumbers?: boolean;
+    includeTotalLines?: boolean;
+    signal?: AbortSignal;
+  } = {}
 ): Promise<ReadFileResult> {
-  const resolved = guard.resolve(workspace, filePath);
+  throwIfAborted(options.signal);
+  const resolved = measureGuard(() => guard.resolve(workspace, filePath));
   const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
-  await guard.assertTextFile(resolved.absPath, maxBytes);
-  const buffer = await fsp.readFile(resolved.absPath);
+  const startLine = Math.max(1, Math.floor(options.startLine ?? 1));
+  const requestedEndLine = options.endLine !== undefined ? Math.max(1, Math.floor(options.endLine)) : undefined;
+  const rangeRequested = options.startLine !== undefined || options.endLine !== undefined;
+  const includeSha256 = options.includeSha256 === true;
+  const stat = await measureFs(() =>
+    rangeRequested && !includeSha256
+      ? guard.assertReadableTextFileForRangeRead(resolved.absPath)
+      : guard.assertTextFile(resolved.absPath, maxBytes)
+  );
+  if (requestedEndLine !== undefined && requestedEndLine < startLine) {
+    throw new LeastError(`end_line (${requestedEndLine}) must be >= start_line (${startLine}).`);
+  }
+  const includeLineNumbers = options.includeLineNumbers !== false;
+  const shouldReturnTotalLines =
+    options.includeTotalLines === true || requestedEndLine === undefined || (startLine === 1 && requestedEndLine === undefined);
+
+  const canUseStreamFastPath = rangeRequested && !includeSha256 && requestedEndLine !== undefined && options.includeTotalLines !== true;
+  if (canUseStreamFastPath) {
+    const streamed = await measureFs(() =>
+      readRangeFromStream(resolved.absPath, startLine, requestedEndLine as number, false, {
+        signal: options.signal,
+        maxReturnedBytes: maxBytes,
+        includeLineNumbers
+      })
+    );
+    const text = includeLineNumbers ? withLineNumbers(streamed.lines, startLine) : streamed.lines.join("\n");
+    const endLine = streamed.lines.length ? startLine + streamed.lines.length - 1 : startLine;
+    const returnedBytes = Buffer.byteLength(text, "utf8");
+    const rangeIncomplete = endLine < (requestedEndLine as number);
+    return {
+      path: resolved.relPath,
+      text,
+      startLine,
+      endLine: Math.max(startLine, endLine),
+      totalLines: undefined,
+      bytes: returnedBytes,
+      fileBytes: stat.size,
+      returnedBytes,
+      sha256: undefined,
+      truncated: streamed.truncatedByBudget || rangeIncomplete,
+      partial: streamed.partial,
+      timedOut: streamed.timedOut
+    };
+  }
+
+  const buffer = await measureFs(() => fsp.readFile(resolved.absPath));
+  throwIfAborted(options.signal);
   const text = buffer.toString("utf8");
   const allLines = splitLines(text);
   const totalLines = allLines.length;
-  const startLine = Math.max(1, Math.floor(options.startLine ?? 1));
-  const endLine = Math.min(totalLines, Math.floor(options.endLine ?? totalLines));
-  if (endLine < startLine) {
-    throw new LeastError(`end_line (${endLine}) must be >= start_line (${startLine}).`);
-  }
+  const endLine = Math.min(totalLines, requestedEndLine ?? totalLines);
   const selected = allLines.slice(startLine - 1, endLine);
-  const numbered = withLineNumbers(selected, startLine);
+  const rendered = includeLineNumbers ? withLineNumbers(selected, startLine) : selected.join("\n");
   const truncated = startLine > 1 || endLine < totalLines;
+  const returnedBytes = Buffer.byteLength(rendered, "utf8");
   return {
     path: resolved.relPath,
-    text: numbered,
+    text: rendered,
     startLine,
     endLine,
-    totalLines,
-    bytes: buffer.byteLength,
-    sha256: sha256(text),
+    totalLines: shouldReturnTotalLines ? totalLines : undefined,
+    bytes: returnedBytes,
+    fileBytes: buffer.byteLength,
+    returnedBytes,
+    sha256: includeSha256 ? sha256(text) : undefined,
     truncated
   };
 }
@@ -264,7 +561,7 @@ export async function writeTextFile(
     await fsp.mkdir(path.dirname(resolved.absPath), { recursive: true });
   }
 
-  const diff = makeUnifiedDiff(oldText, content, resolved.relPath);
+  const diff = await makeUnifiedDiffMaybeOffloaded(oldText, content, resolved.relPath);
   await fsp.writeFile(resolved.absPath, content, "utf8");
   return { path: resolved.relPath, bytes: contentBytes, sha256: sha256(content), existed, diff };
 }
@@ -312,7 +609,7 @@ export async function editTextFile(
     throw new LeastError("Secret-looking content is blocked from edit. Use placeholders such as [REDACTED_SECRET] in handoff files.");
   }
 
-  const diff = makeUnifiedDiff(before, after, resolved.relPath);
+  const diff = await makeUnifiedDiffMaybeOffloaded(before, after, resolved.relPath);
   await fsp.writeFile(resolved.absPath, after, "utf8");
   return { path: resolved.relPath, replacements, bytes: afterBytes, sha256: sha256(after), diff };
 }

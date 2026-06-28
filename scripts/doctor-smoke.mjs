@@ -16,6 +16,31 @@ async function getFreePort() {
   });
 }
 
+async function writeFakeTailscale(tmp) {
+  const scriptPath = path.join(tmp, 'tailscale.mjs');
+  const binPath = path.join(tmp, process.platform === 'win32' ? 'tailscale.cmd' : 'tailscale');
+  const source = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'version') {
+  console.log('1.82.0');
+  process.exit(0);
+}
+if (args[0] === 'status' && args[1] === '--json') {
+  console.log(JSON.stringify({ BackendState: 'Running', Self: { DNSName: 'least-demo.example.ts.net.' } }));
+  process.exit(0);
+}
+process.exit(2);
+`;
+  await fs.writeFile(scriptPath, source, 'utf8');
+  if (process.platform === 'win32') {
+    await fs.writeFile(binPath, `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`, 'utf8');
+  } else {
+    await fs.writeFile(binPath, source, { encoding: 'utf8', mode: 0o755 });
+    await fs.chmod(binPath, 0o755);
+  }
+  return binPath;
+}
+
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'least-doctor-smoke-'));
 const home = await fs.mkdtemp(path.join(os.tmpdir(), 'least-doctor-home-'));
 const port = await getFreePort();
@@ -45,4 +70,34 @@ for (const expected of ['Least doctor', 'Node', 'Build artifacts', 'Local port',
   }
 }
 
-console.log('✓ doctor smoke test passed');
+const fakeTailscale = await writeFakeTailscale(home);
+const tailscalePort = await getFreePort();
+const tailscaleResult = spawnSync(process.execPath, [
+  'scripts/least.mjs',
+  'doctor',
+  '--root',
+  root,
+  '--port',
+  String(tailscalePort),
+  '--tunnel',
+  'tailscale-funnel',
+  '--tailscale',
+  fakeTailscale
+], {
+  cwd: path.resolve('.'),
+  env: { ...process.env, LEAST_HOME: home, NODE_OPTIONS: `--no-deprecation ${process.env.NODE_OPTIONS || ''}`.trim() },
+  encoding: 'utf8'
+});
+
+if (tailscaleResult.status !== 0) {
+  throw new Error(`tailscale doctor failed\nstdout:\n${tailscaleResult.stdout}\nstderr:\n${tailscaleResult.stderr}`);
+}
+
+const tailscaleOutput = `${tailscaleResult.stdout}\n${tailscaleResult.stderr}`;
+for (const expected of ['Tailscale CLI', 'Tailscale daemon', 'Device DNS name', 'least-demo.example.ts.net', 'Funnel policy']) {
+  if (!tailscaleOutput.includes(expected)) {
+    throw new Error(`tailscale doctor output missing ${expected}\n${tailscaleOutput}`);
+  }
+}
+
+console.log('doctor smoke test passed');

@@ -1,19 +1,24 @@
 import fs from "node:fs";
-import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { LeastConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
+import type { LeastConfig } from "./config.js";
+import { collectManifestRoots } from "./skillManifest.js";
 
 export interface SkillInventoryItem {
   name: string;
-  description?: string;
-  source: "workspace" | "user" | "plugin" | "other";
+  description: string | undefined;
+  source: "workspace" | "user" | "plugin" | "external" | "other";
   path: string;
 }
 
 interface SkillInventoryRecord extends SkillInventoryItem {
   absPath: string;
+}
+
+interface CachedSkillDiscovery {
+  records: SkillInventoryRecord[];
+  expiresAt: number;
 }
 
 export interface LoadedSkill {
@@ -30,50 +35,45 @@ export interface McpServerInventoryItem {
 }
 
 function unique<T>(items: T[], key: (item: T) => string): T[] {
-  const seen = new Set<string>();
-  const out: T[] = [];
+  const seen = new Map<string, T>();
   for (const item of items) {
-    const id = key(item);
-    if (seen.has(id)) continue;
-    seen.add(id);
-    out.push(item);
+    const k = key(item);
+    if (!seen.has(k)) seen.set(k, item);
   }
-  return out;
+  return [...seen.values()];
 }
 
+const skillDiscoveryCache = new Map<string, CachedSkillDiscovery>();
+const SKILL_DISCOVERY_TTL_MS = 30_000;
+
 async function safeReadText(file: string, maxBytes = 16_000): Promise<string> {
-  const stat = await fsp.stat(file);
-  const handle = await fsp.open(file, "r");
   try {
-    const buffer = Buffer.alloc(Math.min(stat.size, maxBytes));
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    return buffer.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    await handle.close();
+    const stat = await fs.promises.stat(file);
+    const len = Math.min(stat.size, maxBytes);
+    const fd = await fs.promises.open(file, "r");
+    try {
+      const buf = Buffer.alloc(len);
+      await fd.read(buf, 0, len, 0);
+      return buf.toString("utf8");
+    } finally {
+      await fd.close();
+    }
+  } catch {
+    return "";
   }
 }
 
 async function readTextWithStats(file: string, maxBytes: number): Promise<{ text: string; bytes: number; totalBytes: number; truncated: boolean }> {
-  const stat = await fsp.stat(file);
-  const handle = await fsp.open(file, "r");
-  try {
-    const limit = Math.max(1, Math.min(maxBytes, stat.size));
-    const buffer = Buffer.alloc(limit);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    return {
-      text: buffer.subarray(0, bytesRead).toString("utf8"),
-      bytes: bytesRead,
-      totalBytes: stat.size,
-      truncated: stat.size > bytesRead
-    };
-  } finally {
-    await handle.close();
-  }
+  const stat = await fs.promises.stat(file);
+  const totalBytes = stat.size;
+  const truncated = totalBytes > maxBytes;
+  const text = await safeReadText(file, maxBytes);
+  return { text, bytes: Buffer.byteLength(text, "utf8"), totalBytes, truncated };
 }
 
 async function safeReaddir(dir: string): Promise<fs.Dirent[]> {
   try {
-    return await fsp.readdir(dir, { withFileTypes: true });
+    return await fs.promises.readdir(dir, { withFileTypes: true });
   } catch {
     return [];
   }
@@ -82,11 +82,11 @@ async function safeReaddir(dir: string): Promise<fs.Dirent[]> {
 function displayPath(absPath: string, workspaceRoot: string): string {
   const home = os.homedir();
   if (absPath === workspaceRoot) return "$WORKSPACE";
-  if (absPath.startsWith(`${workspaceRoot}${path.sep}`)) {
+  if (absPath.startsWith(workspaceRoot + path.sep)) {
     return `$WORKSPACE/${path.relative(workspaceRoot, absPath).split(path.sep).join("/")}`;
   }
   if (absPath === home) return "~";
-  if (absPath.startsWith(`${home}${path.sep}`)) {
+  if (absPath.startsWith(home + path.sep)) {
     return `~/${path.relative(home, absPath).split(path.sep).join("/")}`;
   }
   return absPath;
@@ -147,27 +147,51 @@ async function findSkillFiles(root: string, maxDepth: number, out: string[], max
 
 async function discoverSkillRecords(
   workspace: Workspace,
+  config?: LeastConfig,
   options: { includeGlobal?: boolean; maxSkills?: number } = {}
 ): Promise<SkillInventoryRecord[]> {
   const maxSkills = Math.max(1, Math.min(options.maxSkills ?? 120, 500));
-  const roots = [
+  const cacheKey = JSON.stringify({
+    workspaceId: workspace.id,
+    includeGlobal: options.includeGlobal !== false,
+    maxSkills
+  });
+  const cached = skillDiscoveryCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.records.map((record) => ({ ...record }));
+  }
+  const workspaceRoots = [
     path.join(workspace.root, ".codex", "skills"),
     path.join(workspace.root, ".agents", "skills"),
-    path.join(workspace.root, "skills"),
-    ...(options.includeGlobal
-      ? [
-          path.join(os.homedir(), ".codex", "skills"),
-          path.join(os.homedir(), ".agents", "skills"),
-          path.join(os.homedir(), ".codex", "plugins", "cache")
-        ]
-      : [])
+    path.join(workspace.root, "skills")
   ].filter((dir) => fs.existsSync(dir));
+  const globalRoots = options.includeGlobal
+    ? [
+        path.join(os.homedir(), ".codex", "skills"),
+        path.join(os.homedir(), ".agents", "skills"),
+        path.join(os.homedir(), ".codex", "plugins", "cache")
+      ]
+        .filter((dir) => fs.existsSync(dir))
+        .sort((a, b) => a.localeCompare(b))
+    : [];
+  const roots = [...workspaceRoots, ...globalRoots];
+
+  // Add manifest-derived skill roots from settings
+  if (config?.settings) {
+    const manifest = collectManifestRoots(config.settings, workspace.root);
+    for (const root of manifest.roots) {
+      if (fs.existsSync(root) && !roots.includes(root)) {
+        roots.push(root);
+      }
+    }
+  }
 
   const skillFiles: string[] = [];
   for (const root of roots) {
     await findSkillFiles(root, root.includes(`${path.sep}plugins${path.sep}cache`) ? 9 : 3, skillFiles, maxSkills);
     if (skillFiles.length >= maxSkills) break;
   }
+  skillFiles.sort((a, b) => a.localeCompare(b));
 
   const items: SkillInventoryRecord[] = [];
   for (const file of skillFiles.slice(0, maxSkills)) {
@@ -188,18 +212,25 @@ async function discoverSkillRecords(
     });
   }
 
-  return unique(items, (item) => `${item.source}:${item.name}:${item.path}`).sort(compareSkills);
+  const records = unique(items, (item) => `${item.source}:${item.name}:${item.path}`).sort(compareSkills);
+  skillDiscoveryCache.set(cacheKey, {
+    records: records.map((record) => ({ ...record })),
+    expiresAt: Date.now() + SKILL_DISCOVERY_TTL_MS
+  });
+  return records;
 }
 
 export async function discoverSkillInventory(
   workspace: Workspace,
+  config?: LeastConfig,
   options: { includeGlobal?: boolean; maxSkills?: number } = {}
 ): Promise<SkillInventoryItem[]> {
-  return (await discoverSkillRecords(workspace, options)).map(publicSkill);
+  return (await discoverSkillRecords(workspace, config, options)).map(publicSkill);
 }
 
 export async function loadSkill(
   workspace: Workspace,
+  config: LeastConfig,
   options: {
     name: string;
     source?: SkillInventoryItem["source"];
@@ -213,7 +244,7 @@ export async function loadSkill(
   if (!name) throw new Error("Skill name is required.");
   const requestedPath = options.path?.trim();
 
-  const records = await discoverSkillRecords(workspace, {
+  const records = await discoverSkillRecords(workspace, config, {
     includeGlobal: options.includeGlobal !== false,
     maxSkills: options.maxSkills
   });
@@ -266,11 +297,13 @@ function parseJsonMcpServers(text: string, source: string): McpServerInventoryIt
   try {
     const parsed = JSON.parse(text);
     const servers = parsed?.mcpServers;
-    if (!servers || typeof servers !== "object" || Array.isArray(servers)) return [];
-    return Object.keys(servers).map((name) => ({ name, source }));
+    if (typeof servers === "object" && servers !== null && !Array.isArray(servers)) {
+      return Object.keys(servers).map((name) => ({ name, source }));
+    }
   } catch {
-    return [];
+    // Not JSON.
   }
+  return [];
 }
 
 export async function discoverMcpServers(workspace: Workspace): Promise<McpServerInventoryItem[]> {
@@ -280,7 +313,6 @@ export async function discoverMcpServers(workspace: Workspace): Promise<McpServe
     { file: path.join(workspace.root, ".cursor", "mcp.json"), kind: "json" },
     { file: path.join(os.homedir(), ".cursor", "mcp.json"), kind: "json" }
   ];
-
   const servers: McpServerInventoryItem[] = [];
   for (const candidate of candidates) {
     if (!fs.existsSync(candidate.file)) continue;
@@ -293,7 +325,6 @@ export async function discoverMcpServers(workspace: Workspace): Promise<McpServe
     const source = displayPath(candidate.file, workspace.root);
     servers.push(...(candidate.kind === "toml" ? parseTomlMcpServers(text, source) : parseJsonMcpServers(text, source)));
   }
-
   return unique(servers, (server) => `${server.source}:${server.name}`).sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -302,49 +333,23 @@ export async function leastInventory(
   workspace: Workspace,
   options: { includeGlobalSkills?: boolean; includeMcpServers?: boolean; maxSkills?: number } = {}
 ): Promise<{
-  text: string;
+  mode: string;
   skills: SkillInventoryItem[];
   mcpServers: McpServerInventoryItem[];
+  text: string;
 }> {
-  const skills = await discoverSkillInventory(workspace, {
+  const skills = await discoverSkillInventory(workspace, config, {
     includeGlobal: options.includeGlobalSkills !== false,
     maxSkills: options.maxSkills
   });
-  const mcpServers = options.includeMcpServers === false ? [] : await discoverMcpServers(workspace);
-
-  const bySource = skills.reduce<Record<string, number>>((acc, skill) => {
-    acc[skill.source] = (acc[skill.source] ?? 0) + 1;
-    return acc;
-  }, {});
-
-  const skillLines = skills.length
-    ? skills.map((skill) => `- ${skill.name} [${skill.source}]${skill.description ? ` - ${skill.description}` : ""}`).join("\n")
-    : "- none discovered";
-  const mcpLines = mcpServers.length
-    ? mcpServers.map((server) => `- ${server.name} (${server.source})`).join("\n")
-    : "- none discovered";
-
-  const text = `# Least Inventory
-
-Workspace: ${workspace.root}
-Bash mode: ${config.bashMode}
-Write mode: ${config.writeMode}
-Tool mode: ${config.toolMode}
-
-## Skill summary
-
-Total: ${skills.length}
-Workspace: ${bySource.workspace ?? 0}
-User: ${bySource.user ?? 0}
-Plugin: ${bySource.plugin ?? 0}
-Other: ${bySource.other ?? 0}
-
-${skillLines}
-
-## MCP servers
-
-${mcpLines}
-`;
-
-  return { text, skills, mcpServers };
+  const mcpServers = options.includeMcpServers !== false ? await discoverMcpServers(workspace) : [];
+  const skillList = skills.slice(0, 40).map((s) => `  - ${s.name}${s.description ? `: ${s.description}` : ""} [${s.source}]`).join("\n");
+  const mcpList = mcpServers.slice(0, 20).map((s) => `  - ${s.name} [${s.source}]`).join("\n");
+  const text = [
+    `# Least Inventory\n\nSkills (${skills.length}):`,
+    skillList || "  (none)",
+    mcpServers.length ? `\nMCP Servers (${mcpServers.length}):\n${mcpList}` : "\nMCP Servers: (none)",
+    "\nUse load_skill to inspect a skill body."
+  ].join("\n");
+  return { mode: "active", skills, mcpServers, text };
 }

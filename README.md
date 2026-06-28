@@ -72,7 +72,7 @@ What it gives you:
 Normal coding mode  ChatGPT reads, writes, edits, searches, and verifies directly.
 Handoff mode        ChatGPT writes .ai-bridge/current-plan.md for a local implementation agent.
 Pro planning mode   Export a durable context bundle for sessions that cannot call MCP tools.
-Stable URLs         Use an ngrok free dev domain or Cloudflare named tunnel so the ChatGPT app URL stays fixed.
+Stable URLs         Use Tailscale Funnel, ngrok free dev domain, or Cloudflare named tunnel so the ChatGPT app URL stays fixed.
 ```
 
 If your ChatGPT account exposes a stronger model in the web app, and that model/surface can call Developer Mode apps, Least lets it work against your local repo through MCP. Some ChatGPT model surfaces may not be able to call connectors or MCP tools directly. Least does not provide, proxy, resell, or unlock models; it gives compatible ChatGPT sessions local coding tools and repo context.
@@ -86,7 +86,7 @@ Node.js 20+
 ChatGPT Plus or Pro account with Apps / Developer Mode access
 Developer mode enabled from Settings -> Apps -> Advanced settings
 Enforce CSP in developer mode kept enabled
-One public tunnel option: Cloudflare quick tunnel, ngrok free dev domain, or Cloudflare named tunnel
+One public tunnel option: Cloudflare quick tunnel, Tailscale Funnel, ngrok free dev domain, or Cloudflare named tunnel
 ```
 
 Current testing shows free / Go ChatGPT accounts do not expose the app flow needed for Least. Use Plus or Pro for the best experience.
@@ -105,21 +105,49 @@ ChatGPT can do MCP-backed agentic coding in your local repo, while Codex remains
 
 Least defaults to `LEAST_TOOL_MODE=standard`, which keeps ChatGPT's tool picker focused on the normal coding loop plus handoff/export workflows. Use `--tool-mode minimal` for the tightest demo surface, or `--tool-mode full` when you want every compatibility and debugging tool exposed.
 
+For workflow-specific surfaces, `LEAST_TOOLSET` can further focus the catalog without changing the underlying safety mode:
+
+```text
+explore  files, search_context, read_many, read_around, context_pack, project_map, retrieve_output, least_gain, least_discover
+edit     context_pack, read_many, multi_edit, apply_patch, show_changes, retrieve_output, project_memory_*, bash
+review   diff_summary, read_changed_files, search_context, show_changes, review_minimality, least_discover
+handoff  export_pro_context, handoff_to_agent, read_handoff
+full     everything allowed by LEAST_TOOL_MODE
+```
+
 The smaller default tool list is deliberate. ChatGPT behaves better when routine work goes through a few high-signal tools instead of a large action catalog. Installed user/plugin skills are still discovered during workspace open; they are surfaced as context in the workspace card and can be loaded on demand with `load_skill`, not exposed as dozens of separate ChatGPT actions.
 
 Standard mode exposes:
 
 - `server_config` — show safety modes, limits, blocked globs, and allowed roots.
+- `least_perf` — inspect per-tool timings, cache hit rates, raw vs visible output sizes, compaction savings, and timeout counts.
+- `least_gain` — show local compaction savings and top byte savers for the session.
+- `least_discover` — report missed optimization opportunities from local telemetry.
+- `retrieve_output` — recover raw compacted tool output by `sha256:` retrieval key.
 - `open_current_workspace` — open the configured default workspace without accepting a path. Fastest/safest first call.
 - `open_workspace` — open a local project directory using `root` or `path` and return workspace id, git status, AGENTS.md status, optional skill discovery, and optional file tree.
 - `tree` — inspect files.
+- `files` — fast flat candidate discovery with git / ripgrep / Node fallback and warm-cache reuse.
 - `search` — search code with ripgrep or a Node fallback.
+- `search_context` — search plus surrounding code in one call.
+- `read_many` — read several files or ranges concurrently in one request.
+- `read_around` — read around a known line number without calculating the range manually.
+- `context_pack` — gather task-relevant files and snippets in one call with `profile` (`explore` | `edit` | `debug` | `review`) and score-aware selection.
+- `project_map` — build a lightweight symbol map for route/function/type discovery.
+- `batch` — run multiple read-only Least tools in one request.
 - `load_skill` — load bounded `SKILL.md` instructions for a discovered workspace, user, or plugin skill by name, with optional source/path disambiguation.
 - `read` — read text files with line numbers.
 - `write` — create/overwrite files and return a diff. Controlled by `LEAST_WRITE_MODE`.
 - `edit` — exact text replacement and return a diff. Controlled by `LEAST_WRITE_MODE`.
+- `multi_edit` — apply multiple exact edits across files in one call.
+- `apply_patch` — apply a Codex-style patch block inside the workspace.
 - `bash` — run allowlisted shell commands in the workspace. Controlled by `LEAST_BASH_MODE`.
-- `show_changes` — one review-oriented summary with git status, diff stats, and optional diff.
+- `diff_summary` — compact changed-file summary with line counts and rough risk classification.
+- `read_changed_files` — read changed source/test/config files for review without manual file picking.
+- `show_changes` — one review-oriented summary with git status, untracked summaries, diff stats, and optional compact diff.
+- `review_minimality` — flag likely over-engineering in the current change set.
+- `project_memory_search` / `project_memory_save` / `project_memory_update` — durable local repo facts when `LEAST_PROJECT_MEMORY=1`.
+- `warmup` — prime file, git, package, and symbol caches in the background server process.
 - `read_handoff` — read `.ai-bridge` files.
 - `export_pro_context` — write `.ai-bridge/pro-context.md` for models that cannot call MCP tools directly.
 - `handoff_to_agent` — write `.ai-bridge/current-plan.md` for Codex, OpenCode, Pi, or a custom local implementation agent without executing local commands.
@@ -181,6 +209,65 @@ The watcher writes the same review files as `execute-handoff`:
 .ai-bridge/agent-status.md
 .ai-bridge/implementation-diff.patch
 .ai-bridge/execution-log.jsonl
+```
+
+## Output efficiency
+
+Least compacts noisy tool output (large diffs, search hits, test logs) deterministically at the tool boundary. Compacted results include a retrieval key when raw output is stored locally under `.least/cache/tool-output/`.
+
+```text
+LEAST_OUTPUT_MODE=compact          # default for known noisy tools
+LEAST_OUTPUT_STORE=1               # store raw output when compacted
+LEAST_COMPACT_SEARCH=1
+LEAST_COMPACT_GIT_DIFF=1
+LEAST_COMPACT_SHELL=1
+LEAST_PROJECT_MEMORY=0             # set 1 to enable project memory tools + context_pack memory reads
+```
+
+Agent instruction adapters:
+
+- Canonical source: `docs/agent-instructions/least-agent-core.md`
+- Cursor: `.cursor/rules/least.mdc`
+- Copilot: `.github/copilot-instructions.md`
+- Windsurf: `.windsurf/rules/least.md`
+- Cline: `.clinerules/least.md`
+- Example repo file: `AGENTS.example.md`
+- Regenerate thin adapters: `npm run generate:adapters`
+
+## Fastest workflows
+
+For implementation work, the shortest high-signal loop is usually:
+
+```text
+open_current_workspace
+context_pack
+multi_edit or apply_patch
+show_changes
+bash
+```
+
+For review work:
+
+```text
+open_current_workspace
+diff_summary
+read_changed_files
+show_changes
+```
+
+For repo exploration:
+
+```text
+open_current_workspace
+files or project_map
+search_context
+read_many or read_around
+```
+
+If you want the server to prefill hot caches on startup:
+
+```bash
+LEAST_WARMUP=files,git,package least start
 ```
 
 ## Visual ChatGPT cards
@@ -287,7 +374,7 @@ That is the intended low-friction first-run path. It:
 - saves the workspace profile for future least start runs
 - starts the local HTTP MCP server
 - generates a private Least token
-- supports Cloudflare quick tunnel, ngrok free dev domain, Cloudflare stable tunnel, or local-only mode
+- supports Cloudflare quick tunnel, Tailscale Funnel, ngrok free dev domain, Cloudflare stable tunnel, or local-only mode
 - installs cloudflared into ~/.least/bin if Cloudflare is selected and it is missing
 - waits for the public HTTPS tunnel URL
 - copies the exact ChatGPT Server URL to your clipboard
@@ -352,6 +439,7 @@ First-run tunnel choice:
 
 ```text
 cloudflare  Cloudflare quick tunnel. Easiest demo path, new URL each restart.
+tailscale   Tailscale Funnel. Stable public https://<device>.<tailnet>.ts.net hostname.
 ngrok       ngrok free dev domain. Recommended stable URL for most users.
 stable      Cloudflare named tunnel. Stable URL with your own Cloudflare domain.
 local       No public tunnel. Only for local MCP clients.
@@ -411,7 +499,7 @@ Saved workspace profile behavior:
 
 ```text
 least setup
-  choose quick, stable, ngrok, or local
+  choose quick, tailscale, stable, ngrok, or local
   enter the Cloudflare/ngrok hostname when needed
   accept the generated Least auth token
   save the profile
@@ -471,6 +559,7 @@ least setup                 # guided onboarding for new users
 least start --mode handoff  # planning-only .ai-bridge handoff
 least start --mode pro      # export context for models without MCP tools
 least stable --hostname least.example.com --tunnel-name least
+least tailscale
 least ngrok --hostname your-domain.ngrok-free.dev
 ```
 
@@ -501,6 +590,8 @@ Connection: Server URL
 Server URL: https://<cloudflare-host>/mcp?least_token=<token>
 Authentication: No Authentication / None
 ```
+
+The copied URL contains a private local token. Treat it like a password. Prefer Bearer auth in clients that support it; query tokens can appear in browser history, proxy logs, and screenshots.
 
 Planning-only handoff mode:
 
@@ -862,13 +953,55 @@ https://your-domain.ngrok-free.dev/mcp?least_token=keep-this-least-token-stable
 
 After that, keep using the same hostname and token. You do not need to recreate the ChatGPT app unless you change either one.
 
+### Stable URL with Tailscale Funnel
+
+If your tailnet has MagicDNS, HTTPS certificates, and Funnel enabled, Least can publish a stable public URL on your device's `ts.net` hostname without buying a custom domain.
+
+One-time tailnet setup in the Tailscale admin console:
+
+```text
+Enable MagicDNS
+Enable HTTPS certificates
+Allow Funnel for your tailnet
+```
+
+Daily startup:
+
+```bash
+least tailscale \
+  --root /absolute/path/to/your/repo \
+  --grok-oauth \
+  --token keep-this-least-token-stable
+```
+
+Equivalent explicit form:
+
+```bash
+least start \
+  --root /absolute/path/to/your/repo \
+  --tunnel tailscale-funnel \
+  --grok-oauth \
+  --token keep-this-least-token-stable
+```
+
+Least reads your device DNS name from `tailscale status --json`, runs `tailscale funnel --bg http://127.0.0.1:<port>`, waits for public `/healthz`, and prints:
+
+```text
+https://<device>.<tailnet>.ts.net/mcp?least_token=keep-this-least-token-stable
+```
+
+If another Funnel route already points somewhere else on this machine, run `tailscale funnel reset` before starting Least.
+
+Use Tailscale Funnel, not `tailscale serve`, for Grok or any other connector that must reach Least from the public internet. `tailscale serve` is private to your tailnet; Funnel publishes the same `ts.net` HTTPS name publicly. Tailscale Funnel is limited to the public ports your tailnet policy allows, normally 443, 8443, or 10000, while Least still listens locally on `127.0.0.1:<port>`.
+
+
 After saving this in `least setup`, daily startup from that repo is just:
 
 ```bash
 least start
 ```
 
-Least will reuse the saved ngrok hostname and saved Least token.
+Least will reuse the saved Tailscale Funnel mode and saved Least token.
 
 ### Running two repositories at the same time
 
@@ -935,6 +1068,97 @@ MCP endpoint:
 ```text
 http://127.0.0.1:8787/mcp?least_token=replace-with-long-random-token
 ```
+
+### Dual-client mode (ChatGPT + Grok on one host)
+
+One Least process previously could not satisfy both ChatGPT and Grok on the same public URL because ChatGPT expects No Auth MCP metadata on `/mcp`, while Grok expects OAuth-backed MCP metadata. Dual-client mode splits the surfaces by path on one hostname:
+
+```bash
+least tailscale \
+  --root /absolute/path/to/repo \
+  --tool-mode full \
+  --bash full \
+  --write workspace \
+  --dual-client \
+  --token keep-this-stable-token
+```
+
+ChatGPT:
+
+```text
+Server URL: https://<public-host>/mcp?least_token=<token>
+Authentication: No Authentication / None
+```
+
+Grok:
+
+```text
+MCP URL: https://<public-host>/mcp-grok
+Authorization Endpoint: https://<public-host>/oauth/authorize
+Token Endpoint: https://<public-host>/oauth/token
+Client ID: least-grok
+Scope: mcp
+```
+
+Both clients share the same workspace and the same Least bearer token. Concurrent edits from ChatGPT and Grok can conflict at the repo level; treat that as a workflow risk, not a transport bug.
+
+### Grok OAuth wrapper
+
+Use this only when Grok shows an OAuth-only custom connector screen and does not accept a raw MCP URL directly. If Grok accepts a public MCP URL, prefer the normal Least connector URL and skip the OAuth wrapper. For ChatGPT and Grok together on one Tailscale/Cloudflare/ngrok host, use `--dual-client` instead of `--grok-oauth` alone.
+
+Start Least with a public tunnel and Grok OAuth enabled:
+
+```bash
+least start --grok-oauth
+```
+
+Then fill Grok with:
+
+```text
+Client ID:             least-grok            # or LEAST_GROK_OAUTH_CLIENT_ID
+Client Secret:         (leave blank)
+Authorization Endpoint https://<public-host>/oauth/authorize
+Token Endpoint:        https://<public-host>/oauth/token
+Scopes:                mcp
+Token Auth Method:     none (PKCE only)
+```
+
+The MCP server URL is still the same Least public host at `/mcp`. The OAuth wrapper only exists for Grok screens that insist on manual OAuth fields.
+
+### OpenAI-compatible tool API (v1)
+
+The same HTTP server can expose an OpenAI-shaped **tool execution** surface at `/v1` (enabled by default together with MCP). Least **does not** run a chat model on the server in v1. Your client (or another LLM) must send an `assistant` message that already contains `tool_calls`; Least executes those tools and returns aggregated tool output in the completion body.
+
+```text
+Base URL:  http://127.0.0.1:<port>/v1
+Auth:      Authorization: Bearer <LEAST_HTTP_TOKEN>
+           (query ?least_token= or ?token= also works)
+Protocols: LEAST_HTTP_PROTOCOLS=mcp,openai   # default
+           LEAST_HTTP_PROTOCOLS=mcp           # ChatGPT /mcp only
+           least start --http-protocols both|mcp|openai
+```
+
+Example (execute `server_config`):
+
+```bash
+curl -sS http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer $LEAST_HTTP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "least-tools",
+    "messages": [{
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [{
+        "id": "1",
+        "type": "function",
+        "function": { "name": "server_config", "arguments": "{}" }
+      }]
+    }]
+  }'
+```
+
+Optional header `X-Least-Workspace-Id` selects a workspace opened via MCP; otherwise the default workspace root is used.
 
 ## Stdio MCP mode
 

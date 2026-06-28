@@ -1,0 +1,35 @@
+---
+pid: 10004
+cwd: "X:\least"
+command: "$env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User'); cd X:\\least; node --input-type=module -e \"
+import { refreshWindowsPath } from './scripts/ensure-windows-agent-path.mjs';
+refreshWindowsPath();
+import { agentStart } from './dist/agentOps.js';
+const ws = { id: 'least', root: 'X:/least', name: 'least', createdAt: new Date().toISOString() };
+console.log('starting agent_start...');
+const t0 = Date.now();
+try {
+  const r = await agentStart(ws, {
+    workspaceId: ws.id,
+    workspaceRoot: ws.root,
+    agent: 'grok-build',
+    repository: 'least',
+    title: 'E2E smoke summary',
+    prompt: 'Inspect the repository and produce a short summary only. Do not modify source files.',
+    timeoutMs: 3600000,
+    idleTimeoutMs: 900000
+  });
+  console.log('done in', Math.round((Date.now()-t0)/1000)+'s');
+  console.log('job_id:', r.structured.job_id);
+  console.log('state:', r.structured.state);
+  console.log('terminal:', JSON.stringify(r.structured.terminal));
+} catch (e) {
+  console.error('failed in', Math.round((Date.now()-t0)/1000)+'s:', e.message);
+  process.exit(1);
+}
+\""
+started_at: 2026-06-27T08:13:04.811Z
+running_for_ms: 595009   
+---
+starting agent_start...
+[13:43:05] WARNING: local.runner='none' — agent process will run on the host without sandboxing. Only use this when you understand the implications.

@@ -135,6 +135,15 @@ Official references:
 - Cloudflare Tunnel routing: https://developers.cloudflare.com/tunnel/routing/
 - Cloudflare Tunnel DNS records: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/routing-to-tunnel/dns/
 
+## Can ChatGPT and Grok use the same Least hostname?
+
+Yes, with `--dual-client` on a public HTTPS tunnel (Tailscale Funnel, Cloudflare, or ngrok).
+
+- ChatGPT should use `/mcp?least_token=<token>` with Authentication set to No Auth.
+- Grok should use `/mcp-grok` with OAuth fields at `/oauth/authorize` and `/oauth/token`.
+
+Both clients point at the same workspace and share the same Least bearer token. If both edit files at the same time, resolve conflicts in git like any other multi-editor workflow.
+
 ## Can I use the same ChatGPT app URL every day?
 
 Yes, if you use a stable hostname.

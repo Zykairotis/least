@@ -188,6 +188,64 @@ Authentication: None / No Authentication
 
 Least starts the local MCP server, runs `ngrok http http://127.0.0.1:8787 --url https://your-domain.ngrok-free.dev`, waits for `/healthz`, copies the Server URL, and keeps both processes alive until you quit.
 
+## Tailscale Funnel Stable URL
+
+Tailscale Funnel is the simplest stable URL when you already use Tailscale and do not want to buy or manage a custom domain. Least publishes your local MCP server on your device's MagicDNS name:
+
+```text
+Server URL: https://<device>.<tailnet>.ts.net/mcp
+```
+
+Prerequisites in the tailnet admin console:
+
+```text
+MagicDNS enabled
+HTTPS certificates enabled
+Funnel allowed for the tailnet
+Funnel public ports allowed by policy, normally 443, 8443, or 10000
+```
+
+On the machine that runs Least:
+
+```bash
+tailscale up
+least tailscale --root /absolute/path/to/your/repo --grok-oauth --token replace-with-a-long-stable-token
+```
+
+To serve ChatGPT and Grok from the same Funnel hostname, add `--dual-client`:
+
+```bash
+least tailscale --root /absolute/path/to/your/repo --dual-client --token replace-with-a-long-stable-token
+```
+
+Least starts the local MCP server, configures Funnel to `http://127.0.0.1:<port>`, waits for public `/healthz`, and copies the ChatGPT Server URL.
+
+Dual-client public paths:
+
+```text
+ChatGPT Server URL: https://<device>.<tailnet>.ts.net/mcp?least_token=<token>
+Grok MCP URL:       https://<device>.<tailnet>.ts.net/mcp-grok
+Authorization Endpoint: https://<device>.<tailnet>.ts.net/oauth/authorize
+Token Endpoint:       https://<device>.<tailnet>.ts.net/oauth/token
+```
+
+For Grok-only OAuth connector screens (legacy single-surface mode), use the same public Funnel host for every field:
+
+```text
+Server URL: https://<device>.<tailnet>.ts.net/mcp
+Authorization Endpoint: https://<device>.<tailnet>.ts.net/oauth/authorize
+Token Endpoint: https://<device>.<tailnet>.ts.net/oauth/token
+```
+
+Use Tailscale Funnel for Grok, not `tailscale serve`. `tailscale serve` is private to devices in your tailnet, while Funnel makes the `ts.net` HTTPS hostname publicly reachable. Because the hostname is your device's stable MagicDNS name, restarting Least keeps the same `/mcp`, `/oauth/authorize`, and `/oauth/token` URLs.
+
+If Funnel already points at another local service, reset it first:
+
+```bash
+tailscale funnel reset
+```
+
+
 ## Product Plan For All Users
 
 For open-source users, support three modes:

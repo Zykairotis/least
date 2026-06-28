@@ -163,14 +163,7 @@ export class PathGuard {
     return { absPath, relPath };
   }
 
-  async assertTextFile(absPath: string, maxBytes: number): Promise<void> {
-    const stat = await fsp.stat(absPath);
-    if (!stat.isFile()) {
-      throw new LeastError(`Not a file: ${absPath}`);
-    }
-    if (stat.size > maxBytes) {
-      throw new LeastError(`File is too large (${stat.size} bytes). Limit: ${maxBytes} bytes.`);
-    }
+  async assertReadableTextFileSample(absPath: string, stat: fs.Stats): Promise<void> {
     const handle = await fsp.open(absPath, "r");
     try {
       const sample = Buffer.alloc(Math.min(4096, stat.size));
@@ -181,6 +174,27 @@ export class PathGuard {
     } finally {
       await handle.close();
     }
+  }
+
+  async assertTextFile(absPath: string, maxBytes: number): Promise<fs.Stats> {
+    const stat = await fsp.stat(absPath);
+    if (!stat.isFile()) {
+      throw new LeastError(`Not a file: ${absPath}`);
+    }
+    if (stat.size > maxBytes) {
+      throw new LeastError(`File is too large (${stat.size} bytes). Limit: ${maxBytes} bytes.`);
+    }
+    await this.assertReadableTextFileSample(absPath, stat);
+    return stat;
+  }
+
+  async assertReadableTextFileForRangeRead(absPath: string): Promise<fs.Stats> {
+    const stat = await fsp.stat(absPath);
+    if (!stat.isFile()) {
+      throw new LeastError(`Not a file: ${absPath}`);
+    }
+    await this.assertReadableTextFileSample(absPath, stat);
+    return stat;
   }
 }
 

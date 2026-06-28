@@ -1,0 +1,5 @@
+interface:
+  display_name: Local Agent Orchestrator
+  short_description: Route, launch, monitor, and review local coding agents through Least/Xacho.
+  icon: bot
+  accent_color: '#3267E3'

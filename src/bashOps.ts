@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type { LeastConfig } from "./config.js";
+import type { LeastConfig, ShellBackend } from "./config.js";
+import { resolvePowerShellCommand } from "./commandCaps.js";
 import type { Workspace } from "./guard.js";
 import { LeastError, PathGuard } from "./guard.js";
 import { redactSensitiveText } from "./redact.js";
@@ -15,6 +16,7 @@ export interface BashResult {
   stdout: string;
   stderr: string;
   truncated: boolean;
+  timedOut: boolean;
 }
 
 const SAFE_ALLOWED_PREFIXES = [
@@ -67,6 +69,93 @@ const SAFE_ALLOWED_PREFIXES = [
   "npx biome check"
 ];
 
+const READONLY_ALLOWED_PREFIXES = [
+  "pwd",
+  "ls",
+  "find",
+  "git status",
+  "git diff",
+  "git log",
+  "git show",
+  "git branch",
+  "git rev-parse",
+  "git ls-files",
+  "cat",
+  "type",
+  "grep",
+  "rg",
+  "fd",
+  "jq",
+  "yq",
+  "head",
+  "tail",
+  "wc",
+  "sed",
+  "awk",
+  "bat",
+  "tree",
+  "node -v",
+  "node --version",
+  "npm -v",
+  "npm --version",
+  "pnpm -v",
+  "pnpm --version",
+  "yarn -v",
+  "yarn --version",
+  "python --version",
+  "python3 --version"
+];
+
+const READONLY_BLOCKED_PATTERNS = [
+  /(^|\s)rm\s+/,
+  /(^|\s)mv\s+/,
+  /(^|\s)cp\s+/,
+  /(^|\s)dd\s+/,
+  /(^|\s)sudo\s+/,
+  /(^|\s)chmod\s+/,
+  /(^|\s)chown\s+/,
+  /(^|\s)kill\s+/,
+  /(^|\s)pkill\s+/,
+  /(^|\s)curl\s+/,
+  /(^|\s)wget\s+/,
+  /(^|\s)ssh\s+/,
+  /(^|\s)scp\s+/,
+  /(^|\s)rsync\s+/,
+  /(^|\s)docker\s+/,
+  /(^|\s)podman\s+/,
+  /(^|\s)git\s+push\b/,
+  /(^|\s)git\s+reset\b/,
+  /(^|\s)git\s+clean\b/,
+  /(^|\s)git\s+checkout\b/,
+  /(^|\s)git\s+switch\b/,
+  /(^|\s)git\s+restore\b/,
+  /(^|\s)(npm|pnpm|yarn|bun)\s+/,
+  /(^|\s)pytest\b/,
+  /(^|\s)python\s+-m\s+pytest\b/,
+  /(^|\s)go\s+test\b/,
+  /(^|\s)cargo\s+/,
+  /(^|\s)tsc\b/,
+  /(^|\s)eslint\b/,
+  /(^|\s)--no-index\b/,
+  /(^|\s)--fix\b/,
+  /(^|\s)(\/|~(?:\/|\s|$))/,
+  /(^|\s)\.\.(?:\/|\s|$)/,
+  /\$(?:[A-Za-z_][A-Za-z0-9_]*|\{|\[)/,
+  /(^|[\s:])(?:\.env(?:[./\s:]|$)|\.git(?:[\/\s:]|$)|node_modules(?:[\/\s:]|$)|\.ssh(?:[\/\s:]|$)|id_rsa(?:[.\s:]|$)|id_ed25519(?:[.\s:]|$)|[^\s:]*\.(?:pem|key)(?:[\s:]|$))/,
+  /(^|\s)-exec\b/,
+  /(^|\s)-execdir\b/,
+  /(^|\s)-delete\b/,
+  /(^|\s)-ok\b/,
+  /(^|\s)-okdir\b/,
+  /(^|\s)-fprint\b/,
+  /(^|\s)-fprintf\b/,
+  /(^|\s)-fls\b/,
+  /(^|\s)(sed|perl)\s+.*(^|\s)-i(\s|$)/,
+  /[;&|<>`]/,
+  /\$\(/,
+  /\n/
+];
+
 const SAFE_BLOCKED_PATTERNS = [
   /(^|\s)rm\s+/,
   /(^|\s)mv\s+/,
@@ -116,8 +205,37 @@ function compact(command: string): string {
   return command.trim().replace(/\s+/g, " ");
 }
 
-function startsWithAllowedPrefix(command: string): boolean {
+const BASH_READ_ONLY_PREFIXES = [
+  "pwd",
+  "ls",
+  "find",
+  "git status",
+  "git diff",
+  "git log",
+  "git show",
+  "git branch",
+  "git rev-parse",
+  "git ls-files"
+];
+
+/** Whether bash requires workspace mutation lock under lease concurrency mode. */
+export function bashRequiresMutationLock(config: LeastConfig, command: string): boolean {
+  if (config.bashMode === "off") return false;
   const normalized = compact(command);
+  if (config.bashMode === "readonly" || config.bashMode === "full") {
+    const readonlyPrefix = READONLY_ALLOWED_PREFIXES.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix} `));
+    const blockedReadonlyShape = READONLY_BLOCKED_PATTERNS.some((pattern) => pattern.test(normalized));
+    return !readonlyPrefix || blockedReadonlyShape;
+  }
+  return !BASH_READ_ONLY_PREFIXES.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix} `));
+}
+
+function startsWithAllowedPrefix(command: string, config: LeastConfig): boolean {
+  const normalized = compact(command);
+  const effectiveMode = config.yoloMode ? "full" : config.bashMode;
+  if (effectiveMode === "readonly") {
+    return READONLY_ALLOWED_PREFIXES.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix} `));
+  }
   return isAllowedPackageScript(normalized) || SAFE_ALLOWED_PREFIXES.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix} `));
 }
 
@@ -129,24 +247,33 @@ function isAllowedPackageScript(command: string): boolean {
 
 function assertSafeCommand(config: LeastConfig, command: string): void {
   if (config.bashMode === "off") {
-    throw new LeastError("bash tool is disabled. Start with LEAST_BASH_MODE=safe or LEAST_BASH_MODE=full to enable it.");
+    throw new LeastError(
+      "bash tool is disabled. Start with LEAST_BASH_MODE=safe, LEAST_BASH_MODE=readonly, or LEAST_BASH_MODE=full to enable it."
+    );
   }
-  if (config.bashMode === "full") return;
+  const effectiveMode = config.yoloMode ? "full" : config.bashMode;
+  if (effectiveMode === "full") return;
 
   const normalized = compact(command);
-  for (const pattern of SAFE_BLOCKED_PATTERNS) {
+  const blockedPatterns = effectiveMode === "readonly" ? READONLY_BLOCKED_PATTERNS : SAFE_BLOCKED_PATTERNS;
+  for (const pattern of blockedPatterns) {
     if (pattern.test(normalized)) {
       throw new LeastError(
-        `Command is blocked in LEAST_BASH_MODE=safe: ${normalized}\n` +
-          "Use separate read/search/git tools, or restart with LEAST_BASH_MODE=full only for trusted repos."
+        `Command is blocked in LEAST_BASH_MODE=${effectiveMode}: ${normalized}\n` +
+          (effectiveMode === "readonly"
+            ? "Readonly bash allows inspection commands only. Use LEAST_BASH_MODE=safe for test/build scripts or LEAST_BASH_MODE=full for trusted automation."
+            : "Use separate read/search/git tools, or restart with LEAST_BASH_MODE=readonly or LEAST_BASH_MODE=full only for trusted repos.")
       );
     }
   }
-  if (!startsWithAllowedPrefix(normalized)) {
+  if (!startsWithAllowedPrefix(normalized, config)) {
     throw new LeastError(
-      `Command is not in the safe bash allowlist: ${normalized}\n` +
-        "Allowed examples: ls, find, git status, git diff, npm test, npm run typecheck, npm run build:clients, pytest, go test, cargo test. Use read/search tools for file contents. " +
-        "Use LEAST_BASH_MODE=full for trusted local automation."
+      effectiveMode === "readonly"
+        ? `Command is not in the readonly bash allowlist: ${normalized}\n` +
+            "Allowed examples: ls, find, git status, git diff, git ls-files, rg, head, tail, cat, grep. Use LEAST_BASH_MODE=safe for test/build scripts or LEAST_BASH_MODE=full for trusted automation."
+        : `Command is not in the safe bash allowlist: ${normalized}\n` +
+            "Allowed examples: ls, find, git status, git diff, npm test, npm run typecheck, npm run build:clients, pytest, go test, cargo test. Use read/search tools for file contents. " +
+            "Use LEAST_BASH_MODE=readonly for terminal-style inspection or LEAST_BASH_MODE=full for trusted local automation."
     );
   }
 }
@@ -181,11 +308,42 @@ function makeEnv(config: LeastConfig): NodeJS.ProcessEnv {
   };
 }
 
-function shellSpec(): { command: string; args: string[] } {
-  if (process.platform === "win32") {
-    return { command: process.env.ComSpec ?? "cmd.exe", args: ["/d", "/s", "/c"] };
+function windowsPathToWsl(winPath: string): string {
+  const normalized = path.resolve(winPath).replace(/\\/g, "/");
+  const match = normalized.match(/^([A-Za-z]):\/(.*)$/);
+  if (!match) return normalized.replace(/'/g, `'\\''`);
+  const drive = match[1].toLowerCase();
+  const rest = match[2];
+  return `/mnt/${drive}/${rest}`.replace(/'/g, `'\\''`);
+}
+
+async function shellSpec(config: LeastConfig, cwd?: string): Promise<{ command: string; args: string[]; wrapCommand?: (command: string) => string }> {
+  const backend: ShellBackend =
+    config.shellBackend === "auto" ? (process.platform === "win32" ? "cmd" : "bash") : config.shellBackend;
+
+  switch (backend) {
+    case "powershell": {
+      const ps = await resolvePowerShellCommand();
+      return {
+        command: ps,
+        args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+      };
+    }
+    case "cmd":
+      return { command: process.env.ComSpec ?? "cmd.exe", args: ["/d", "/s", "/c"] };
+    case "bash":
+      return { command: fs.existsSync("/bin/bash") ? "/bin/bash" : "bash", args: ["-lc"] };
+    case "wsl": {
+      const wslCwd = cwd ? windowsPathToWsl(cwd) : undefined;
+      return {
+        command: "wsl.exe",
+        args: ["bash", "-lc"],
+        wrapCommand: (command: string) => (wslCwd ? `cd '${wslCwd}' && ${command}` : command)
+      };
+    }
+    default:
+      return { command: fs.existsSync("/bin/bash") ? "/bin/bash" : "bash", args: ["-lc"] };
   }
-  return { command: fs.existsSync("/bin/bash") ? "/bin/bash" : "bash", args: ["-lc"] };
 }
 
 function trimOutput(value: string, maxBytes: number): { value: string; truncated: boolean } {
@@ -210,8 +368,10 @@ export async function runBash(
   const start = Date.now();
 
   return new Promise((resolve, reject) => {
-    const shell = shellSpec();
-    const child = spawn(shell.command, [...shell.args, command], {
+    void (async () => {
+    const shell = await shellSpec(config, cwd);
+    const effectiveCommand = shell.wrapCommand ? shell.wrapCommand(command) : command;
+    const child = spawn(shell.command, [...shell.args, effectiveCommand], {
       cwd,
       env: makeEnv(config),
       stdio: ["ignore", "pipe", "pipe"]
@@ -254,8 +414,10 @@ export async function runBash(
         durationMs: Date.now() - start,
         stdout: out.value,
         stderr: err.value,
-        truncated: out.truncated || err.truncated
+        truncated: out.truncated || err.truncated,
+        timedOut: killedByTimeout
       });
     });
+    })().catch(reject);
   });
 }

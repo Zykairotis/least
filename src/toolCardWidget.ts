@@ -1,4 +1,6 @@
 export const TOOL_CARD_URI = "ui://widget/least-tool-card-v8.html";
+/** Older builds pointed tools at v9; keep serving the same HTML for cached ChatGPT apps. */
+export const TOOL_CARD_URI_ALIASES = ["ui://widget/least-tool-card-v9.html"] as const;
 export const TOOL_CARD_MIME_TYPE = "text/html;profile=mcp-app";
 
 export const toolCardWidgetHtml = String.raw`
@@ -11,7 +13,7 @@ export const toolCardWidgetHtml = String.raw`
         <div class="title">Least</div>
         <div class="subtitle">Waiting for tool result...</div>
       </div>
-      <span class="pill info">waiting</span>
+      <span class="pill frost">waiting</span>
     </header>
     <div class="skeleton">
       <span></span>
@@ -23,92 +25,95 @@ export const toolCardWidgetHtml = String.raw`
 
 <style>
   :root {
-    color-scheme: dark light;
-    --panel: #11151c;
-    --panel-2: #161b24;
-    --panel-3: #0c1016;
-    --panel-4: #1d222b;
-    --line: rgba(212, 219, 229, 0.13);
-    --line-strong: rgba(212, 219, 229, 0.24);
-    --text: #f2f4f7;
-    --soft: #c9d0da;
-    --muted: #97a1af;
-    --quiet: #6f7988;
-    --accent: #d7b56d;
-    --accent-soft: rgba(215, 181, 109, 0.12);
-    --blue: #9dc3ff;
-    --green: #8edc99;
-    --red: #f29a9a;
-    --amber: #e8c978;
-    --shadow: rgba(0, 0, 0, 0.26);
+    color-scheme: dark;
+    --nord0: #030407;
+    --nord1: #06080c;
+    --nord2: #0a0d12;
+    --nord3: #0f131a;
+    --nord4: #151b24;
+    --nord5: #7b8799;
+    --nord6: #a3afc0;
+    --nord7: #c8d0dc;
+    --nord8: #7ab8b6;
+    --nord9: #6fa8b8;
+    --nord10: #6d8faa;
+    --nord11: #4d6d8c;
+    --nord12: #a85b64;
+    --nord13: #b06f5a;
+    --nord14: #c4a86a;
+    --nord15: #7fa070;
+    --nord16: #9a7a9e;
+    --line: rgba(77, 109, 140, 0.2);
+    --line-strong: rgba(77, 109, 140, 0.32);
+    --shadow: rgba(0, 0, 0, 0.72);
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Monaco, Consolas, monospace;
+    --sans: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
   }
 
   * { box-sizing: border-box; }
 
-  body {
+  html, body {
     margin: 0;
     background: transparent;
-    color: var(--text);
-    font: 12px/1.48 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    letter-spacing: 0;
+    color: var(--nord7);
+    font: 12px/1.5 var(--sans);
   }
 
   .wrap {
     width: 100%;
+    background: var(--nord0);
   }
 
   .card {
     position: relative;
     overflow: hidden;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    background:
-      radial-gradient(circle at 18px 0, rgba(215, 181, 109, 0.12), transparent 42px),
-      linear-gradient(180deg, rgba(255, 255, 255, 0.042), rgba(255, 255, 255, 0)),
-      var(--panel);
-    box-shadow: 0 14px 34px var(--shadow);
+    border-radius: 10px;
+    background: var(--nord1);
+    box-shadow: 0 10px 28px var(--shadow);
   }
 
   .rail {
     position: absolute;
     inset: 0 auto 0 0;
     width: 3px;
-    background: linear-gradient(180deg, var(--accent), rgba(142, 220, 153, 0.75) 64%, transparent);
-    opacity: 0.88;
+    background: var(--nord11);
+    opacity: 0.9;
   }
 
   .head {
     display: grid;
-    grid-template-columns: 28px minmax(0, 1fr) auto;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
     align-items: center;
     gap: 10px;
-    min-height: 56px;
-    padding: 11px 12px 10px 14px;
+    min-height: 58px;
+    padding: 12px 14px 11px 16px;
     border-bottom: 1px solid var(--line);
+    background: var(--nord2);
   }
 
   .glyph {
     display: inline-grid;
     place-items: center;
-    width: 26px;
-    height: 26px;
-    border: 1px solid rgba(215, 181, 109, 0.28);
+    width: 28px;
+    height: 28px;
+    border: 1px solid var(--line-strong);
     border-radius: 8px;
-    background: linear-gradient(180deg, rgba(215, 181, 109, 0.16), rgba(215, 181, 109, 0.04));
-    color: var(--accent);
-    font-size: 10px;
-    font-weight: 900;
+    background: var(--nord3);
+    color: var(--nord8);
+    font: 10px/1 var(--mono);
+    font-weight: 800;
+    letter-spacing: -0.02em;
   }
 
-  .headline {
-    min-width: 0;
-  }
+  .headline { min-width: 0; }
 
   .title {
     overflow: hidden;
-    color: var(--text);
+    color: var(--nord7);
     font-size: 12px;
-    font-weight: 760;
+    font-weight: 750;
+    letter-spacing: 0.01em;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -116,9 +121,9 @@ export const toolCardWidgetHtml = String.raw`
   .subtitle {
     overflow: hidden;
     margin-top: 2px;
-    color: var(--muted);
+    color: var(--nord5);
     font-size: 11px;
-    font-weight: 650;
+    font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -127,7 +132,7 @@ export const toolCardWidgetHtml = String.raw`
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end;
-    gap: 6px;
+    gap: 5px;
     min-width: 0;
   }
 
@@ -135,66 +140,123 @@ export const toolCardWidgetHtml = String.raw`
     display: inline-flex;
     align-items: center;
     min-height: 20px;
-    max-width: 22ch;
+    max-width: 24ch;
     overflow: hidden;
-    padding: 2px 7px;
+    padding: 2px 8px;
     border: 1px solid var(--line);
-    border-radius: 6px;
-    background: rgba(255, 255, 255, 0.035);
-    color: var(--muted);
+    border-radius: 999px;
+    background: var(--nord3);
+    color: var(--nord5);
     font-size: 10px;
-    font-weight: 720;
+    font-weight: 700;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .pill.good { color: var(--green); border-color: rgba(134, 239, 172, 0.28); background: rgba(134, 239, 172, 0.08); }
-  .pill.bad { color: var(--red); border-color: rgba(253, 164, 175, 0.28); background: rgba(253, 164, 175, 0.08); }
-  .pill.info { color: var(--blue); border-color: rgba(157, 195, 255, 0.28); background: rgba(157, 195, 255, 0.08); }
-  .pill.warn { color: var(--amber); border-color: rgba(253, 230, 138, 0.28); background: rgba(253, 230, 138, 0.08); }
+  .pill.good { color: var(--nord15); border-color: rgba(127, 160, 112, 0.35); background: #0c120d; }
+  .pill.bad { color: var(--nord12); border-color: rgba(168, 91, 100, 0.35); background: #120a0b; }
+  .pill.frost { color: var(--nord9); border-color: rgba(111, 168, 184, 0.35); background: #0a1014; }
+  .pill.warn { color: var(--nord14); border-color: rgba(196, 168, 106, 0.35); background: #12100a; }
+  .pill.accent { color: var(--nord8); border-color: rgba(122, 184, 182, 0.35); background: #0a1111; }
+  .pill.muted { color: var(--nord10); border-color: var(--line); background: var(--nord2); }
 
-  .body {
-    max-height: 420px;
-    overflow: auto;
-    padding: 10px;
+  .strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    background: var(--nord0);
   }
 
-  .metrics {
+  .strip-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 22px;
+    padding: 2px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--nord2);
+    color: var(--nord6);
+    font-size: 10px;
+    font-weight: 650;
+  }
+
+  .strip-key {
+    color: var(--nord10);
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .body {
+    max-height: 460px;
+    overflow: auto;
+    padding: 12px;
+    background: var(--nord1);
+  }
+
+  .banner {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px;
+    margin-bottom: 10px;
+    padding: 10px 11px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--nord2);
+    color: var(--nord6);
+    font-size: 11px;
+  }
+
+  .banner strong { color: var(--nord8); font-weight: 800; }
+
+  .metrics,
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 8px;
     margin-bottom: 10px;
   }
 
-  .metric {
+  .metric,
+  .summary-item {
     min-width: 0;
-    padding: 8px 9px;
+    padding: 9px 10px;
     border: 1px solid var(--line);
-    border-radius: 7px;
-    background: rgba(255, 255, 255, 0.025);
+    border-radius: 8px;
+    background: var(--nord2);
   }
 
-  .metric .label {
+  .metric .label,
+  .summary-label {
     display: block;
     margin-bottom: 4px;
-    color: var(--quiet);
-    font-size: 10px;
-    font-weight: 900;
+    color: var(--nord10);
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
   }
 
-  .metric .value {
+  .metric .value,
+  .summary-value {
     overflow: hidden;
-    color: var(--soft);
+    color: var(--nord7);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 750;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
+  .metric .value.small { font-size: 11px; font-weight: 650; }
+
   .code {
     overflow: hidden;
     border: 1px solid var(--line);
-    border-radius: 7px;
-    background: var(--panel-3);
+    border-radius: 8px;
+    background: var(--nord0);
   }
 
   .codebar {
@@ -203,82 +265,49 @@ export const toolCardWidgetHtml = String.raw`
     justify-content: space-between;
     gap: 10px;
     min-height: 30px;
-    padding: 6px 9px;
+    padding: 6px 10px;
     border-bottom: 1px solid var(--line);
-    background: var(--panel-2);
-    color: var(--muted);
-    font-size: 11px;
-    font-weight: 720;
+    background: var(--nord2);
+    color: var(--nord10);
+    font-size: 10px;
+    font-weight: 750;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
   }
 
   pre {
     margin: 0;
     padding: 10px;
     overflow: visible;
-    color: var(--soft);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    color: var(--nord6);
+    font-family: var(--mono);
     font-size: 11px;
-    line-height: 1.52;
+    line-height: 1.55;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
 
   .diff-line { display: block; min-height: 18px; padding: 0 4px; border-radius: 3px; }
-  .diff-add { color: var(--green); background: rgba(142, 220, 153, 0.08); }
-  .diff-del { color: var(--red); background: rgba(242, 154, 154, 0.08); }
-  .diff-hunk { color: var(--blue); }
-  .terminal pre { color: #dbe7f5; }
-  .prompt { color: var(--accent); }
-
-  .summary {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 8px;
-    margin-bottom: 10px;
-  }
-
-  .summary-item {
-    min-width: 0;
-    padding: 9px 10px;
-    border: 1px solid var(--line);
-    border-radius: 7px;
-    background: rgba(255, 255, 255, 0.025);
-  }
-
-  .summary-label {
-    display: block;
-    margin-bottom: 4px;
-    color: var(--quiet);
-    font-size: 10px;
-    font-weight: 760;
-  }
-
-  .summary-value {
-    color: var(--text);
-    font-size: 15px;
-    font-variant-numeric: tabular-nums;
-    font-weight: 760;
-  }
-
-  .file-list {
-    display: grid;
-    gap: 4px;
-    margin-bottom: 10px;
-  }
+  .diff-add { color: var(--nord15); background: #0b100c; }
+  .diff-del { color: var(--nord12); background: #100b0c; }
+  .diff-hunk { color: var(--nord9); }
+  .terminal pre { color: var(--nord7); }
+  .prompt { color: var(--nord8); font-weight: 800; }
 
   .section-label {
-    margin: 10px 1px 6px;
-    color: var(--quiet);
-    font-size: 10px;
+    margin: 12px 1px 6px;
+    color: var(--nord10);
+    font-size: 9px;
     font-weight: 850;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
   }
 
   .fold {
     margin-top: 8px;
     border: 1px solid var(--line);
-    border-radius: 7px;
-    background: rgba(255, 255, 255, 0.018);
+    border-radius: 8px;
+    background: var(--nord0);
   }
 
   .fold > summary {
@@ -286,11 +315,11 @@ export const toolCardWidgetHtml = String.raw`
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 10px;
     align-items: center;
-    min-height: 34px;
+    min-height: 36px;
     padding: 8px 10px;
     cursor: pointer;
-    color: var(--soft);
-    font-weight: 760;
+    color: var(--nord6);
+    font-weight: 700;
     list-style: none;
   }
 
@@ -303,92 +332,139 @@ export const toolCardWidgetHtml = String.raw`
   }
 
   .fold-count {
-    color: var(--muted);
+    color: var(--nord10);
     font-size: 10px;
     font-weight: 800;
   }
 
-  .fold-body {
-    padding: 0 8px 8px;
-  }
+  .fold-body { padding: 0 8px 8px; }
+
+  .file-list { display: grid; gap: 5px; margin-bottom: 10px; }
 
   .file-row {
     display: grid;
-    grid-template-columns: 42px minmax(0, 1fr);
+    grid-template-columns: 48px minmax(0, 1fr) auto;
     gap: 8px;
     align-items: center;
-    padding: 7px 8px;
+    padding: 7px 9px;
     border: 1px solid var(--line);
-    border-radius: 7px;
-    background: rgba(255, 255, 255, 0.022);
+    border-radius: 8px;
+    background: var(--nord2);
   }
 
   .file-code {
-    color: var(--accent);
-    font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    color: var(--nord8);
+    font: 10px/1.2 var(--mono);
     font-weight: 800;
   }
 
   .file-name {
     overflow: hidden;
-    color: var(--soft);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    color: var(--nord6);
+    font-family: var(--mono);
+    font-size: 11px;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .file-tag {
+    color: var(--nord10);
+    font-size: 9px;
+    font-weight: 800;
+    text-transform: uppercase;
   }
 
   .empty {
     padding: 10px;
     border: 1px dashed var(--line-strong);
-    border-radius: 7px;
-    background: rgba(255, 255, 255, 0.018);
-    color: var(--muted);
+    border-radius: 8px;
+    background: var(--nord0);
+    color: var(--nord5);
+    font-size: 11px;
   }
 
-  .search {
-    display: grid;
-    gap: 4px;
-  }
+  .search { display: grid; gap: 4px; }
 
   .hit {
     display: grid;
-    grid-template-columns: minmax(120px, 0.34fr) minmax(0, 1fr);
+    grid-template-columns: minmax(120px, 0.36fr) minmax(0, 1fr);
     gap: 8px;
-    padding: 6px 8px;
-    border-radius: 7px;
+    padding: 7px 8px;
+    border-radius: 8px;
   }
 
-  .hit:nth-child(odd) {
-    background: rgba(255, 255, 255, 0.025);
-  }
+  .hit:nth-child(odd) { background: var(--nord2); }
 
   .hit-file {
     overflow: hidden;
-    color: var(--blue);
-    font-weight: 850;
+    color: var(--nord9);
+    font-weight: 800;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .hit-text {
-    color: var(--soft);
-    overflow-wrap: anywhere;
+  .hit-text { color: var(--nord6); overflow-wrap: anywhere; }
+
+  .footer {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-top: 1px solid var(--line);
+    background: var(--nord0);
+    color: var(--nord10);
+    font-size: 10px;
+    font-weight: 650;
   }
 
-  .muted { color: var(--muted); }
+  .footer code {
+    color: var(--nord8);
+    font-family: var(--mono);
+    font-size: 10px;
+  }
+
+  .skill-bars {
+    display: grid;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+
+  .skill-bar {
+    display: grid;
+    grid-template-columns: 56px 1fr 28px;
+    gap: 8px;
+    align-items: center;
+    font-size: 10px;
+    color: var(--nord5);
+  }
+
+  .skill-track {
+    height: 6px;
+    border-radius: 999px;
+    background: var(--nord3);
+    overflow: hidden;
+  }
+
+  .skill-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--nord11);
+  }
+
+  .muted { color: var(--nord5); }
 
   .skeleton {
     display: grid;
     gap: 7px;
-    padding: 11px 13px 13px 17px;
-    border-top: 1px solid rgba(255, 255, 255, 0.02);
+    padding: 12px 14px 14px 18px;
   }
 
   .skeleton span {
     height: 8px;
     max-width: 78%;
     border-radius: 999px;
-    background: linear-gradient(90deg, rgba(148, 163, 184, 0.12), rgba(148, 163, 184, 0.22), rgba(148, 163, 184, 0.12));
+    background: var(--nord3);
     animation: least-sheen 1.55s ease-in-out infinite;
   }
 
@@ -396,16 +472,15 @@ export const toolCardWidgetHtml = String.raw`
   .skeleton span:nth-child(3) { max-width: 66%; animation-delay: 0.24s; }
 
   @keyframes least-sheen {
-    0%, 100% { opacity: 0.46; transform: translateX(0); }
+    0%, 100% { opacity: 0.42; transform: translateX(0); }
     50% { opacity: 1; transform: translateX(2px); }
   }
 
-  @media (max-width: 640px) {
-    .head { grid-template-columns: 28px minmax(0, 1fr); }
+  @media (max-width: 720px) {
+    .head { grid-template-columns: 30px minmax(0, 1fr); }
     .meta { grid-column: 1 / -1; justify-content: flex-start; }
-    .summary,
-    .metrics,
-    .hit { grid-template-columns: 1fr; }
+    .summary, .metrics, .hit, .file-row { grid-template-columns: 1fr; }
+    .summary, .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
 </style>
 
@@ -414,10 +489,10 @@ export const toolCardWidgetHtml = String.raw`
 
   function esc(value) {
     return String(value ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;");
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   }
 
   function truncate(value, max = 9000) {
@@ -445,50 +520,87 @@ export const toolCardWidgetHtml = String.raw`
     return text.split("/").filter(Boolean).pop() || text || ".";
   }
 
+  function shortId(value) {
+    const text = String(value || "");
+    if (!text) return "-";
+    return text.length > 14 ? text.slice(0, 8) + "..." + text.slice(-4) : text;
+  }
+
+  function formatBytes(bytes) {
+    const n = Number(bytes);
+    if (!Number.isFinite(n) || n <= 0) return "-";
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+    if (n >= 1024) return Math.round(n / 1024) + " KB";
+    return n + " B";
+  }
+
+  function parseGitBranch(status) {
+    const line = String(status || "").split("\n").find((row) => row.startsWith("##"));
+    if (!line) return "";
+    const body = line.slice(2).trim();
+    const branch = body.split("...")[0].trim();
+    return branch || body;
+  }
+
   function titleFor(tool) {
     const titles = {
       open_current_workspace: "Workspace",
       open_workspace: "Workspace",
       write: "File write",
       edit: "Exact edit",
-      git_diff: "Git Diff",
+      git_diff: "Git diff",
       show_changes: "Change review",
       export_pro_context: "Pro context",
       handoff_to_agent: "Agent handoff",
       handoff_to_codex: "Codex handoff",
       bash: "Terminal",
       search: "Search",
-      read: "Read file"
+      read: "Read file",
+      context_pack: "Context pack",
+      least_gain: "Least gain",
+      least_discover: "Least discover",
+      retrieve_output: "Retrieve output"
     };
-    return titles[tool] || "Least";
+    return titles[tool] || (tool ? tool.replace(/_/g, " ") : "Least");
   }
 
   function iconFor(tool) {
-    if (tool === "open_current_workspace" || tool === "open_workspace") return "W";
-    if (tool === "write") return "W";
-    if (tool === "edit") return "E";
-    if (tool === "git_diff") return "G";
-    if (tool === "show_changes") return "D";
-    if (tool === "export_pro_context") return "P";
-    if (tool === "handoff_to_agent") return "A";
-    if (tool === "handoff_to_codex") return "H";
-    if (tool === "bash") return "$";
-    if (tool === "search") return "S";
-    if (tool === "read") return "R";
-    return "L";
+    const icons = {
+      open_current_workspace: "W",
+      open_workspace: "W",
+      write: "W",
+      edit: "E",
+      git_diff: "G",
+      show_changes: "D",
+      export_pro_context: "P",
+      handoff_to_agent: "A",
+      handoff_to_codex: "C",
+      bash: "$",
+      search: "S",
+      read: "R",
+      context_pack: "K"
+    };
+    return icons[tool] || "L";
   }
 
   function subtitleFor(data) {
     if (data?.least_tool === "open_current_workspace" || data?.least_tool === "open_workspace") {
-      return data?.root || "Workspace opened";
+      const branch = parseGitBranch(data?.git_status);
+      return branch ? branch + " · " + basename(data?.root || "") : (data?.root || "Workspace opened");
     }
     if (data?.least_tool === "show_changes") {
       if (data?.status_error || data?.diff_error) return "Git state unavailable";
       const count = Array.isArray(data?.changed_files) ? data.changed_files.length : 0;
-      if (!count && !data?.changed) return "Workspace is clean";
-      return count === 1 ? "1 changed file" : count + " changed files";
+      const untracked = Number(data?.untracked_summary?.count || 0);
+      if (!count && !untracked && !data?.changed) return "Working tree clean";
+      const parts = [];
+      if (count) parts.push(count + " tracked");
+      if (untracked) parts.push(untracked + " untracked");
+      return parts.join(" · ");
     }
-    if (data?.least_tool === "handoff_to_agent" && data?.agent_name) return data.agent_name;
+    if (data?.least_tool === "handoff_to_agent" || data?.least_tool === "handoff_to_codex") {
+      return data?.agent_name || data?.agent || "Handoff written";
+    }
     if (data?.path) return data.path;
     if (data?.plan_path) return data.plan_path;
     if (data?.root) return data.root;
@@ -497,6 +609,7 @@ export const toolCardWidgetHtml = String.raw`
   }
 
   function pill(text, cls) {
+    if (!text) return "";
     return '<span class="pill ' + esc(cls || "") + '">' + esc(text) + '</span>';
   }
 
@@ -507,13 +620,48 @@ export const toolCardWidgetHtml = String.raw`
       '<header class="head">',
       '<span class="glyph">' + esc(iconFor(tool)) + '</span>',
       '<div class="headline"><div class="title">' + esc(titleFor(tool)) + '</div><div class="subtitle">' + esc(subtitleFor(data)) + '</div></div>',
-      '<div class="meta">' + (pills || '') + '</div>',
+      '<div class="meta">' + (pills || "") + '</div>',
       '</header>'
-    ].join('');
+    ].join("");
   }
 
-  function metric(label, value) {
-    return '<div class="metric"><span class="label">' + esc(label) + '</span><div class="value">' + esc(value ?? "-") + '</div></div>';
+  function footer(data) {
+    const id = data?.workspace_id ? '<code>' + esc(shortId(data.workspace_id)) + '</code>' : "";
+    const tool = data?.least_tool ? "tool " + esc(data.least_tool) : "least";
+    return '<footer class="footer"><span>' + tool + '</span><span>workspace ' + (id || "-") + '</span></footer>';
+  }
+
+  function stripItem(key, value) {
+    if (!value) return "";
+    return '<span class="strip-item"><span class="strip-key">' + esc(key) + '</span><span>' + esc(value) + '</span></span>';
+  }
+
+  function statusStrip(data) {
+    const branch = parseGitBranch(data?.git_status);
+    const lock = data?.lock;
+    const lockText = lock?.locked ? "locked" : data?.concurrency_mode && data.concurrency_mode !== "off" ? "unlocked" : "";
+    const items = [
+      stripItem("branch", branch),
+      stripItem("toolset", data?.toolset),
+      stripItem("shell", data?.shell_backend),
+      stripItem("lock", lockText),
+      stripItem("concurrency", data?.concurrency_mode)
+    ].filter(Boolean).join("");
+    return items ? '<div class="strip">' + items + '</div>' : "";
+  }
+
+  function compactionBanner(data) {
+    if (!data?.compacted && !data?.output_meta?.compacted) return "";
+    const raw = formatBytes(data?.rawBytes ?? data?.output_meta?.rawBytes);
+    const visible = formatBytes(data?.visibleBytes ?? data?.output_meta?.visibleBytes);
+    const saved = formatBytes(data?.savedBytes ?? data?.output_meta?.savedBytes);
+    const key = data?.output_meta?.retrievalKey || data?.output_meta?.retrievalHint || "";
+    const hint = key ? '<div class="muted">Retrieve omitted detail with <strong>retrieve_output</strong>.</div>' : "";
+    return '<div class="banner"><div><strong>Compact output</strong> · raw ' + esc(raw) + ' → visible ' + esc(visible) + (saved !== "-" ? ' · saved ' + esc(saved) : '') + '</div>' + hint + '</div>';
+  }
+
+  function metric(label, value, small) {
+    return '<div class="metric"><span class="label">' + esc(label) + '</span><div class="value' + (small ? " small" : "") + '">' + esc(value ?? "-") + '</div></div>';
   }
 
   function summaryItem(label, value) {
@@ -536,6 +684,20 @@ export const toolCardWidgetHtml = String.raw`
     return "skill";
   }
 
+  function skillBars(counts) {
+    const total = Math.max(1, Number(counts?.total || 0));
+    const rows = [
+      ["repo", Number(counts?.workspace || 0)],
+      ["user", Number(counts?.user || 0)],
+      ["plug", Number(counts?.plugin || 0)]
+    ].filter((row) => row[1] > 0);
+    if (!rows.length) return "";
+    return '<div class="skill-bars">' + rows.map(([label, count]) => {
+      const pct = Math.max(8, Math.round((count / total) * 100));
+      return '<div class="skill-bar"><span>' + esc(label) + '</span><div class="skill-track"><div class="skill-fill" style="width:' + pct + '%"></div></div><span>' + esc(count) + '</span></div>';
+    }).join("") + '</div>';
+  }
+
   function renderDiff(diff) {
     return truncate(diff, 14000).split("\n").map((line) => {
       let cls = "diff-line";
@@ -548,50 +710,70 @@ export const toolCardWidgetHtml = String.raw`
 
   function renderFile(data) {
     const pills = [
-      data.bytes !== undefined ? pill(data.bytes + " bytes") : "",
+      pill(data.path ? basename(data.path) : "", "accent"),
+      data.bytes !== undefined ? pill(formatBytes(data.bytes), "muted") : "",
+      data.sha256 ? pill(shortId(data.sha256), "muted") : "",
       data.additions !== undefined ? pill("+" + data.additions, "good") : "",
-      data.deletions !== undefined ? pill("-" + data.deletions, "bad") : "",
-      data.replacements !== undefined ? pill(data.replacements + " replacements", "info") : ""
+      data.deletions !== undefined ? pill("-" + data.deletions, "bad") : ""
     ].join("");
     const body = data.diff ? renderDiff(data.diff) : esc(truncate(data.text || ""));
-    return '<article class="card">' + header(data, pills) + '<div class="body">' +
+    return '<article class="card">' + header(data, pills) + compactionBanner(data) + '<div class="body">' +
+      '<div class="summary">' +
+      summaryItem("Bytes", formatBytes(data.bytes)) +
+      summaryItem("Added", "+" + (data.additions ?? 0)) +
+      summaryItem("Removed", "-" + (data.deletions ?? 0)) +
+      summaryItem("Edits", data.replacements ?? "-") +
+      '</div>' +
       codebox(basename(data.path || data.plan_path || "file"), body, "") +
-      '</div></article>';
+      '</div>' + footer(data) + '</article>';
   }
 
   function renderChanges(data) {
     const files = Array.isArray(data.changed_files) ? data.changed_files : [];
+    const untracked = data.untracked_summary;
     const hasGitError = Boolean(data.status_error || data.diff_error);
     const changed = Boolean(data.changed);
     const pills = [
-      hasGitError ? pill("git unavailable", "warn") : changed ? pill("changed", "info") : pill("clean", "good"),
+      hasGitError ? pill("git unavailable", "warn") : changed ? pill("dirty", "warn") : pill("clean", "good"),
+      data.staged ? pill("staged", "frost") : "",
+      data.summary_only ? pill("summary only", "muted") : pill(data.include_diff === false ? "no diff" : "with diff", "frost"),
       data.additions !== undefined ? pill("+" + data.additions, "good") : "",
       data.deletions !== undefined ? pill("-" + data.deletions, "bad") : ""
     ].join("");
-    const fileRows = files.slice(0, 10).map((line) => {
+    const fileRows = files.slice(0, 12).map((line) => {
       const status = String(line).slice(0, 2).trim() || "?";
       const name = String(line).slice(2).trim() || String(line);
-      return '<div class="file-row"><span class="file-code">' + esc(status) + '</span><span class="file-name">' + esc(name) + '</span></div>';
+      return '<div class="file-row"><span class="file-code">' + esc(status) + '</span><span class="file-name">' + esc(name) + '</span><span class="file-tag">tracked</span></div>';
     }).join("");
-    const moreFiles = files.length > 10 ? '<div class="empty">+' + esc(files.length - 10) + ' more changed files</div>' : "";
+    const moreFiles = files.length > 12 ? '<div class="empty">+' + esc(files.length - 12) + ' more changed files</div>' : "";
+    const untrackedRows = Array.isArray(untracked?.paths) ? untracked.paths.slice(0, 8).map((item) => {
+      const path = typeof item === "string" ? item : item?.path || "?";
+      const kind = typeof item === "object" && item?.kind ? item.kind : "file";
+      return '<div class="file-row"><span class="file-code">??</span><span class="file-name">' + esc(path) + '</span><span class="file-tag">' + esc(kind) + '</span></div>';
+    }).join("") : "";
     const state = hasGitError
       ? '<div class="empty">' + esc(data.status_error || data.diff_error) + '</div>'
       : fileRows
         ? '<div class="file-list">' + fileRows + '</div>' + moreFiles
-        : '<div class="empty">No changed files.</div>';
+        : '<div class="empty">No tracked changes.</div>';
+    const untrackedBlock = untracked?.count
+      ? '<div class="section-label">Untracked</div><div class="file-list">' + (untrackedRows || '<div class="empty">' + esc(untracked.text || (untracked.count + " files")) + '</div>') + '</div>'
+      : "";
     const diff = data.diff ? codebox("diff", renderDiff(data.diff), "") : "";
-    return '<article class="card">' + header(data, pills) + '<div class="body">' +
+    return '<article class="card">' + header(data, pills) + statusStrip({ git_status: data.status }) + compactionBanner(data) + '<div class="body">' +
       '<div class="summary">' +
-      summaryItem("Files", files.length) +
+      summaryItem("Tracked", files.length) +
+      summaryItem("Untracked", untracked?.count ?? 0) +
       summaryItem("Added", "+" + (data.additions ?? 0)) +
       summaryItem("Deleted", "-" + (data.deletions ?? 0)) +
       '</div>' +
-      state +
+      '<div class="section-label">Tracked changes</div>' + state +
+      untrackedBlock +
       diff +
-      '</div></article>';
+      '</div>' + footer(data) + '</article>';
   }
 
-  function gitStatusRows(status, max = 8) {
+  function gitStatusRows(status, max = 10) {
     return String(status || "")
       .split("\n")
       .map((line) => line.trim())
@@ -600,69 +782,84 @@ export const toolCardWidgetHtml = String.raw`
       .map((line) => {
         const code = line.slice(0, 2).trim() || "?";
         const name = line.slice(2).trim() || line;
-        return '<div class="file-row"><span class="file-code">' + esc(code) + '</span><span class="file-name">' + esc(name) + '</span></div>';
+        return '<div class="file-row"><span class="file-code">' + esc(code) + '</span><span class="file-name">' + esc(name) + '</span><span class="file-tag">git</span></div>';
       })
       .join("");
   }
 
   function renderWorkspace(data) {
-    const skills = Array.isArray(data.skill_inventory) ? data.skill_inventory : (Array.isArray(data.skills) ? data.skills : []);
+    const skills = Array.isArray(data.skill_inventory) ? data.skill_inventory : (Array.isArray(data.skills) ? data.skills.map((name) => ({ name, source: "workspace" })) : []);
     const skillCount = Number(data.skill_counts?.total ?? skills.length);
-    const changedRows = gitStatusRows(data.git_status, 8);
+    const changedRows = gitStatusRows(data.git_status, 10);
     const gitLines = String(data.git_status || "").split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("##"));
-    const agentsLabel = data.agents_loaded ? (data.agents_path || "AGENTS.md") : "no AGENTS";
+    const branch = parseGitBranch(data.git_status);
     const pills = [
-      pill(agentsLabel, data.agents_loaded ? "good" : "warn"),
-      pill(skillCount + " skills", skillCount ? "info" : ""),
-      data.tool_mode ? pill("tools " + data.tool_mode) : ""
+      pill(branch || "no branch", "frost"),
+      pill(data.agents_loaded ? (data.agents_path || "AGENTS.md") : "no AGENTS", data.agents_loaded ? "good" : "warn"),
+      pill(skillCount + " skills", skillCount ? "accent" : "muted"),
+      pill("tools " + (data.tool_mode || "-"), "muted")
     ].join("");
     const contextRows = [
-      '<div class="file-row"><span class="file-code">root</span><span class="file-name">' + esc(data.root || ".") + '</span></div>',
-      data.workspace_id ? '<div class="file-row"><span class="file-code">id</span><span class="file-name">' + esc(data.workspace_id) + '</span></div>' : "",
-      data.agents_loaded ? '<div class="file-row"><span class="file-code">rules</span><span class="file-name">' + esc(data.agents_path || "AGENTS.md") + '</span></div>' : ""
+      '<div class="file-row"><span class="file-code">root</span><span class="file-name">' + esc(data.root || ".") + '</span><span class="file-tag">path</span></div>',
+      data.workspace_id ? '<div class="file-row"><span class="file-code">id</span><span class="file-name">' + esc(data.workspace_id) + '</span><span class="file-tag">session</span></div>' : "",
+      data.agents_loaded ? '<div class="file-row"><span class="file-code">rules</span><span class="file-name">' + esc(data.agents_path || "AGENTS.md") + '</span><span class="file-tag">agent</span></div>' : "",
+      data.toolset ? '<div class="file-row"><span class="file-code">set</span><span class="file-name">' + esc(data.toolset) + '</span><span class="file-tag">tools</span></div>' : ""
     ].join("");
-    const skillRows = skills.slice(0, 16).map((skill) => {
+    const skillRows = skills.slice(0, 18).map((skill) => {
       const value = typeof skill === "string" ? skill : (skill?.name || "skill");
       const source = typeof skill === "string" ? "skill" : shortSource(skill?.source);
-      return '<div class="file-row"><span class="file-code">' + esc(source) + '</span><span class="file-name">' + esc(value) + '</span></div>';
+      const desc = typeof skill === "object" && skill?.description ? skill.description : "";
+      return '<div class="file-row"><span class="file-code">' + esc(source) + '</span><span class="file-name" title="' + esc(desc) + '">' + esc(value) + '</span><span class="file-tag">skill</span></div>';
     }).join("");
     const skillText = skills.length
-      ? '<div class="file-list">' + skillRows + '</div>' + (skills.length > 16 ? '<div class="empty">+' + esc(skills.length - 16) + ' more skills</div>' : "")
-      : '<div class="empty">No skills discovered. Use include_global_skills=true if this is unexpected.</div>';
+      ? skillBars(data.skill_counts) + '<div class="file-list">' + skillRows + '</div>' + (skills.length > 18 ? '<div class="empty">+' + esc(skills.length - 18) + ' more skills</div>' : "")
+      : '<div class="empty">No skills discovered. Pass include_skills=true or include_global_skills=true.</div>';
     const gitText = changedRows
-      ? '<div class="file-list">' + changedRows + '</div>' + (gitLines.length > 8 ? '<div class="empty">+' + esc(gitLines.length - 8) + ' more changed files</div>' : "")
+      ? '<div class="file-list">' + changedRows + '</div>' + (gitLines.length > 10 ? '<div class="empty">+' + esc(gitLines.length - 10) + ' more changed paths</div>' : "")
       : '<div class="empty">Working tree clean.</div>';
-    const tree = data.tree ? codebox("tree", esc(previewLines(data.tree, 18)), "") : "";
-    return '<article class="card">' + header(data, pills) + '<div class="body">' +
+    const tree = data.tree ? codebox("tree", esc(previewLines(data.tree, 20)), "") : "";
+    const lock = data.lock;
+    const lockNote = lock?.locked
+      ? '<div class="banner"><strong>Workspace lock active</strong> · owner ' + esc(lock.owner_label || lock.owner_session_id || "unknown") + (lock.seconds_remaining !== undefined ? ' · ' + esc(lock.seconds_remaining) + 's left' : '') + '</div>'
+      : "";
+    return '<article class="card">' + header(data, pills) + statusStrip(data) + '<div class="body">' + lockNote +
       '<div class="summary">' +
       summaryItem("Write", data.write_mode || "-") +
       summaryItem("Bash", data.bash_mode || "-") +
       summaryItem("Tools", data.tool_mode || "-") +
+      summaryItem("Skills", skillCount) +
       '</div>' +
-      '<div class="section-label">Context</div><div class="file-list">' + contextRows + '</div>' +
-      fold("Git", gitLines.length ? gitLines.length + " changed" : "clean", gitText, false) +
-      fold("Skills", skillCount + " discovered", skillText, false) +
+      '<div class="section-label">Workspace</div><div class="file-list">' + contextRows + '</div>' +
+      fold("Git", gitLines.length ? gitLines.length + " paths" : "clean", gitText, gitLines.length > 0) +
+      fold("Skills", skillCount + " discovered", skillText, skillCount > 0) +
       fold("Tree", data.tree ? "available" : "", tree, false) +
-      '</div></article>';
+      '</div>' + footer(data) + '</article>';
   }
 
   function renderHandoff(data) {
     const pills = [
-      data.agent_name ? pill(data.agent_name, "info") : "",
-      data.model ? pill(data.model) : "",
+      pill(data.agent_name || data.agent || "agent", "accent"),
+      data.model ? pill(data.model, "frost") : "",
       data.additions !== undefined ? pill("+" + data.additions, "good") : "",
       data.deletions !== undefined ? pill("-" + data.deletions, "bad") : ""
     ].join("");
     const rows = [
-      data.plan_path ? '<div class="file-row"><span class="file-code">plan</span><span class="file-name">' + esc(data.plan_path) + '</span></div>' : "",
-      data.status_path ? '<div class="file-row"><span class="file-code">status</span><span class="file-name">' + esc(data.status_path) + '</span></div>' : "",
-      data.diff_path ? '<div class="file-row"><span class="file-code">diff</span><span class="file-name">' + esc(data.diff_path) + '</span></div>' : ""
+      data.plan_path ? '<div class="file-row"><span class="file-code">plan</span><span class="file-name">' + esc(data.plan_path) + '</span><span class="file-tag">md</span></div>' : "",
+      data.status_path ? '<div class="file-row"><span class="file-code">status</span><span class="file-name">' + esc(data.status_path) + '</span><span class="file-tag">md</span></div>' : "",
+      data.diff_path ? '<div class="file-row"><span class="file-code">diff</span><span class="file-name">' + esc(data.diff_path) + '</span><span class="file-tag">patch</span></div>' : "",
+      data.execution_log_path ? '<div class="file-row"><span class="file-code">log</span><span class="file-name">' + esc(data.execution_log_path) + '</span><span class="file-tag">jsonl</span></div>' : ""
     ].join("");
-    const diff = data.diff ? codebox("plan file diff", renderDiff(data.diff), "") : "";
+    const diff = data.diff ? codebox("plan diff", renderDiff(data.diff), "") : "";
     return '<article class="card">' + header(data, pills) + '<div class="body">' +
-      '<div class="file-list">' + rows + '</div>' +
+      '<div class="summary">' +
+      summaryItem("Agent", data.agent_name || data.agent || "-") +
+      summaryItem("Model", data.model || "-") +
+      summaryItem("Added", "+" + (data.additions ?? 0)) +
+      summaryItem("Removed", "-" + (data.deletions ?? 0)) +
+      '</div>' +
+      '<div class="section-label">Handoff files</div><div class="file-list">' + rows + '</div>' +
       diff +
-      '</div></article>';
+      '</div>' + footer(data) + '</article>';
   }
 
   function renderBash(data) {
@@ -672,21 +869,23 @@ export const toolCardWidgetHtml = String.raw`
     const totalLines = stdoutLines + stderrLines;
     const pills = [
       pill(ok ? "passed" : "failed", ok ? "good" : "bad"),
-      pill(totalLines + " lines", "info"),
-      pill((data.durationMs ?? "-") + " ms")
+      data.timedOut || data.truncated ? pill("truncated", "warn") : "",
+      pill(totalLines + " lines", "frost"),
+      pill((data.durationMs ?? "-") + " ms", "muted")
     ].join("");
     const command = '<span class="prompt">$</span> ' + esc(data.command || "");
-    const output = previewLines(data.stdout || data.stderr || "", 18);
+    const output = previewLines(data.stdout || data.stderr || "", 20);
     const outputBox = output ? codebox("output preview", esc(truncate(output, 5000)), "terminal") : '<div class="empty">Command produced no output.</div>';
-    return '<article class="card">' + header(data, pills) + '<div class="body">' +
+    return '<article class="card">' + header(data, pills) + compactionBanner(data) + '<div class="body">' +
       '<div class="summary">' +
       summaryItem("Exit", data.exitCode ?? "-") +
+      summaryItem("Signal", data.signal || "-") +
       summaryItem("Lines", totalLines) +
       summaryItem("Duration", (data.durationMs ?? "-") + " ms") +
       '</div>' +
       codebox("command", command, "terminal") +
       outputBox +
-      '</div></article>';
+      '</div>' + footer(data) + '</article>';
   }
 
   function renderSearch(data) {
@@ -698,17 +897,24 @@ export const toolCardWidgetHtml = String.raw`
       const body = parts.length > 2 ? parts.slice(2).join(":").trim() : line;
       return '<div class="hit"><div class="hit-file">' + esc(file) + '</div><div class="hit-text">' + esc(body) + '</div></div>';
     }).join("") || '<div class="muted">No matches.</div>';
-    return '<article class="card">' + header(data, pill(count + " matches", "info") + pill(data.used || "search")) +
-      '<div class="body"><div class="search">' + hits + '</div></div></article>';
+    return '<article class="card">' + header(data, pill(count + " matches", "frost") + pill(data.used || data.backend || "search", "muted")) +
+      compactionBanner(data) +
+      '<div class="body"><div class="search">' + hits + '</div></div>' + footer(data) + '</article>';
   }
 
   function renderGeneric(data) {
-    const keys = Object.keys(data || {}).filter((key) => !key.startsWith("least_"));
-    const metrics = keys.slice(0, 3).map((key) => metric(key, typeof data[key] === "object" ? JSON.stringify(data[key]) : data[key])).join("");
-    return '<article class="card">' + header(data, pill("structured", "info")) +
-      '<div class="body">' + (metrics ? '<div class="metrics">' + metrics + '</div>' : '') +
+    const keys = Object.keys(data || {}).filter((key) => !key.startsWith("least_") && key !== "text");
+    const priority = ["profile", "task", "query", "changed", "count", "matches", "records", "findings", "recommendations", "raw_bytes_processed", "visible_bytes_emitted"];
+    const ordered = [...priority.filter((key) => keys.includes(key)), ...keys.filter((key) => !priority.includes(key))];
+    const metrics = ordered.slice(0, 6).map((key) => {
+      const value = data[key];
+      const rendered = typeof value === "object" ? JSON.stringify(value) : value;
+      return metric(key.replace(/_/g, " "), rendered, String(rendered || "").length > 18);
+    }).join("");
+    return '<article class="card">' + header(data, pill("structured", "frost")) + compactionBanner(data) + '<div class="body">' +
+      (metrics ? '<div class="metrics">' + metrics + '</div>' : "") +
       codebox("structured output", esc(truncate(JSON.stringify(data || {}, null, 2))), "") +
-      '</div></article>';
+      '</div>' + footer(data) + '</article>';
   }
 
   function isPlaceholderPayload(data) {
@@ -718,13 +924,14 @@ export const toolCardWidgetHtml = String.raw`
   }
 
   function renderPending() {
+    if (!root) return;
     root.innerHTML = [
       '<article class="card pending">',
       '<div class="rail"></div>',
       '<header class="head">',
       '<span class="glyph">L</span>',
       '<div class="headline"><div class="title">Least</div><div class="subtitle">Waiting for tool result...</div></div>',
-      '<span class="pill info">waiting</span>',
+      '<span class="pill frost">waiting</span>',
       '</header>',
       '<div class="skeleton"><span></span><span></span><span></span></div>',
       '</article>'
@@ -732,6 +939,7 @@ export const toolCardWidgetHtml = String.raw`
   }
 
   function render(data) {
+    if (!root) return;
     if (isPlaceholderPayload(data)) {
       renderPending();
       return;
@@ -747,17 +955,39 @@ export const toolCardWidgetHtml = String.raw`
       root.innerHTML = renderFile(data);
     } else if (tool === "bash") {
       root.innerHTML = renderBash(data);
-    } else if (tool === "search") {
+    } else if (tool === "search" || tool === "search_context") {
       root.innerHTML = renderSearch(data);
     } else {
       root.innerHTML = renderGeneric(data);
     }
   }
 
-  render(window.openai?.toolOutput || window.openai?.toolResponseMetadata || {});
+  function safeRender(data) {
+    try {
+      render(data);
+    } catch (error) {
+      if (!root) return;
+      root.innerHTML = [
+        '<article class="card">',
+        '<div class="rail"></div>',
+        '<header class="head">',
+        '<span class="glyph">!</span>',
+        '<div class="headline"><div class="title">Least widget error</div><div class="subtitle">',
+        esc(error && error.message ? error.message : String(error)),
+        '</div></div>',
+        '<span class="pill bad">error</span>',
+        '</header>',
+        '<div class="body"><div class="empty">Retry the tool or refresh MCP app actions.</div></div>',
+        '</article>'
+      ].join("");
+    }
+  }
+
+  safeRender(window.openai && window.openai.toolOutput ? window.openai.toolOutput : (window.openai && window.openai.toolResponseMetadata ? window.openai.toolResponseMetadata : {}));
 
   window.addEventListener("openai:set_globals", (event) => {
-    render(event.detail?.globals?.toolOutput || window.openai?.toolOutput || {});
+    const globals = event.detail && event.detail.globals ? event.detail.globals : {};
+    safeRender(globals.toolOutput || (window.openai && window.openai.toolOutput ? window.openai.toolOutput : {}));
   }, { passive: true });
 
   window.addEventListener("message", (event) => {
@@ -765,7 +995,8 @@ export const toolCardWidgetHtml = String.raw`
     const message = event.data;
     if (!message || message.jsonrpc !== "2.0") return;
     if (message.method === "ui/notifications/tool-result") {
-      render(message.params?.structuredContent || {});
+      const params = message.params && typeof message.params === "object" ? message.params : {};
+      safeRender(params.structuredContent || {});
     }
   }, { passive: true });
 </script>

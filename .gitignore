@@ -5,6 +5,7 @@ dist/
 .env.*
 *.tgz
 .ai-bridge/
+.least/
 LEAST_MCP_REPORT.md
 *.local.md
 *.local.json

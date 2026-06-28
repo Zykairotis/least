@@ -205,7 +205,7 @@ try {
       throw new Error(`${visualTool} should render the Least widget`);
     }
   }
-  for (const quietTool of ['server_config', 'least_inventory', 'list_workspaces', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'read', 'bash', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
+  for (const quietTool of ['server_config', 'least_inventory', 'list_workspaces', 'workspace_snapshot', 'files', 'tree', 'search', 'search_context', 'read', 'read_many', 'json_query', 'load_skill', 'bash', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
     if (hasWidgetMeta(queryTools, quietTool, toolCardUri)) {
       throw new Error(`${quietTool} should stay data-only without widget metadata`);
     }
@@ -240,7 +240,7 @@ try {
   });
 
   const currentOpened = await withClient(mcpUrl, async (client) => {
-    const result = await callTool(client, 'open_current_workspace', { include_tree: false });
+    const result = await callTool(client, 'open_current_workspace', { include_tree: false, include_skills: true });
     if (result.structuredContent.least_tool !== 'open_current_workspace') {
       throw new Error('HTTP tool result was not tagged for widget rendering');
     }

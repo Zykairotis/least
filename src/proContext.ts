@@ -171,7 +171,7 @@ export async function buildProContext(
     Math.min(config.maxWriteBytes, 2_000_000)
   );
 
-  const status = gitStatus(config, workspace);
+  const status = await gitStatus(config, workspace);
   const changedFiles = parseChangedFiles(status);
   const importantFiles = await existingImportantFiles(guard, workspace);
   const selectedPaths = unique(options.selectedPaths ?? []);
@@ -214,10 +214,10 @@ export async function buildProContext(
   })).text);
 
   appendSection(parts, "Git Status", `\`\`\`text\n${status}\n\`\`\``);
-  appendSection(parts, "Recent Commits", `\`\`\`text\n${gitLog(config, workspace, 8)}\n\`\`\``);
+  appendSection(parts, "Recent Commits", `\`\`\`text\n${await gitLog(config, workspace, 8)}\n\`\`\``);
 
   if (options.includeDiff !== false) {
-    const diff = truncateText(gitDiff(config, guard, workspace), maxDiffBytes);
+    const diff = truncateText(await gitDiff(config, guard, workspace), maxDiffBytes);
     truncated ||= diff.truncated;
     appendSection(parts, "Git Diff", `\`\`\`diff\n${diff.text}\n\`\`\``);
   }

@@ -149,13 +149,20 @@ export async function workspaceSummary(
   config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
-  options: { includeTree?: boolean; maxDepth?: number; bootstrapContext?: boolean; includeSkills?: boolean; includeGlobalSkills?: boolean } = {}
+  options: {
+    includeTree?: boolean;
+    maxDepth?: number;
+    bootstrapContext?: boolean;
+    includeSkills?: boolean;
+    includeGlobalSkills?: boolean;
+    includeRecentCommits?: boolean;
+  } = {}
 ): Promise<WorkspaceSummary> {
   if (options.bootstrapContext) {
     await ensureAiBridge(config, guard, workspace);
   }
   const skillInventory = options.includeSkills
-    ? await discoverSkillInventory(workspace, { includeGlobal: options.includeGlobalSkills !== false, maxSkills: 120 })
+    ? await discoverSkillInventory(workspace, config, { includeGlobal: options.includeGlobalSkills !== false, maxSkills: 120 })
     : [];
   const skills = skillInventory.map((skill) => skill.name);
   const counts = skillCounts(skillInventory);
@@ -166,7 +173,7 @@ export async function workspaceSummary(
   }
 
   let treeText: string | undefined;
-  if (options.includeTree !== false) {
+  if (options.includeTree) {
     const tree = await repoTree(config, guard, workspace, {
       path: ".",
       maxDepth: Math.max(1, Math.min(options.maxDepth ?? 3, 8)),
@@ -176,12 +183,13 @@ export async function workspaceSummary(
     treeText = tree.text;
   }
 
-  const status = gitStatus(config, workspace);
-  const log = gitLog(config, workspace, 5);
+  const status = await gitStatus(config, workspace);
+  const log = options.includeRecentCommits ? await gitLog(config, workspace, 5) : "";
   const skillText = options.includeSkills
     ? `Skills: ${counts.total} total (${counts.workspace ?? 0} workspace, ${counts.user ?? 0} user, ${counts.plugin ?? 0} plugin, ${counts.other ?? 0} other).`
     : "Skills: skipped. Pass include_skills=true if skill discovery is needed.";
-  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}\n\n## Recent commits\n\n${log}\n${treeText ? `\n## Files\n\n${treeText}` : ""}`;
+  const commitsSection = options.includeRecentCommits ? `\n\n## Recent commits\n\n${log}` : "";
+  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}${commitsSection}${treeText ? `\n\n## Files\n\n${treeText}` : ""}`;
 
   return {
     text,
@@ -255,8 +263,8 @@ export async function readCodexContext(
   const ai = options.includeAiBridge === false
     ? { text: "Skipped by request.", files: [] }
     : await readAiBridgeContext(config, guard, workspace);
-  const status = options.includeGit === false ? undefined : gitStatus(config, workspace);
-  const diff = options.includeDiff ? gitDiff(config, guard, workspace) : undefined;
+  const status = options.includeGit === false ? undefined : await gitStatus(config, workspace);
+  const diff = options.includeDiff ? await gitDiff(config, guard, workspace) : undefined;
 
   const text = [
     "# Codex Context",

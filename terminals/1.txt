@@ -1,0 +1,14 @@
+---
+pid: 38528
+cwd: "X:\least"
+command: "cd X:\\least; npm install jsdom --no-save 2>&1"
+started_at: 2026-06-26T16:47:50.618Z
+running_for_ms: 19360006 
+---
+
+added 38 packages, and audited 151 packages in 2m
+
+39 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
