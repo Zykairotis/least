@@ -1,5 +1,7 @@
 Read .ai-bridge/current-plan.md and execute it in small, reviewable steps.
 
+When creating or fully replacing multiple files, prefer Least `write_many` (or one multi-file patch) over many single-file writes. Prefer `response_mode=summary` during implementation and call `show_changes` once after a mutation batch. Use `multi_edit` for exact in-place edits and `apply_patch` for patch-form changes.
+
 After each meaningful change, update .ai-bridge/codex-status.md with:
 
 - what changed

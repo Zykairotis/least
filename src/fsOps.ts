@@ -2,11 +2,45 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
+import { createInterface } from "node:readline";
 import { minimatch } from "minimatch";
-import type { CodexProConfig } from "./config.js";
+import type { LeastConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
-import { CodexProError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
+import { LeastError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
+import {
+  COMPACT_DIFF_MAX_CHARS,
+  FULL_DIFF_MAX_CHARS,
+  STORAGE_DIFF_MAX_CHARS,
+  combineDiffParts,
+  type DiffComputeMode,
+  type PreparedTextContent,
+  emptyDiffMeta,
+  type MutationDiffMeta
+} from "./mutationTypes.js";
+import { recordCacheOutcome, recordFsTiming, recordGuardTiming, recordPartial } from "./perf.js";
 import { hasSecretValue, redactSensitiveText } from "./redact.js";
+import { ToolTimeoutError, throwIfAborted } from "./timeout.js";
+import { offloadedUnifiedDiff, shouldOffloadUnifiedDiff } from "./workerOps.js";
+import {
+  getCachedFileSnapshot,
+  invalidateFileSnapshot,
+  readTextWithSnapshot,
+  setCachedFileSnapshot
+} from "./fileSnapshotCache.js";
+
+export type { DiffComputeMode, PreparedTextContent, MutationDiffMeta } from "./mutationTypes.js";
+
+/** Encode once, hash once. Reuse buffer + digest across write/cache/response. */
+export function prepareTextContent(text: string): PreparedTextContent {
+  const buffer = Buffer.from(text, "utf8");
+  return {
+    text,
+    buffer,
+    bytes: buffer.length,
+    sha256: createHash("sha256").update(buffer).digest("hex")
+  };
+}
 
 export interface TreeOptions {
   path?: string;
@@ -26,10 +60,32 @@ export interface ReadFileResult {
   text: string;
   startLine: number;
   endLine: number;
-  totalLines: number;
+  totalLines?: number;
+  /** Returned model-visible bytes for the selected range. */
   bytes: number;
-  sha256: string;
+  /** Full on-disk file bytes. */
+  fileBytes?: number;
+  /** Alias for bytes — returned range bytes. */
+  returnedBytes?: number;
+  sha256?: string;
   truncated: boolean;
+  partial?: boolean;
+  timedOut?: boolean;
+}
+
+export interface ReadManyItem {
+  path: string;
+  startLine?: number;
+  endLine?: number;
+}
+
+export interface ReadManyResult {
+  text: string;
+  files: ReadFileResult[];
+  totalBytes: number;
+  truncated: boolean;
+  partial?: boolean;
+  timedOut?: boolean;
 }
 
 export interface DiffResult {
@@ -37,6 +93,14 @@ export interface DiffResult {
   additions: number;
   deletions: number;
   changed: boolean;
+  /** Complete (or storage-capped) diff for retrieval storage. */
+  storageDiff?: string;
+  /** Visible preview text (may equal diff). */
+  preview?: string;
+  /** False when storageDiff hit the storage cap. */
+  complete?: boolean;
+  /** Whether line stats were computed (false in summary mode). */
+  statsComputed?: boolean;
 }
 
 export function sha256(text: string): string {
@@ -100,15 +164,194 @@ export function makeUnifiedDiff(oldText: string, newText: string, relPath: strin
   return { diff: redactSensitiveText(diff), additions, deletions, changed: true };
 }
 
+export async function makeUnifiedDiffMaybeOffloaded(oldText: string, newText: string, relPath: string, maxChars = 60_000): Promise<DiffResult> {
+  if (!shouldOffloadUnifiedDiff(oldText, newText)) {
+    return makeUnifiedDiff(oldText, newText, relPath, maxChars);
+  }
+  const diff = await offloadedUnifiedDiff(oldText, newText, relPath, maxChars);
+  return { ...diff, diff: redactSensitiveText(diff.diff) };
+}
+
+/**
+ * Compute a mutation diff according to response policy.
+ *
+ * - summary: no unified diff; additions/deletions are null (stats omitted).
+ * - compact/full: generate a storage-bound complete diff, then a separate visible preview.
+ *   Callers should store `storageDiff` under a retrieval key and put only `preview` in
+ *   structured content (never both text and structured).
+ */
+export async function computeMutationDiff(
+  oldText: string,
+  newText: string,
+  relPath: string,
+  mode: DiffComputeMode,
+  maxChars?: number,
+  options: { storageMaxChars?: number } = {}
+): Promise<MutationDiffMeta> {
+  if (mode === "none") {
+    return emptyDiffMeta();
+  }
+  const previewLimit =
+    maxChars ?? (mode === "compact" ? COMPACT_DIFF_MAX_CHARS : FULL_DIFF_MAX_CHARS);
+  const storageLimit = Math.max(0, Math.min(options.storageMaxChars ?? STORAGE_DIFF_MAX_CHARS, STORAGE_DIFF_MAX_CHARS));
+  const generationLimit = Math.max(previewLimit, storageLimit);
+
+  const complete = await makeUnifiedDiffMaybeOffloaded(oldText, newText, relPath, generationLimit);
+  const storage = combineDiffParts([complete.diff], storageLimit);
+  const storageTruncated = storage.truncated || complete.diff.includes("[diff truncated");
+
+  let preview = complete.diff;
+  let previewTruncated = false;
+  if (preview.length > previewLimit) {
+    preview = preview.slice(0, previewLimit) + `\n...[diff truncated to ${previewLimit} chars]`;
+    previewTruncated = true;
+  }
+
+  return {
+    additions: complete.additions,
+    deletions: complete.deletions,
+    changed: complete.changed,
+    statsComputed: true,
+    storageDiff: storage.text,
+    storageTruncated,
+    complete: !storageTruncated,
+    preview,
+    // legacy alias used by older write/edit return shapes
+    diff: preview,
+    truncated: previewTruncated || storageTruncated
+  };
+}
+
 function isHiddenName(name: string): boolean {
   return name.startsWith(".") && name !== "." && name !== "..";
 }
 
-export async function repoTree(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: TreeOptions): Promise<TreeResult> {
+async function measureFs<T>(fn: () => Promise<T>): Promise<T> {
+  const started = performance.now();
+  try {
+    return await fn();
+  } finally {
+    recordFsTiming(performance.now() - started);
+  }
+}
+
+function measureGuard<T>(fn: () => T): T {
+  const started = performance.now();
+  try {
+    return fn();
+  } finally {
+    recordGuardTiming(performance.now() - started);
+  }
+}
+
+function renderedLineBytes(line: string, lineNumber: number, includeLineNumbers: boolean, lineNumberWidth: number): number {
+  if (!includeLineNumbers) {
+    return Buffer.byteLength(line, "utf8");
+  }
+  return Buffer.byteLength(`${String(lineNumber).padStart(lineNumberWidth, " ")} | ${line}`, "utf8");
+}
+
+async function readRangeFromStream(
+  absPath: string,
+  startLine: number,
+  requestedEndLine: number,
+  includeTotalLines: boolean,
+  options: {
+    signal?: AbortSignal;
+    maxReturnedBytes?: number;
+    includeLineNumbers?: boolean;
+  } = {}
+): Promise<{ lines: string[]; totalLines?: number; timedOut: boolean; partial: boolean; truncatedByBudget: boolean }> {
+  const lines: string[] = [];
+  const stream = fs.createReadStream(absPath, { encoding: "utf8" });
+  const reader = createInterface({ input: stream, crlfDelay: Infinity });
+  let totalLines = 0;
+  let timedOut = false;
+  let partial = false;
+  let truncatedByBudget = false;
+  const includeLineNumbers = options.includeLineNumbers !== false;
+  const lineNumberWidth = String(requestedEndLine).length;
+  const maxReturnedBytes = options.maxReturnedBytes;
+  let collectedBytes = 0;
+
+  const onAbort = () => {
+    timedOut = options.signal?.reason instanceof ToolTimeoutError;
+    partial = true;
+    reader.close();
+    stream.destroy(options.signal?.reason instanceof Error ? options.signal.reason : undefined);
+  };
+
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for await (const line of reader) {
+      totalLines += 1;
+      if (totalLines >= startLine && totalLines <= requestedEndLine) {
+        const lineBytes = renderedLineBytes(line, totalLines, includeLineNumbers, lineNumberWidth);
+        const separatorBytes = lines.length > 0 ? 1 : 0;
+        if (maxReturnedBytes !== undefined && collectedBytes + separatorBytes + lineBytes > maxReturnedBytes) {
+          truncatedByBudget = true;
+          partial = true;
+          break;
+        }
+        lines.push(line);
+        collectedBytes += separatorBytes + lineBytes;
+      }
+      if (!includeTotalLines && totalLines >= requestedEndLine && !truncatedByBudget) {
+        break;
+      }
+      if (options.signal?.aborted) {
+        timedOut = options.signal.reason instanceof ToolTimeoutError;
+        partial = true;
+        break;
+      }
+      if (truncatedByBudget) break;
+    }
+  } catch (error) {
+    if (!(options.signal?.aborted && options.signal.reason instanceof ToolTimeoutError)) {
+      throw error;
+    }
+    timedOut = true;
+    partial = true;
+  } finally {
+    options.signal?.removeEventListener("abort", onAbort);
+    reader.close();
+    if (!stream.destroyed) stream.destroy();
+  }
+
+  if (timedOut || truncatedByBudget) {
+    recordPartial();
+  }
+  return {
+    lines,
+    totalLines: includeTotalLines ? totalLines : undefined,
+    timedOut,
+    partial: partial || truncatedByBudget,
+    truncatedByBudget
+  };
+}
+
+export async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const concurrency = Math.max(1, Math.min(limit, items.length || 1));
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const current = nextIndex;
+      nextIndex += 1;
+      results[current] = await fn(items[current] as T, current);
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  return results;
+}
+
+export async function repoTree(config: LeastConfig, guard: PathGuard, workspace: Workspace, options: TreeOptions): Promise<TreeResult> {
   const target = guard.resolve(workspace, options.path ?? ".");
   const stat = await fsp.stat(target.absPath);
   if (!stat.isDirectory()) {
-    throw new CodexProError(`Not a directory: ${target.relPath}`);
+    throw new LeastError(`Not a directory: ${target.relPath}`);
   }
 
   const lines: string[] = [target.relPath === "." ? "." : `${target.relPath}/`];
@@ -195,129 +438,487 @@ export async function listFiles(
   return files;
 }
 
+export async function fileContentSha256(
+  config: LeastConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  filePath: string
+): Promise<{ exists: boolean; sha256?: string }> {
+  const resolved = guard.resolve(workspace, filePath);
+  if (!fs.existsSync(resolved.absPath)) {
+    return { exists: false };
+  }
+  const maxBytes = Math.max(config.maxWriteBytes, config.maxReadBytes);
+  const stat = await guard.assertTextFile(resolved.absPath, maxBytes);
+  const snapshot = await readTextWithSnapshot(resolved.absPath, { maxBytes, knownStat: stat });
+  if (snapshot.cacheHit) recordCacheOutcome(true);
+  else recordCacheOutcome(false);
+  return { exists: true, sha256: snapshot.sha256 };
+}
+
+export async function readManyTextFiles(
+  config: LeastConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  items: ReadManyItem[],
+  options: {
+    maxTotalBytes?: number;
+    concurrency?: number;
+    includeSha256?: boolean;
+    includeLineNumbers?: boolean;
+    includeTotalLines?: boolean;
+    signal?: AbortSignal;
+  } = {}
+): Promise<ReadManyResult> {
+  if (!items.length) throw new LeastError("items must include at least one file.");
+  const maxTotalBytes = Math.min(options.maxTotalBytes ?? config.maxReadBytes * 3, config.maxReadBytes * 10);
+  const concurrency = Math.max(1, Math.min(options.concurrency ?? 8, 16));
+
+  // Deduplicate request list before parallel execution to avoid race-duplicate reads.
+  const uniqueItems: ReadManyItem[] = [];
+  const seenKeys = new Set<string>();
+  for (const item of items) {
+    const key = `${item.path}\u0000${item.startLine ?? ""}\u0000${item.endLine ?? ""}\u0000${options.includeSha256 ? "sha" : "no-sha"}\u0000${options.includeLineNumbers === false ? "plain" : "numbered"}\u0000${options.includeTotalLines ? "totals" : "fast"}`;
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    uniqueItems.push(item);
+  }
+
+  // Shared atomic-ish budget: stop scheduling new work once exhausted (best-effort across workers).
+  let budgetRemaining = maxTotalBytes;
+  let budgetExhausted = false;
+
+  const resolved = await mapWithConcurrency(uniqueItems, concurrency, async (item) => {
+    if (options.signal?.aborted || budgetExhausted || budgetRemaining <= 0) {
+      return undefined;
+    }
+    const result = await readTextFile(config, guard, workspace, item.path, {
+      startLine: item.startLine,
+      endLine: item.endLine,
+      maxBytes: Math.min(config.maxReadBytes, Math.max(1, budgetRemaining)),
+      includeSha256: options.includeSha256,
+      includeLineNumbers: options.includeLineNumbers,
+      includeTotalLines: options.includeTotalLines,
+      signal: options.signal
+    });
+    const returnedBytes = result.returnedBytes ?? result.bytes;
+    if (returnedBytes > budgetRemaining) {
+      budgetExhausted = true;
+      return undefined;
+    }
+    budgetRemaining -= returnedBytes;
+    if (budgetRemaining <= 0) budgetExhausted = true;
+    return result;
+  });
+
+  const files: ReadFileResult[] = [];
+  let totalBytes = 0;
+  let truncated = budgetExhausted;
+  let partial = false;
+  let timedOut = false;
+
+  for (const result of resolved) {
+    if (!result) {
+      truncated = true;
+      continue;
+    }
+    if (options.signal?.aborted) {
+      partial = true;
+      timedOut = options.signal.reason instanceof ToolTimeoutError;
+      truncated = true;
+      break;
+    }
+    const returnedBytes = result.returnedBytes ?? result.bytes;
+    if (totalBytes + returnedBytes > maxTotalBytes) {
+      truncated = true;
+      break;
+    }
+    files.push(result);
+    totalBytes += returnedBytes;
+    partial = partial || result.partial === true;
+    timedOut = timedOut || result.timedOut === true;
+    if (result.truncated && result.totalLines !== undefined) {
+      truncated = true;
+    }
+  }
+
+  const text = files
+    .map(
+      (file) =>
+        `### ${file.path}\nLines: ${file.startLine}-${file.endLine}${file.totalLines !== undefined ? ` of ${file.totalLines}` : ""}\n${file.sha256 ? `SHA-256: ${file.sha256}\n` : ""}${file.partial ? "Partial: true\n" : ""}\n\`\`\`text\n${file.text}\n\`\`\``
+    )
+    .join("\n\n");
+  if (partial) recordPartial();
+  return { text, files, totalBytes, truncated, partial, timedOut };
+}
+
 export async function readTextFile(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   filePath: string,
-  options: { startLine?: number; endLine?: number; maxBytes?: number } = {}
+  options: {
+    startLine?: number;
+    endLine?: number;
+    maxBytes?: number;
+    includeSha256?: boolean;
+    includeLineNumbers?: boolean;
+    includeTotalLines?: boolean;
+    signal?: AbortSignal;
+  } = {}
 ): Promise<ReadFileResult> {
-  const resolved = guard.resolve(workspace, filePath);
+  throwIfAborted(options.signal);
+  const resolved = measureGuard(() => guard.resolve(workspace, filePath));
   const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
-  await guard.assertTextFile(resolved.absPath, maxBytes);
-  const buffer = await fsp.readFile(resolved.absPath);
-  const text = buffer.toString("utf8");
+  const startLine = Math.max(1, Math.floor(options.startLine ?? 1));
+  const requestedEndLine = options.endLine !== undefined ? Math.max(1, Math.floor(options.endLine)) : undefined;
+  const rangeRequested = options.startLine !== undefined || options.endLine !== undefined;
+  const includeSha256 = options.includeSha256 === true;
+  const stat = await measureFs(() =>
+    rangeRequested && !includeSha256
+      ? guard.assertReadableTextFileForRangeRead(resolved.absPath)
+      : guard.assertTextFile(resolved.absPath, maxBytes)
+  );
+  if (requestedEndLine !== undefined && requestedEndLine < startLine) {
+    throw new LeastError(`end_line (${requestedEndLine}) must be >= start_line (${startLine}).`);
+  }
+  const includeLineNumbers = options.includeLineNumbers !== false;
+  const shouldReturnTotalLines =
+    options.includeTotalLines === true || requestedEndLine === undefined || (startLine === 1 && requestedEndLine === undefined);
+
+  const canUseStreamFastPath = rangeRequested && !includeSha256 && requestedEndLine !== undefined && options.includeTotalLines !== true;
+  if (canUseStreamFastPath) {
+    // Prefer cached full text for range slices when available (avoids re-streaming cold scans).
+    const cached = getCachedFileSnapshot(resolved.absPath, stat);
+    if (cached) {
+      recordCacheOutcome(true);
+      const allLines = splitLines(cached.text);
+      const endLine = Math.min(allLines.length, requestedEndLine as number);
+      const selected = allLines.slice(startLine - 1, endLine);
+      const text = includeLineNumbers ? withLineNumbers(selected, startLine) : selected.join("\n");
+      const returnedBytes = Buffer.byteLength(text, "utf8");
+      const truncatedByBudget = returnedBytes > maxBytes;
+      const finalText = truncatedByBudget ? text.slice(0, maxBytes) : text;
+      return {
+        path: resolved.relPath,
+        text: finalText,
+        startLine,
+        endLine: Math.max(startLine, endLine),
+        totalLines: undefined,
+        bytes: Buffer.byteLength(finalText, "utf8"),
+        fileBytes: stat.size,
+        returnedBytes: Buffer.byteLength(finalText, "utf8"),
+        sha256: undefined,
+        truncated: truncatedByBudget || endLine < (requestedEndLine as number),
+        partial: truncatedByBudget
+      };
+    }
+    recordCacheOutcome(false);
+    const streamed = await measureFs(() =>
+      readRangeFromStream(resolved.absPath, startLine, requestedEndLine as number, false, {
+        signal: options.signal,
+        maxReturnedBytes: maxBytes,
+        includeLineNumbers
+      })
+    );
+    const text = includeLineNumbers ? withLineNumbers(streamed.lines, startLine) : streamed.lines.join("\n");
+    const endLine = streamed.lines.length ? startLine + streamed.lines.length - 1 : startLine;
+    const returnedBytes = Buffer.byteLength(text, "utf8");
+    const rangeIncomplete = endLine < (requestedEndLine as number);
+    return {
+      path: resolved.relPath,
+      text,
+      startLine,
+      endLine: Math.max(startLine, endLine),
+      totalLines: undefined,
+      bytes: returnedBytes,
+      fileBytes: stat.size,
+      returnedBytes,
+      sha256: undefined,
+      truncated: streamed.truncatedByBudget || rangeIncomplete,
+      partial: streamed.partial,
+      timedOut: streamed.timedOut
+    };
+  }
+
+  // Full-file path: reuse snapshot cache when size/mtime match.
+  const snapshot = await measureFs(() => readTextWithSnapshot(resolved.absPath, { maxBytes: Math.max(maxBytes, config.maxReadBytes) }));
+  throwIfAborted(options.signal);
+  if (snapshot.cacheHit) recordCacheOutcome(true);
+  else recordCacheOutcome(false);
+  const text = snapshot.text;
   const allLines = splitLines(text);
   const totalLines = allLines.length;
-  const startLine = Math.max(1, Math.floor(options.startLine ?? 1));
-  const endLine = Math.min(totalLines, Math.floor(options.endLine ?? totalLines));
-  if (endLine < startLine) {
-    throw new CodexProError(`end_line (${endLine}) must be >= start_line (${startLine}).`);
-  }
+  const endLine = Math.min(totalLines, requestedEndLine ?? totalLines);
   const selected = allLines.slice(startLine - 1, endLine);
-  const numbered = withLineNumbers(selected, startLine);
+  const rendered = includeLineNumbers ? withLineNumbers(selected, startLine) : selected.join("\n");
   const truncated = startLine > 1 || endLine < totalLines;
+  const returnedBytes = Buffer.byteLength(rendered, "utf8");
   return {
     path: resolved.relPath,
-    text: numbered,
+    text: rendered,
     startLine,
     endLine,
-    totalLines,
-    bytes: buffer.byteLength,
-    sha256: sha256(text),
+    totalLines: shouldReturnTotalLines ? totalLines : undefined,
+    bytes: returnedBytes,
+    fileBytes: snapshot.size,
+    returnedBytes,
+    sha256: includeSha256 ? snapshot.sha256 : undefined,
     truncated
   };
 }
 
+export interface WriteTextFileOptions {
+  createDirs?: boolean;
+  overwrite?: boolean;
+  /** Control unified-diff generation. Default: full (backward compatible). */
+  diffMode?: DiffComputeMode;
+  maxDiffChars?: number;
+  /** Precomputed content (encode/hash once). */
+  prepared?: PreparedTextContent;
+  /** When provided, skip re-reading the original for diff/existence. */
+  beforeText?: string;
+  existed?: boolean;
+}
+
 export async function writeTextFile(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   filePath: string,
   content: string,
-  options: { createDirs?: boolean; overwrite?: boolean } = {}
+  options: WriteTextFileOptions = {}
 ): Promise<{ path: string; bytes: number; sha256: string; existed: boolean; diff: DiffResult }> {
   const resolved = guard.resolve(workspace, filePath, { forWrite: true });
-  const contentBytes = Buffer.byteLength(content, "utf8");
-  if (contentBytes > config.maxWriteBytes) {
-    throw new CodexProError(`Write content is too large (${contentBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
+  const prepared = options.prepared ?? prepareTextContent(content);
+  if (prepared.bytes > config.maxWriteBytes) {
+    throw new LeastError(`Write content is too large (${prepared.bytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
   }
-  if (hasSecretValue(content)) {
-    throw new CodexProError("Secret-looking content is blocked from write. Use placeholders such as [REDACTED_SECRET] in handoff files.");
+  if (hasSecretValue(prepared.text)) {
+    throw new LeastError("Secret-looking content is blocked from write. Use placeholders such as [REDACTED_SECRET] in handoff files.");
   }
 
-  let oldText = "";
-  let existed = false;
-  try {
-    await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
-    oldText = await fsp.readFile(resolved.absPath, "utf8");
-    existed = true;
-  } catch (error) {
-    if (error instanceof CodexProError && error.message.startsWith("Not a file")) throw error;
-    if (fs.existsSync(resolved.absPath)) throw error;
+  const diffMode = options.diffMode ?? "full";
+  let oldText = options.beforeText ?? "";
+  let existed = options.existed ?? false;
+  if (options.beforeText === undefined && options.existed === undefined) {
+    // Summary mode without a pre-supplied beforeText only needs existence for overwrite checks.
+    // Full content is required when a unified diff will be computed.
+    const needsOldContent = diffMode !== "none";
+    try {
+      if (needsOldContent) {
+        const stat = await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
+        const snapshot = await readTextWithSnapshot(resolved.absPath, {
+          maxBytes: Math.max(config.maxWriteBytes, config.maxReadBytes),
+          knownStat: stat
+        });
+        if (snapshot.cacheHit) recordCacheOutcome(true);
+        else recordCacheOutcome(false);
+        oldText = snapshot.text;
+        existed = true;
+      } else {
+        // Existence, type, size, and binary validation in one stat/sample pass.
+        await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
+        existed = true;
+        oldText = "";
+      }
+    } catch (error) {
+      if (error instanceof LeastError && error.message.startsWith("Not a file")) throw error;
+      if (error instanceof LeastError && error.message.startsWith("File is too large")) throw error;
+      if (error instanceof LeastError && error.message.includes("binary")) throw error;
+      if (error instanceof LeastError && error.message.startsWith("Refusing")) throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" || !fs.existsSync(resolved.absPath)) {
+        existed = false;
+        oldText = "";
+      } else {
+        throw error;
+      }
+    }
   }
 
   if (existed && options.overwrite === false) {
-    throw new CodexProError(`File already exists and overwrite=false: ${resolved.relPath}`);
+    throw new LeastError(`File already exists and overwrite=false: ${resolved.relPath}`);
   }
-  if (options.createDirs) {
+  if (options.createDirs !== false) {
     await fsp.mkdir(path.dirname(resolved.absPath), { recursive: true });
+  } else {
+    const parent = path.dirname(resolved.absPath);
+    try {
+      const parentStat = await fsp.stat(parent);
+      if (!parentStat.isDirectory()) {
+        throw new LeastError(`Parent path is not a directory (create_dirs=false): ${path.dirname(resolved.relPath)}`);
+      }
+    } catch (error) {
+      if (error instanceof LeastError) throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new LeastError(`Parent directory does not exist (create_dirs=false): ${path.dirname(resolved.relPath)}`);
+      }
+      throw error;
+    }
   }
 
-  const diff = makeUnifiedDiff(oldText, content, resolved.relPath);
-  await fsp.writeFile(resolved.absPath, content, "utf8");
-  return { path: resolved.relPath, bytes: contentBytes, sha256: sha256(content), existed, diff };
+  const diffMeta = await computeMutationDiff(oldText, prepared.text, resolved.relPath, diffMode, options.maxDiffChars, {
+    storageMaxChars: config.outputStoreMaxItemBytes
+  });
+  const preview = diffMeta.preview ?? diffMeta.diff ?? `No changes in ${resolved.relPath}.`;
+  const diff: DiffResult = {
+    diff: preview,
+    preview,
+    additions: diffMeta.additions ?? 0,
+    deletions: diffMeta.deletions ?? 0,
+    changed: diffMeta.changed,
+    storageDiff: diffMeta.storageDiff,
+    complete: diffMeta.complete,
+    statsComputed: diffMeta.statsComputed
+  };
+  await fsp.writeFile(resolved.absPath, prepared.buffer);
+  invalidateFileSnapshot(resolved.absPath);
+  try {
+    const nextStat = await fsp.stat(resolved.absPath);
+    setCachedFileSnapshot(resolved.absPath, nextStat, prepared.text, prepared.sha256);
+  } catch {
+    // Best-effort cache warm after write.
+  }
+  return { path: resolved.relPath, bytes: prepared.bytes, sha256: prepared.sha256, existed, diff };
+}
+
+export interface EditTextFileOptions {
+  replaceAll?: boolean;
+  expectedReplacements?: number;
+  /** Control unified-diff generation. Default: full (backward compatible). */
+  diffMode?: DiffComputeMode;
+  maxDiffChars?: number;
 }
 
 export async function editTextFile(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   filePath: string,
   oldText: string,
   newText: string,
-  options: { replaceAll?: boolean; expectedReplacements?: number } = {}
+  options: EditTextFileOptions = {}
 ): Promise<{ path: string; replacements: number; bytes: number; sha256: string; diff: DiffResult }> {
-  if (!oldText) throw new CodexProError("old_text must not be empty.");
+  if (!oldText) throw new LeastError("old_text must not be empty.");
   const resolved = guard.resolve(workspace, filePath, { forWrite: true });
-  await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
-  const before = await fsp.readFile(resolved.absPath, "utf8");
-  const occurrences = before.split(oldText).length - 1;
+  const maxBytes = Math.max(config.maxWriteBytes, config.maxReadBytes);
+  const stat = await guard.assertTextFile(resolved.absPath, maxBytes);
+  const snapshot = await readTextWithSnapshot(resolved.absPath, { maxBytes, knownStat: stat });
+  if (snapshot.cacheHit) recordCacheOutcome(true);
+  else recordCacheOutcome(false);
+  const before = snapshot.text;
+  const occurrences = countOccurrences(before, oldText);
   if (occurrences === 0) {
-    throw new CodexProError(`old_text was not found in ${resolved.relPath}. Read the file and retry with an exact snippet.`);
+    throw new LeastError(`old_text was not found in ${resolved.relPath}. Read the file and retry with an exact snippet.`);
   }
 
   let replacements: number;
   let after: string;
   if (options.replaceAll) {
-    after = before.split(oldText).join(newText);
+    after = replaceAllOccurrences(before, oldText, newText);
     replacements = occurrences;
   } else {
     if (occurrences !== 1) {
-      throw new CodexProError(`old_text matched ${occurrences} times. Provide a more specific old_text or set replace_all=true.`);
+      throw new LeastError(`old_text matched ${occurrences} times. Provide a more specific old_text or set replace_all=true.`);
     }
     after = before.replace(oldText, newText);
     replacements = 1;
   }
 
   if (typeof options.expectedReplacements === "number" && replacements !== options.expectedReplacements) {
-    throw new CodexProError(`Expected ${options.expectedReplacements} replacements but would perform ${replacements}.`);
+    throw new LeastError(`Expected ${options.expectedReplacements} replacements but would perform ${replacements}.`);
   }
 
-  const afterBytes = Buffer.byteLength(after, "utf8");
-  if (afterBytes > config.maxWriteBytes) {
-    throw new CodexProError(`Edited file would be too large (${afterBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
+  const prepared = prepareTextContent(after);
+  if (prepared.bytes > config.maxWriteBytes) {
+    throw new LeastError(`Edited file would be too large (${prepared.bytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
   }
-  if (hasSecretValue(after)) {
-    throw new CodexProError("Secret-looking content is blocked from edit. Use placeholders such as [REDACTED_SECRET] in handoff files.");
+  if (hasSecretValue(prepared.text)) {
+    throw new LeastError("Secret-looking content is blocked from edit. Use placeholders such as [REDACTED_SECRET] in handoff files.");
   }
 
-  const diff = makeUnifiedDiff(before, after, resolved.relPath);
-  await fsp.writeFile(resolved.absPath, after, "utf8");
-  return { path: resolved.relPath, replacements, bytes: afterBytes, sha256: sha256(after), diff };
+  const diffMode = options.diffMode ?? "full";
+  const diffMeta = await computeMutationDiff(before, prepared.text, resolved.relPath, diffMode, options.maxDiffChars, {
+    storageMaxChars: config.outputStoreMaxItemBytes
+  });
+  const preview = diffMeta.preview ?? diffMeta.diff ?? `No changes in ${resolved.relPath}.`;
+  const diff: DiffResult = {
+    diff: preview,
+    preview,
+    additions: diffMeta.additions ?? 0,
+    deletions: diffMeta.deletions ?? 0,
+    changed: diffMeta.changed,
+    storageDiff: diffMeta.storageDiff,
+    complete: diffMeta.complete,
+    statsComputed: diffMeta.statsComputed
+  };
+  await fsp.writeFile(resolved.absPath, prepared.buffer);
+  invalidateFileSnapshot(resolved.absPath);
+  try {
+    const nextStat = await fsp.stat(resolved.absPath);
+    setCachedFileSnapshot(resolved.absPath, nextStat, prepared.text, prepared.sha256);
+  } catch {
+    // Best-effort cache warm after edit.
+  }
+  return { path: resolved.relPath, replacements, bytes: prepared.bytes, sha256: prepared.sha256, diff };
 }
 
-export async function ensureAiBridge(config: CodexProConfig, guard: PathGuard, workspace: Workspace): Promise<string[]> {
+/** Count non-overlapping occurrences of needle in haystack without allocating split arrays. */
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while (index <= haystack.length - needle.length) {
+    const found = haystack.indexOf(needle, index);
+    if (found === -1) break;
+    count += 1;
+    index = found + needle.length;
+  }
+  return count;
+}
+
+function replaceAllOccurrences(haystack: string, needle: string, replacement: string): string {
+  if (!needle) return haystack;
+  // Avoid split/join double scan for large files.
+  if (!haystack.includes(needle)) return haystack;
+  return haystack.split(needle).join(replacement);
+}
+
+/**
+ * Plan an exact edit against in-memory file text without writing.
+ * Used by multi_edit transactional preflight.
+ */
+export function planTextEdit(
+  before: string,
+  oldText: string,
+  newText: string,
+  options: { replaceAll?: boolean; expectedReplacements?: number; relPath?: string } = {}
+): { after: string; replacements: number } {
+  if (!oldText) throw new LeastError("old_text must not be empty.");
+  const label = options.relPath ?? "file";
+  const occurrences = countOccurrences(before, oldText);
+  if (occurrences === 0) {
+    throw new LeastError(`old_text was not found in ${label}. Read the file and retry with an exact snippet.`);
+  }
+  let replacements: number;
+  let after: string;
+  if (options.replaceAll) {
+    after = replaceAllOccurrences(before, oldText, newText);
+    replacements = occurrences;
+  } else {
+    if (occurrences !== 1) {
+      throw new LeastError(`old_text matched ${occurrences} times. Provide a more specific old_text or set replace_all=true.`);
+    }
+    after = before.replace(oldText, newText);
+    replacements = 1;
+  }
+  if (typeof options.expectedReplacements === "number" && replacements !== options.expectedReplacements) {
+    throw new LeastError(`Expected ${options.expectedReplacements} replacements but would perform ${replacements}.`);
+  }
+  return { after, replacements };
+}
+
+export async function ensureAiBridge(config: LeastConfig, guard: PathGuard, workspace: Workspace): Promise<string[]> {
   const files: Record<string, string> = {
     "README.md": `# AI Bridge\n\nShared planning context for ChatGPT, other planning models, Codex, OpenCode, Pi, or another local implementation agent.\n\n- current-plan.md: plan produced by ChatGPT or another planning model for the implementation agent.\n- agent-status.md: generic implementation notes, touched files, test results, blockers, and review notes.\n- implementation-diff.patch: final review diff from the implementation agent when practical.\n- codex-status.md: legacy Codex-specific status file, kept for existing workflows.\n- decisions.md: architectural decisions that should remain stable.\n- open-questions.md: unresolved questions.\n- execution-log.jsonl: append-only generic agent handoff and execution events.\n- session-log.jsonl: append-only legacy session events.\n`,
     "current-plan.md": "# Current Plan\n\nNo plan written yet.\n",

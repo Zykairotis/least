@@ -19,6 +19,31 @@ export function redactSensitiveText(text: string): string {
     .replace(OPENAI_SECRET_PATTERN, (match) => isPlaceholderSecret(match) ? match : "[REDACTED_SECRET]");
 }
 
+const SENSITIVE_KEY_RE = /^(authorization|cookie|set-cookie|x-api-key|api[_-]?key|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|private[_-]?key)$/i;
+const INTERNAL_LEASE_TOKEN_KEYS = new Set([
+  "lease_token",
+  "workspace_lease_token",
+  "mutation_lease_token"
+]);
+
+export function isInternalLeastTokenKey(key: string): boolean {
+  return INTERNAL_LEASE_TOKEN_KEYS.has(key.trim().toLowerCase());
+}
+
+export function isSensitiveKey(key: string): boolean {
+  if (isInternalLeastTokenKey(key)) return false;
+  if (SENSITIVE_KEY_RE.test(key)) return true;
+  const lower = key.toLowerCase();
+  return (
+    lower.includes("password") ||
+    lower.includes("secret") ||
+    lower.endsWith("token") ||
+    lower.endsWith("apikey") ||
+    lower.endsWith("api_key") ||
+    lower.endsWith("api-key")
+  );
+}
+
 export function redactStructured<T>(value: T, depth = 0): T {
   if (depth > 8) return value;
   if (typeof value === "string") return redactSensitiveText(value) as T;
@@ -27,7 +52,11 @@ export function redactStructured<T>(value: T, depth = 0): T {
 
   const out: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
-    out[key] = redactStructured(item, depth + 1);
+    if (isSensitiveKey(key) && (typeof item === "string" || typeof item === "number" || typeof item === "boolean")) {
+      out[key] = "[REDACTED_SECRET]";
+    } else {
+      out[key] = redactStructured(item, depth + 1);
+    }
   }
   return out as T;
 }

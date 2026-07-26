@@ -1,0 +1,14 @@
+---
+description: Least MCP workflow guidance for Cursor agents
+globs:
+alwaysApply: false
+---
+
+Follow the canonical Least agent instructions in `docs/agent-instructions/least-agent-core.md`.
+
+Highlights:
+
+- Start with `context_pack` for non-trivial repo tasks.
+- Prefer `search_context`, `read_many`, and `show_changes` over shell browsing.
+- Use `retrieve_output` only when compact tool output is insufficient.
+- Use `least_perf`, `least_gain`, and `least_discover` when tuning Least itself.

@@ -1,25 +1,25 @@
 {
-  "name": "codexpro",
-  "version": "0.28.5",
-  "description": "A local MCP/App SDK-style connector that lets ChatGPT inspect, edit, and hand off work to Codex inside a local dev workspace.",
+  "name": "least",
+  "version": "0.31.0",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rebel0789/codexpro.git"
+    "url": "git+https://github.com/Zykairotis/least.git"
   },
   "bugs": {
-    "url": "https://github.com/rebel0789/codexpro/issues"
+    "url": "https://github.com/Zykairotis/least/issues"
   },
-  "homepage": "https://rebel0789.github.io/codexpro/",
+  "homepage": "https://Zykairotis.github.io/least/",
   "keywords": [
     "mcp",
     "chatgpt",
     "codex",
     "apps-sdk",
-    "codexpro",
+    "least",
     "local-development",
     "cloudflare-tunnel",
+    "tailscale",
     "ngrok"
   ],
   "engines": {
@@ -48,36 +48,69 @@
     "access": "public"
   },
   "bin": {
-    "codexpro": "scripts/codexpro.mjs",
-    "codexpro-mcp": "dist/stdio.js",
-    "codexpro-mcp-http": "dist/http.js"
+    "least": "scripts/least.mjs",
+    "least-mcp": "dist/stdio.js",
+    "least-mcp-http": "dist/http.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepack": "npm run build",
+    "prepublishOnly": "node scripts/release-guard.mjs",
     "start": "node dist/stdio.js",
     "start:stdio": "node dist/stdio.js",
     "start:http": "node dist/http.js",
     "dev:stdio": "tsx src/stdio.ts",
     "dev:http": "tsx src/http.ts",
-    "smoke": "node scripts/smoke.mjs && node scripts/http-smoke.mjs && node scripts/pro-smoke.mjs && node scripts/doctor-smoke.mjs && node scripts/settings-smoke.mjs && node scripts/execute-handoff-smoke.mjs",
-    "doctor": "node scripts/codexpro.mjs doctor",
-    "connect": "node scripts/codexpro.mjs",
-    "connect:setup": "node scripts/codexpro.mjs setup",
-    "connect:local": "node scripts/codexpro.mjs --tunnel none",
-    "connect:cloudflare": "node scripts/codexpro.mjs --tunnel cloudflare",
-    "connect:chatgpt": "node scripts/codexpro.mjs --tunnel cloudflare",
-    "connect:stable": "node scripts/codexpro.mjs --tunnel cloudflare-named",
-    "connect:ngrok": "node scripts/codexpro.mjs ngrok",
+    "smoke": "node scripts/smoke.mjs && node scripts/http-smoke.mjs && node scripts/grok-oauth-smoke.mjs && node scripts/dual-client-smoke.mjs && node scripts/tailscale-funnel-smoke.mjs && node scripts/openai-smoke.mjs && node scripts/pro-smoke.mjs && node scripts/doctor-smoke.mjs && node scripts/settings-smoke.mjs && node scripts/permissions-unit.mjs && node scripts/skills-manifest-unit.mjs && node scripts/load-skill-unit.mjs && node scripts/hooks-unit.mjs && node scripts/yolo-mode-unit.mjs && node scripts/execute-handoff-smoke.mjs && node scripts/workspace-locks-unit.mjs && node scripts/concurrency-lock-smoke.mjs && node scripts/file-snapshot-cache-unit.mjs && node scripts/fast-exploration-unit.mjs && node scripts/shell-backend-smoke.mjs && node scripts/perf-accounting-unit.mjs && node scripts/output-shaper-unit.mjs && node scripts/git-blame-unit.mjs && node scripts/patch-preview-unit.mjs && node scripts/agent-dag-unit.mjs && node scripts/range-read-unit.mjs && node scripts/review-untracked-unit.mjs && node scripts/process-runner-unit.mjs && node scripts/timeout-unit.mjs && node scripts/output-store-unit.mjs && node scripts/context-ranker-unit.mjs && node scripts/gain-unit.mjs && node scripts/project-memory-unit.mjs && node scripts/minimality-review-unit.mjs && node scripts/local-http-unit.mjs && node scripts/local-http-smoke.mjs && node scripts/docker-compose-ops-unit.mjs && node scripts/package-ops-unit.mjs && node scripts/file-transaction-parallel-unit.mjs && node scripts/mutation-response-mode-unit.mjs && node scripts/write-many-unit.mjs && node scripts/mutation-output-unit.mjs && node scripts/diff-worker-threshold-unit.mjs && node scripts/project-impact-unit.mjs && node scripts/symlink-write-unit.mjs && node scripts/codex-sessions-unit.mjs && node scripts/release-guard-unit.mjs",
+    "benchmark:write": "node scripts/write-performance-benchmark.mjs",
+    "benchmark:write:quick": "node scripts/write-performance-benchmark.mjs --quick",
+    "benchmark:exploration": "node scripts/fast-exploration-benchmark.mjs",
+    "benchmark:scale": "node scripts/perf-scale-benchmark.mjs --repo-size=small",
+    "benchmark:scale:tiny": "node scripts/perf-scale-benchmark.mjs --repo-size=tiny",
+    "benchmark:scale:small": "node scripts/perf-scale-benchmark.mjs --repo-size=small",
+    "release:guard": "node scripts/release-guard.mjs",
+    "release:check": "npm run release:guard && npm run build && npm run smoke && npm audit --audit-level=high && npm pack --dry-run",
+    "generate:adapters": "node scripts/generate-agent-adapters.mjs",
+    "doctor": "node scripts/least.mjs doctor",
+    "connect": "node scripts/least.mjs",
+    "connect:setup": "node scripts/least.mjs setup",
+    "connect:local": "node scripts/least.mjs --tunnel none",
+    "connect:cloudflare": "node scripts/least.mjs --tunnel cloudflare",
+    "connect:chatgpt": "node scripts/least.mjs --tunnel cloudflare",
+    "connect:stable": "node scripts/least.mjs --tunnel cloudflare-named",
+    "connect:ngrok": "node scripts/least.mjs ngrok",
+    "connect:tailscale": "node scripts/least.mjs tailscale",
     "pro:bundle": "node scripts/pro-bundle.mjs",
-    "pro:apply": "node scripts/pro-apply.mjs"
+    "pro:apply": "node scripts/pro-apply.mjs",
+    "dashboard:dev": "cd web/dashboard && npx vite --config vite.config.ts",
+    "dashboard:build": "cd web/dashboard && npx vite build --config vite.config.ts",
+    "dashboard:typecheck": "npx tsc -p web/dashboard/tsconfig.json --noEmit",
+    "dashboard:preview": "cd web/dashboard && npx vite preview --config vite.config.ts --host 127.0.0.1 --port 8922",
+    "dashboard:unit": "node scripts/dashboard-unit.mjs",
+    "dashboard:agent-unit": "node scripts/dashboard-agent-unit.mjs",
+    "dashboard:smoke": "node scripts/dashboard-smoke.mjs",
+    "dashboard:build-smoke": "node scripts/dashboard-build-smoke.mjs",
+    "agent:terminal-smoke": "node scripts/agent-terminal-smoke.mjs",
+    "agent:lifecycle-smoke": "node scripts/agent-lifecycle-smoke.mjs",
+    "agent:start-contract-smoke": "node scripts/agent-start-contract-smoke.mjs",
+    "agent:direct-folder-smoke": "node scripts/agent-direct-folder-smoke.mjs",
+    "agent:deck-unit": "node scripts/agent-deck-unit.mjs",
+    "agent:omp-windows-smoke": "node scripts/agent-omp-windows-launch-smoke.mjs",
+    "agent:e2e-smoke": "node scripts/agent-e2e-smoke.mjs",
+    "agent:cli": "node scripts/least-agent-cli.mjs",
+    "workflow:state-unit": "node scripts/least-workflow-state-unit.mjs",
+    "workflow:video-study-smoke": "node scripts/least-workflow-video-study-smoke.mjs",
+    "postinstall": "node scripts/patch-groundcrew-windows.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.4",
+    "@clipboard-health/groundcrew": "^4.45.9",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "minimatch": "^10.0.1",
-    "zod": "^3.25.76"
+    "yaml": "^2.9.0",
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

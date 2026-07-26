@@ -1,0 +1,38 @@
+{
+  "sources": [{ "kind": "linear", "enabled": false }],
+  "workspace": {
+    "projectDir": "X:/",
+    "worktreeDir": "X:/least/.ai-bridge/groundcrew-worktrees",
+    "knownRepositories": ["least"]
+  },
+  "workspaceKind": "zellij",
+  "agents": {
+    "default": "grok-build",
+    "definitions": {
+      "grok-build": {
+        "cmd": "cmd /c scripts\\least-grok-headless.cmd",
+        "color": "#f97316"
+      },
+      "codex-host": {
+        "cmd": "codex exec --json --sandbox workspace-write",
+        "color": "#10b981"
+      },
+      "codex-wsl": {
+        "cmd": "wsl bash scripts/least-codex-wsl.sh",
+        "color": "#06b6d4"
+      },
+      "oh-my-pi": {
+        "cmd": "omp -p --approval-mode write",
+        "color": "#a855f7"
+      }
+    }
+  },
+  "local": {
+    "runner": "none"
+  },
+  "defaults": {
+    "hooks": {
+      "prepareWorktree": "true"
+    }
+  }
+}

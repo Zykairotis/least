@@ -56,21 +56,21 @@ function waitForExit(child, timeoutMs = 5000) {
 }
 
 async function expectHttpTokenRequired(name, overrides = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), `codexpro-http-no-token-${name}-`));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), `least-http-no-token-${name}-`));
   const port = await getFreePort();
   const env = {
     ...process.env,
-    CODEXPRO_ROOT: root,
-    CODEXPRO_ALLOWED_ROOTS: root,
-    CODEXPRO_HOST: '127.0.0.1',
-    CODEXPRO_PORT: String(port),
-    CODEXPRO_BASH_MODE: 'safe',
-    CODEXPRO_WRITE_MODE: 'handoff',
+    LEAST_ROOT: root,
+    LEAST_ALLOWED_ROOTS: root,
+    LEAST_HOST: '127.0.0.1',
+    LEAST_PORT: String(port),
+    LEAST_BASH_MODE: 'safe',
+    LEAST_WRITE_MODE: 'handoff',
     ...overrides
   };
-  delete env.CODEXPRO_HTTP_TOKEN;
+  delete env.LEAST_HTTP_TOKEN;
   delete env.CODEBASE_BRIDGE_HTTP_TOKEN;
-  delete env.CODEXPRO_ALLOW_NO_HTTP_TOKEN;
+  delete env.LEAST_ALLOW_NO_HTTP_TOKEN;
 
   const child = spawn('node', ['dist/http.js'], {
     cwd: path.resolve('.'),
@@ -81,13 +81,13 @@ async function expectHttpTokenRequired(name, overrides = {}) {
   if (result.code === 0) {
     throw new Error(`expected ${name} HTTP server without token to fail closed`);
   }
-  if (!result.stderr.includes('CODEXPRO_HTTP_TOKEN is required')) {
+  if (!result.stderr.includes('LEAST_HTTP_TOKEN is required')) {
     throw new Error(`expected ${name} missing-token failure, got:\n${result.stderr}`);
   }
 }
 
 async function listTools(url, token) {
-  const client = new Client({ name: 'codexpro-http-smoke', version: '0.0.0' });
+  const client = new Client({ name: 'least-http-smoke', version: '0.0.0' });
   const transport = new StreamableHTTPClientTransport(new URL(url), {
     requestInit: token ? { headers: { Authorization: `Bearer ${token}` } } : undefined
   });
@@ -110,11 +110,11 @@ function hasWidgetMeta(tools, name, uri) {
   return meta.ui?.resourceUri === uri || meta['openai/outputTemplate'] === uri;
 }
 
-await expectHttpTokenRequired('non-loopback', { CODEXPRO_HOST: '0.0.0.0' });
-await expectHttpTokenRequired('tunnel-mode', { CODEXPRO_TUNNEL_MODE: '1' });
+await expectHttpTokenRequired('non-loopback', { LEAST_HOST: '0.0.0.0' });
+await expectHttpTokenRequired('tunnel-mode', { LEAST_TUNNEL_MODE: '1' });
 
 async function withClient(url, fn) {
-  const client = new Client({ name: 'codexpro-http-smoke', version: '0.0.0' });
+  const client = new Client({ name: 'least-http-smoke', version: '0.0.0' });
   const transport = new StreamableHTTPClientTransport(new URL(url));
   try {
     await client.connect(transport);
@@ -133,7 +133,7 @@ async function callTool(client, name, args = {}) {
   return result;
 }
 
-const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-http-smoke-'));
+const root = await fs.mkdtemp(path.join(os.tmpdir(), 'least-http-smoke-'));
 await fs.mkdir(path.join(root, '.codex', 'skills', 'http-smoke-skill'), { recursive: true });
 await fs.writeFile(path.join(root, '.codex', 'skills', 'http-smoke-skill', 'SKILL.md'), [
   '---',
@@ -145,19 +145,19 @@ await fs.writeFile(path.join(root, '.codex', 'skills', 'http-smoke-skill', 'SKIL
   ''
 ].join('\n'), 'utf8');
 const port = await getFreePort();
-const token = 'codexpro-http-smoke-token';
+const token = 'least-http-smoke-token';
 const child = spawn('node', ['dist/http.js'], {
   cwd: path.resolve('.'),
   env: {
     ...process.env,
-    CODEXPRO_ROOT: root,
-    CODEXPRO_ALLOWED_ROOTS: root,
-    CODEXPRO_PORT: String(port),
-    CODEXPRO_HTTP_TOKEN: token,
-    CODEXPRO_BASH_MODE: 'safe',
-    CODEXPRO_WRITE_MODE: 'handoff',
-    CODEXPRO_TOOL_MODE: 'full',
-    CODEXPRO_WIDGET_DOMAIN: 'https://widgets.codexpro.test'
+    LEAST_ROOT: root,
+    LEAST_ALLOWED_ROOTS: root,
+    LEAST_PORT: String(port),
+    LEAST_HTTP_TOKEN: token,
+    LEAST_BASH_MODE: 'safe',
+    LEAST_WRITE_MODE: 'handoff',
+    LEAST_TOOL_MODE: 'full',
+    LEAST_WIDGET_DOMAIN: 'https://widgets.least.test'
   },
   stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -178,34 +178,34 @@ try {
     throw new Error(`expected authenticated healthz to return 200, got ${authorized.status}`);
   }
 
-  const queryAuthorized = await fetch(`${baseUrl}/healthz?codexpro_token=${encodeURIComponent(token)}`);
+  const queryAuthorized = await fetch(`${baseUrl}/healthz?least_token=${encodeURIComponent(token)}`);
   if (queryAuthorized.status !== 200) {
     throw new Error(`expected URL-token healthz to return 200, got ${queryAuthorized.status}`);
   }
 
-  const home = await fetch(`${baseUrl}/?codexpro_token=${encodeURIComponent(token)}`);
+  const home = await fetch(`${baseUrl}/?least_token=${encodeURIComponent(token)}`);
   const homeText = await home.text();
   if (home.status !== 200 || !home.headers.get('content-type')?.includes('text/html')) {
     throw new Error(`expected authenticated onboarding page to return HTML 200, got ${home.status}`);
   }
-  if (!homeText.includes('CodexPro local bridge') || !homeText.includes('ChatGPT setup')) {
+  if (!homeText.includes('Least local bridge') || !homeText.includes('ChatGPT setup')) {
     throw new Error('onboarding page did not include expected setup copy');
   }
 
-  const queryTools = await listTools(`${baseUrl}/mcp?codexpro_token=${encodeURIComponent(token)}`);
+  const queryTools = await listTools(`${baseUrl}/mcp?least_token=${encodeURIComponent(token)}`);
   const queryToolNames = toolNames(queryTools);
-  for (const expected of ['server_config', 'codexpro_inventory', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'load_skill', 'show_changes', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
+  for (const expected of ['server_config', 'least_inventory', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'load_skill', 'show_changes', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context', 'agent_list', 'agent_doctor', 'agent_plan', 'agent_start', 'agent_status', 'agent_tail', 'agent_result', 'agent_attach_hint']) {
     if (!queryToolNames.includes(expected)) {
       throw new Error(`URL-token MCP tools/list missing ${expected}; got ${queryToolNames.join(', ')}`);
     }
   }
-  const toolCardUri = 'ui://widget/codexpro-tool-card-v8.html';
-  for (const visualTool of ['open_current_workspace', 'open_workspace', 'write', 'edit', 'show_changes', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex']) {
+  const toolCardUri = 'ui://widget/least-tool-card-v8.html';
+  for (const visualTool of ['open_current_workspace', 'open_workspace', 'files', 'write', 'edit', 'bash', 'shell', 'show_changes', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex', 'agent_list', 'agent_doctor', 'agent_plan', 'agent_start', 'agent_status', 'agent_tail', 'agent_result', 'agent_attach_hint']) {
     if (!hasWidgetMeta(queryTools, visualTool, toolCardUri)) {
-      throw new Error(`${visualTool} should render the CodexPro widget`);
+      throw new Error(`${visualTool} should render the Least widget`);
     }
   }
-  for (const quietTool of ['server_config', 'codexpro_inventory', 'list_workspaces', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'read', 'bash', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
+  for (const quietTool of ['server_config', 'least_inventory', 'list_workspaces', 'workspace_snapshot', 'tree', 'search', 'search_context', 'read', 'read_many', 'json_query', 'load_skill', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
     if (hasWidgetMeta(queryTools, quietTool, toolCardUri)) {
       throw new Error(`${quietTool} should stay data-only without widget metadata`);
     }
@@ -216,8 +216,13 @@ try {
   if (!headerToolNames.includes('server_config')) {
     throw new Error(`bearer MCP tools/list missing server_config; got ${headerToolNames.join(', ')}`);
   }
+  for (const expected of ['agent_start', 'agent_status', 'agent_result']) {
+    if (!headerToolNames.includes(expected)) {
+      throw new Error(`bearer MCP tools/list missing ${expected}; got ${headerToolNames.join(', ')}`);
+    }
+  }
 
-  const mcpUrl = `${baseUrl}/mcp?codexpro_token=${encodeURIComponent(token)}`;
+  const mcpUrl = `${baseUrl}/mcp?least_token=${encodeURIComponent(token)}`;
   await withClient(mcpUrl, async (client) => {
     const resources = await client.listResources();
     const toolCard = resources.resources.find((resource) => resource.uri === toolCardUri);
@@ -234,14 +239,14 @@ try {
     if (!widgetMeta.ui?.csp || !widgetMeta['openai/widgetCSP']) {
       throw new Error('HTTP tool-card widget resource did not expose standard and ChatGPT CSP metadata');
     }
-    if (widgetMeta.ui?.domain !== 'https://widgets.codexpro.test' || widgetMeta['openai/widgetDomain'] !== 'https://widgets.codexpro.test') {
+    if (widgetMeta.ui?.domain !== 'https://widgets.least.test' || widgetMeta['openai/widgetDomain'] !== 'https://widgets.least.test') {
       throw new Error('HTTP tool-card widget resource did not expose standard and ChatGPT widget domain metadata');
     }
   });
 
   const currentOpened = await withClient(mcpUrl, async (client) => {
-    const result = await callTool(client, 'open_current_workspace', { include_tree: false });
-    if (result.structuredContent.codexpro_tool !== 'open_current_workspace') {
+    const result = await callTool(client, 'open_current_workspace', { include_tree: false, include_skills: true });
+    if (result.structuredContent.least_tool !== 'open_current_workspace') {
       throw new Error('HTTP tool result was not tagged for widget rendering');
     }
     if (result.structuredContent.tool_mode !== 'full') {
@@ -254,11 +259,11 @@ try {
   });
 
   await withClient(mcpUrl, async (client) => {
-    const inventory = await callTool(client, 'codexpro_inventory', {
+    const inventory = await callTool(client, 'least_inventory', {
       include_global_skills: false,
       include_mcp_servers: false
     });
-    if (inventory.structuredContent.codexpro_tool !== 'codexpro_inventory') {
+    if (inventory.structuredContent.least_tool !== 'least_inventory') {
       throw new Error('HTTP inventory result was not tagged for widget rendering');
     }
     const loadedSkill = await callTool(client, 'load_skill', {

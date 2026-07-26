@@ -26,6 +26,15 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Exploration Benchmark
+        run: npm run benchmark:exploration
+
+      - name: Scale Benchmark Tiny
+        run: npm run benchmark:scale:tiny
+
+      - name: Scale Benchmark Small
+        run: npm run benchmark:scale:small
+
       - name: Smoke Test
         run: npm run smoke
 

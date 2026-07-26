@@ -1,0 +1,71 @@
+{
+  // Copy this file to .least/agents.local.jsonc and edit for your machine.
+  // This config is used by Least for validation/doctor checks.
+  // Groundcrew still needs its own crew.config.ts for actual worktree/session launches.
+  "groundcrew": {
+    "configPath": "~/.config/groundcrew/crew.config.ts",
+    "workspaceKind": "zellij",
+    "runner": "srt"
+  },
+  "terminal": {
+    "preferredBackend": "zellij",
+    "zellijSessionPrefix": "least-agent",
+    "logFallback": true
+  },
+  "agents": {
+    "claude-code": {
+      "provider": "claude",
+      "groundcrewProfile": "claude-code",
+      "cmd": "claude --permission-mode auto",
+      "promptVia": "positional",
+      "defaultTimeoutMs": 3600000,
+      "idleTimeoutMs": 900000,
+      "writePolicy": "worktree",
+      "enabled": true
+    },
+    "codex-host": {
+      "provider": "codex",
+      "groundcrewProfile": "codex-host",
+      "cmd": "codex exec --json --sandbox workspace-write",
+      "promptVia": "positional",
+      "defaultTimeoutMs": 3600000,
+      "idleTimeoutMs": 900000,
+      "writePolicy": "worktree",
+      "enabled": true,
+      "notes": "Safer host Codex profile; do not use yolo/danger bypass by default."
+    },
+    "codex-wsl": {
+      "provider": "codex",
+      "groundcrewProfile": "codex-wsl",
+      "command": ["scripts/least-codex-wsl.sh"],
+      "promptVia": "prompt-file",
+      "defaultTimeoutMs": 3600000,
+      "idleTimeoutMs": 900000,
+      "writePolicy": "worktree",
+      "enabled": true,
+      "notes": "Use wrapper script; avoid inline WSL shell quoting."
+    },
+    "grok-build": {
+      "provider": "grok",
+      "groundcrewProfile": "grok-build",
+      "command": ["scripts/least-grok-headless.cmd"],
+      "promptVia": "positional",
+      "defaultTimeoutMs": 7200000,
+      "idleTimeoutMs": 1200000,
+      "writePolicy": "worktree",
+      "enabled": true,
+      "notes": "Verified against xAI Grok Build CLI docs: grok -p supports headless prompts and streaming-json output."
+    },
+    "oh-my-pi": {
+      "provider": "pi",
+      "groundcrewProfile": "oh-my-pi",
+      "cmd": "omp -p --approval-mode write",
+      "promptVia": "positional",
+      "defaultTimeoutMs": 3600000,
+      "idleTimeoutMs": 900000,
+      "writePolicy": "worktree",
+      "enabled": true,
+      "notes": "Verified against can1357/oh-my-pi: the installed CLI binary is omp; -p/--print is non-interactive mode."
+    }
+  }
+}

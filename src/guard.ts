@@ -4,8 +4,9 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { minimatch } from "minimatch";
-import type { CodexProConfig } from "./config.js";
+import type { LeastConfig } from "./config.js";
 import { expandHome } from "./config.js";
+import { getCachedFileSnapshot } from "./fileSnapshotCache.js";
 
 export interface Workspace {
   id: string;
@@ -13,10 +14,10 @@ export interface Workspace {
   openedAt: string;
 }
 
-export class CodexProError extends Error {
+export class LeastError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = "CodexProError";
+    this.name = "LeastError";
   }
 }
 
@@ -61,7 +62,7 @@ function closestExistingParent(absPath: string): string {
 export class WorkspaceManager {
   private readonly workspaces = new Map<string, Workspace>();
 
-  constructor(private readonly config: CodexProConfig) {}
+  constructor(private readonly config: LeastConfig) {}
 
   defaultWorkspace(): Workspace {
     const existing = [...this.workspaces.values()].find((workspace) => workspace.root === this.config.defaultRoot);
@@ -72,16 +73,16 @@ export class WorkspaceManager {
     const requested = rootInput?.trim() ? expandHome(rootInput.trim()) : this.config.defaultRoot;
     const resolved = path.resolve(requested);
     if (!fs.existsSync(resolved)) {
-      throw new CodexProError(`Workspace root does not exist: ${resolved}`);
+      throw new LeastError(`Workspace root does not exist: ${resolved}`);
     }
     const stat = fs.statSync(resolved);
     if (!stat.isDirectory()) {
-      throw new CodexProError(`Workspace root is not a directory: ${resolved}`);
+      throw new LeastError(`Workspace root is not a directory: ${resolved}`);
     }
     const realRoot = fs.realpathSync(resolved);
     const allowed = this.config.allowedRoots.some((allowedRoot) => isSubpath(realRoot, allowedRoot));
     if (!allowed) {
-      throw new CodexProError(
+      throw new LeastError(
         `Workspace root is outside allowed roots: ${realRoot}\nAllowed roots:\n${this.config.allowedRoots.map((r) => `- ${r}`).join("\n")}`
       );
     }
@@ -99,7 +100,7 @@ export class WorkspaceManager {
     if (!id) return this.defaultWorkspace();
     const workspace = this.workspaces.get(id);
     if (!workspace) {
-      throw new CodexProError(`Unknown workspace_id: ${id}. Call open_workspace first.`);
+      throw new LeastError(`Unknown workspace_id: ${id}. Call open_workspace first.`);
     }
     return workspace;
   }
@@ -110,7 +111,7 @@ export class WorkspaceManager {
 }
 
 export class PathGuard {
-  constructor(private readonly config: CodexProConfig) {}
+  constructor(private readonly config: LeastConfig) {}
 
   isBlockedRelativePath(relPath: string): boolean {
     const rel = normalizeRelPath(relPath).replace(/^\.\//, "");
@@ -123,7 +124,7 @@ export class PathGuard {
 
   assertNotBlocked(relPath: string): void {
     if (this.isBlockedRelativePath(relPath)) {
-      throw new CodexProError(`Path is blocked by safety rules: ${relPath}`);
+      throw new LeastError(`Path is blocked by safety rules: ${relPath}`);
     }
   }
 
@@ -134,7 +135,7 @@ export class PathGuard {
     const relPath = displayPath(absPath, workspace.root);
 
     if (!isSubpath(absPath, workspace.root)) {
-      throw new CodexProError(`Path escapes workspace root: ${inputPath}`);
+      throw new LeastError(`Path escapes workspace root: ${inputPath}`);
     }
 
     this.assertNotBlocked(relPath);
@@ -142,17 +143,25 @@ export class PathGuard {
     const realTarget = maybeRealpath(absPath);
     if (realTarget) {
       if (!isSubpath(realTarget, workspace.root)) {
-        throw new CodexProError(`Path resolves outside workspace root through a symlink: ${inputPath}`);
+        throw new LeastError(`Path resolves outside workspace root through a symlink: ${inputPath}`);
       }
       const realRel = displayPath(realTarget, workspace.root);
       this.assertNotBlocked(realRel);
     }
 
     if (options.forWrite) {
+      try {
+        if (fs.lstatSync(absPath).isSymbolicLink()) {
+          throw new LeastError(`Refusing to write through a symbolic link: ${inputPath}`);
+        }
+      } catch (error) {
+        if (error instanceof LeastError) throw error;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
       const parent = closestExistingParent(path.dirname(absPath));
       const realParent = maybeRealpath(parent);
       if (realParent && !isSubpath(realParent, workspace.root)) {
-        throw new CodexProError(`Write path resolves through a parent outside the workspace: ${inputPath}`);
+        throw new LeastError(`Write path resolves through a parent outside the workspace: ${inputPath}`);
       }
       if (realParent) {
         const realParentRel = displayPath(realParent, workspace.root);
@@ -163,24 +172,38 @@ export class PathGuard {
     return { absPath, relPath };
   }
 
-  async assertTextFile(absPath: string, maxBytes: number): Promise<void> {
-    const stat = await fsp.stat(absPath);
-    if (!stat.isFile()) {
-      throw new CodexProError(`Not a file: ${absPath}`);
-    }
-    if (stat.size > maxBytes) {
-      throw new CodexProError(`File is too large (${stat.size} bytes). Limit: ${maxBytes} bytes.`);
-    }
+  async assertReadableTextFileSample(absPath: string, stat: fs.Stats): Promise<void> {
     const handle = await fsp.open(absPath, "r");
     try {
       const sample = Buffer.alloc(Math.min(4096, stat.size));
       const { bytesRead } = await handle.read(sample, 0, sample.length, 0);
       if (sample.subarray(0, bytesRead).includes(0)) {
-        throw new CodexProError("Refusing to read binary file.");
+        throw new LeastError("Refusing to read binary file.");
       }
     } finally {
       await handle.close();
     }
+  }
+
+  async assertTextFile(absPath: string, maxBytes: number): Promise<fs.Stats> {
+    const stat = await fsp.stat(absPath);
+    if (!stat.isFile()) {
+      throw new LeastError(`Not a file: ${absPath}`);
+    }
+    if (stat.size > maxBytes) {
+      throw new LeastError(`File is too large (${stat.size} bytes). Limit: ${maxBytes} bytes.`);
+    }
+    if (!getCachedFileSnapshot(absPath, stat)) await this.assertReadableTextFileSample(absPath, stat);
+    return stat;
+  }
+
+  async assertReadableTextFileForRangeRead(absPath: string): Promise<fs.Stats> {
+    const stat = await fsp.stat(absPath);
+    if (!stat.isFile()) {
+      throw new LeastError(`Not a file: ${absPath}`);
+    }
+    await this.assertReadableTextFileSample(absPath, stat);
+    return stat;
   }
 }
 

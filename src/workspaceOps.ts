@@ -2,13 +2,14 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { CodexProConfig } from "./config.js";
+import type { LeastConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { PathGuard } from "./guard.js";
 import { readTextFile, repoTree, ensureAiBridge } from "./fsOps.js";
 import { gitDiff, gitLog, gitStatus } from "./gitOps.js";
 import { discoverSkillInventory } from "./capabilitiesOps.js";
 import type { SkillInventoryItem } from "./capabilitiesOps.js";
+import { discoverAgentSupport, type AgentDiscoverySummary } from "./agentDiscovery.js";
 
 export interface WorkspaceSummary {
   text: string;
@@ -21,6 +22,7 @@ export interface WorkspaceSummary {
   skillCounts: Record<string, number>;
   tree?: string;
   gitStatus: string;
+  agentDiscovery: AgentDiscoverySummary;
 }
 
 export interface CodexContext {
@@ -112,7 +114,7 @@ async function findAgentsFilesInDir(workspace: Workspace, dir: string): Promise<
 }
 
 async function readAgentsChain(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   targetPath: string,
@@ -146,16 +148,23 @@ async function readAgentsChain(
 }
 
 export async function workspaceSummary(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
-  options: { includeTree?: boolean; maxDepth?: number; bootstrapContext?: boolean; includeSkills?: boolean; includeGlobalSkills?: boolean } = {}
+  options: {
+    includeTree?: boolean;
+    maxDepth?: number;
+    bootstrapContext?: boolean;
+    includeSkills?: boolean;
+    includeGlobalSkills?: boolean;
+    includeRecentCommits?: boolean;
+  } = {}
 ): Promise<WorkspaceSummary> {
   if (options.bootstrapContext) {
     await ensureAiBridge(config, guard, workspace);
   }
   const skillInventory = options.includeSkills
-    ? await discoverSkillInventory(workspace, { includeGlobal: options.includeGlobalSkills !== false, maxSkills: 120 })
+    ? await discoverSkillInventory(workspace, config, { includeGlobal: options.includeGlobalSkills !== false, maxSkills: 120 })
     : [];
   const skills = skillInventory.map((skill) => skill.name);
   const counts = skillCounts(skillInventory);
@@ -166,7 +175,7 @@ export async function workspaceSummary(
   }
 
   let treeText: string | undefined;
-  if (options.includeTree !== false) {
+  if (options.includeTree) {
     const tree = await repoTree(config, guard, workspace, {
       path: ".",
       maxDepth: Math.max(1, Math.min(options.maxDepth ?? 3, 8)),
@@ -176,12 +185,31 @@ export async function workspaceSummary(
     treeText = tree.text;
   }
 
-  const status = gitStatus(config, workspace);
-  const log = gitLog(config, workspace, 5);
+  const status = await gitStatus(config, workspace);
+  const log = options.includeRecentCommits ? await gitLog(config, workspace, 5) : "";
+  const agentDiscovery = await discoverAgentSupport(workspace);
   const skillText = options.includeSkills
     ? `Skills: ${counts.total} total (${counts.workspace ?? 0} workspace, ${counts.user ?? 0} user, ${counts.plugin ?? 0} plugin, ${counts.other ?? 0} other).`
     : "Skills: skipped. Pass include_skills=true if skill discovery is needed.";
-  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}\n\n## Recent commits\n\n${log}\n${treeText ? `\n## Files\n\n${treeText}` : ""}`;
+  const commitsSection = options.includeRecentCommits ? `\n\n## Recent commits\n\n${log}` : "";
+  const agentText = agentDiscovery.available
+    ? [
+        "## Local Agents",
+        "",
+        `Enabled profiles: ${agentDiscovery.enabledProfiles.join(", ")}`,
+        `Direct agent tools: ${agentDiscovery.directTools.join(", ")}`,
+        agentDiscovery.note ?? "",
+        "",
+        "Use direct agent_* tools if your client exposes them.",
+        `Fallback CLI doctor bridge: ${agentDiscovery.cliBridgeDoctor}`,
+        `Fallback CLI start example: ${agentDiscovery.cliBridgeStartExample}`
+      ].filter(Boolean).join("\n")
+    : [
+        "## Local Agents",
+        "",
+        agentDiscovery.note ?? "No enabled local agent profiles were discovered."
+      ].join("\n");
+  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n${agentText}\n\n## Git status\n\n${status}${commitsSection}${treeText ? `\n\n## Files\n\n${treeText}` : ""}`;
 
   return {
     text,
@@ -193,12 +221,13 @@ export async function workspaceSummary(
     skillInventory,
     skillCounts: counts,
     tree: treeText,
-    gitStatus: status
+    gitStatus: status,
+    agentDiscovery
   };
 }
 
 export async function readAiBridgeContext(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   options: { createIfMissing?: boolean } = {}
@@ -238,7 +267,7 @@ export async function readAiBridgeContext(
 }
 
 export async function readCodexContext(
-  config: CodexProConfig,
+  config: LeastConfig,
   guard: PathGuard,
   workspace: Workspace,
   options: {
@@ -255,8 +284,8 @@ export async function readCodexContext(
   const ai = options.includeAiBridge === false
     ? { text: "Skipped by request.", files: [] }
     : await readAiBridgeContext(config, guard, workspace);
-  const status = options.includeGit === false ? undefined : gitStatus(config, workspace);
-  const diff = options.includeDiff ? gitDiff(config, guard, workspace) : undefined;
+  const status = options.includeGit === false ? undefined : await gitStatus(config, workspace);
+  const diff = options.includeDiff ? await gitDiff(config, guard, workspace) : undefined;
 
   const text = [
     "# Codex Context",

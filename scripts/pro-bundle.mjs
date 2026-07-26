@@ -5,11 +5,11 @@ import path from 'node:path';
 import process from 'node:process';
 
 function usage() {
-  console.log(`CodexPro context bundle
+  console.log(`Least context bundle
 
 Usage:
-  codexpro pro-bundle --root /path/to/repo --copy
-  codexpro pro-bundle --root /path/to/repo --path src/App.tsx --glob "src/**/*.ts"
+  Lst pro-bundle --root /path/to/repo --copy
+  Lst pro-bundle --root /path/to/repo --path src/App.tsx --glob "src/**/*.ts"
 
 Options:
   --root <dir>              Workspace root. Default: current directory.

@@ -1,12 +1,12 @@
-# CodexPro FAQ
+# Least FAQ
 
 ## Which ChatGPT account should I use?
 
 Use ChatGPT Plus or Pro with Apps / Developer Mode access.
 
-Current testing shows free and Go accounts do not expose the app flow needed for CodexPro.
+Current testing shows free and Go accounts do not expose the app flow needed for Least.
 
-CodexPro does not unlock Developer Mode, unlock models, bypass account limits, or provide account access. It connects to the ChatGPT app surface your account already has.
+Least does not unlock Developer Mode, unlock models, bypass account limits, or provide account access. It connects to the ChatGPT app surface your account already has.
 
 Account access and model tool support are separate. A Plus or Pro account can have Apps / Developer Mode, while a specific model surface may still be unable to call connectors or MCP tools directly. Use the Pro context fallback for those sessions.
 
@@ -15,22 +15,22 @@ Account access and model tool support are separate. A Plus or Pro account can ha
 Install globally once:
 
 ```bash
-npm install -g codexpro
+npm install -g least
 ```
 
 Then run setup from the repo you want ChatGPT to work on:
 
 ```bash
-codexpro setup
+least setup
 ```
 
 After setup, daily startup from that same repo is:
 
 ```bash
-codexpro start
+least start
 ```
 
-`npx codexpro@latest start` still works as a no-install fallback, but the global install is easier for normal users.
+`npx least@latest start` still works as a no-install fallback, but the global install is easier for normal users.
 
 ## What do I enable in ChatGPT?
 
@@ -48,42 +48,42 @@ Settings
 In Create App:
 
 ```text
-Name: CodexPro
+Name: Least
 Description: Local workspace bridge for ChatGPT coding
 Connection: Server URL
-Server URL: paste the URL copied by CodexPro
+Server URL: paste the URL copied by Least
 Authentication: No Authentication / None
 ```
 
-The copied Server URL already includes the private CodexPro token.
+The copied Server URL already includes the private Least token.
 
 ## Should CSP stay enabled?
 
 Yes. Keep Enforce CSP in developer mode enabled.
 
-CodexPro widgets are built for the CSP-enabled path. They do not need unrestricted network access, external fonts, remote scripts, iframes, or third-party images.
+Least widgets are built for the CSP-enabled path. They do not need unrestricted network access, external fonts, remote scripts, iframes, or third-party images.
 
-## Does CodexPro bypass rate limits?
+## Does Least bypass rate limits?
 
 No.
 
-CodexPro does not bypass, avoid, increase, pool, resell, or modify ChatGPT, Codex, OpenAI, or third-party model limits. Every request still runs through the user's own ChatGPT session and whatever limits that account has.
+Least does not bypass, avoid, increase, pool, resell, or modify ChatGPT, Codex, OpenAI, or third-party model limits. Every request still runs through the user's own ChatGPT session and whatever limits that account has.
 
-The useful part is that Codex and ChatGPT are different product surfaces. If one workflow is unavailable and another product surface you already have access to is still available, CodexPro lets you work against the same local repo without changing either product's limits.
+The useful part is that Codex and ChatGPT are different product surfaces. If one workflow is unavailable and another product surface you already have access to is still available, Least lets you work against the same local repo without changing either product's limits.
 
-## Can CodexPro use GPT-5.5?
+## Can Least use GPT-5.5?
 
 Only if your ChatGPT account already exposes that exact model, or a similar stronger model, in the ChatGPT web product surface you are using, and that model surface can call Developer Mode apps.
 
-Some stronger planning-model surfaces may not be able to call the CodexPro connector directly. CodexPro does not provide, proxy, resell, or unlock models. It gives compatible ChatGPT sessions local repo tools.
+Some stronger planning-model surfaces may not be able to call the Least connector directly. Least does not provide, proxy, resell, or unlock models. It gives compatible ChatGPT sessions local repo tools.
 
 For models that cannot call tools, generate a repo context bundle instead:
 
 ```bash
-codexpro pro-bundle --root /path/to/repo --copy
+least pro-bundle --root /path/to/repo --copy
 ```
 
-## What can ChatGPT see through CodexPro?
+## What can ChatGPT see through Least?
 
 ChatGPT can see explicit workspace context exposed by tools:
 
@@ -125,15 +125,24 @@ No public tunnel:       local-only mode, only for clients that can reach localho
 
 Cloudflare quick tunnel URLs change on restart. If you put a quick-mode URL into ChatGPT, you must edit the ChatGPT app Server URL every time you restart the tunnel.
 
-For most users, the better path is a free ngrok dev domain. Create a free ngrok account, find your assigned dev domain under Universal Gateway -> Domains, and save that hostname during `codexpro setup`.
+For most users, the better path is a free ngrok dev domain. Create a free ngrok account, find your assigned dev domain under Universal Gateway -> Domains, and save that hostname during `least setup`.
 
-If you own a domain, use Cloudflare named tunnels and route DNS to a hostname like `codexpro.example.com`.
+If you own a domain, use Cloudflare named tunnels and route DNS to a hostname like `least.example.com`.
 
 Official references:
 
 - ngrok dev domains: https://ngrok.com/docs/universal-gateway/domains
 - Cloudflare Tunnel routing: https://developers.cloudflare.com/tunnel/routing/
 - Cloudflare Tunnel DNS records: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/routing-to-tunnel/dns/
+
+## Can ChatGPT and Grok use the same Least hostname?
+
+Yes, with `--dual-client` on a public HTTPS tunnel (Tailscale Funnel, Cloudflare, or ngrok).
+
+- ChatGPT should use `/mcp?least_token=<token>` with Authentication set to No Auth.
+- Grok should use `/mcp-grok` with OAuth fields at `/oauth/authorize` and `/oauth/token`.
+
+Both clients point at the same workspace and share the same Least bearer token. If both edit files at the same time, resolve conflicts in git like any other multi-editor workflow.
 
 ## Can I use the same ChatGPT app URL every day?
 
@@ -142,7 +151,7 @@ Yes, if you use a stable hostname.
 Recommended simple path:
 
 ```bash
-codexpro setup
+least setup
 # choose ngrok
 # enter your ngrok free dev domain
 ```
@@ -150,12 +159,12 @@ codexpro setup
 After that:
 
 ```bash
-codexpro start
+least start
 ```
 
-The same hostname and CodexPro token are reused for that workspace.
+The same hostname and Least token are reused for that workspace.
 
-## What if I run CodexPro in two repos at once?
+## What if I run Least in two repos at once?
 
 Use different local ports and different tunnel hostnames.
 
@@ -166,23 +175,23 @@ repo A: port 8787, hostname A
 repo B: port 8788, hostname B
 ```
 
-Run `codexpro setup` in each repo and save a profile per workspace.
+Run `least setup` in each repo and save a profile per workspace.
 
-## Why not use codexpro.github.io?
+## Why not use least.github.io?
 
 GitHub Pages gives `owner.github.io` only to the GitHub user or organization named `owner`.
 
-The `codexpro` GitHub username already exists, so this repo cannot use `codexpro.github.io` from the `rebel0789` account.
+The `least` GitHub username already exists, so this repo cannot use `least.github.io` from the `Zykairotis` account.
 
 The clean GitHub Pages URL for this project is:
 
 ```text
-https://rebel0789.github.io/codexpro/
+https://Zykairotis.github.io/least/
 ```
 
-## Is CodexPro production safe?
+## Is Least production safe?
 
-CodexPro is a local developer bridge, not an OS sandbox.
+Least is a local developer bridge, not an OS sandbox.
 
 Use it with repos you trust. Keep token auth enabled for public tunnels. Keep safe bash on unless you know why you need full bash. Read [SECURITY.md](SECURITY.md) before exposing it through a public tunnel.
 
@@ -191,15 +200,15 @@ Use it with repos you trust. Keep token auth enabled for public tunnels. Keep sa
 Workspace profiles are saved under:
 
 ```text
-~/.codexpro/profiles/
+~/.least/profiles/
 ```
 
 Use:
 
 ```bash
-codexpro settings
-codexpro settings list
-codexpro settings delete --yes
+least settings
+least settings list
+least settings delete --yes
 ```
 
 Saved tokens are redacted when profiles are displayed.
