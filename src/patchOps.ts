@@ -92,39 +92,51 @@ function applyUpdateToText(original: string, patchLines: string[]): string {
   const output: string[] = [];
   let cursor = 0;
 
+  const hunks: string[][] = [];
+  let current: string[] = [];
   for (const raw of patchLines) {
-    if (raw.startsWith("@@")) continue;
-    const op = raw[0];
-    const content = raw.slice(1);
-    if (op === " ") {
-      while (cursor < source.length && source[cursor] !== content) {
-        output.push(source[cursor] as string);
-        cursor += 1;
-      }
-      if (source[cursor] !== content) {
-        throw new LeastError(`Patch context not found: ${content}`);
-      }
-      output.push(content);
-      cursor += 1;
-      continue;
-    }
-    if (op === "-") {
-      while (cursor < source.length && source[cursor] !== content) {
-        output.push(source[cursor] as string);
-        cursor += 1;
-      }
-      if (source[cursor] !== content) {
-        throw new LeastError(`Patch removal not found: ${content}`);
-      }
-      cursor += 1;
-      continue;
-    }
-    if (op === "+") {
-      output.push(content);
+    if (raw.startsWith("@@")) {
+      if (current.length) hunks.push(current);
+      current = [];
       continue;
     }
     if (raw === "*** End of File") continue;
-    throw new LeastError(`Unsupported patch line: ${raw}`);
+    current.push(raw);
+  }
+  if (current.length) hunks.push(current);
+
+  for (const hunk of hunks) {
+    const oldLines: string[] = [];
+    const newLines: string[] = [];
+    for (const raw of hunk) {
+      const op = raw[0];
+      const content = raw.slice(1);
+      if (op === " ") {
+        oldLines.push(content);
+        newLines.push(content);
+      } else if (op === "-") {
+        oldLines.push(content);
+      } else if (op === "+") {
+        newLines.push(content);
+      } else {
+        throw new LeastError(`Unsupported patch line: ${raw}`);
+      }
+    }
+
+    const matches: number[] = [];
+    if (oldLines.length === 0) {
+      matches.push(cursor);
+    } else {
+      for (let start = cursor; start + oldLines.length <= source.length; start += 1) {
+        if (oldLines.every((line, index) => source[start + index] === line)) matches.push(start);
+      }
+    }
+    if (matches.length === 0) throw new LeastError("Patch hunk context not found.");
+    if (matches.length > 1) throw new LeastError("Patch hunk is ambiguous; add more surrounding context.");
+
+    const start = matches[0]!;
+    output.push(...source.slice(cursor, start), ...newLines);
+    cursor = start + oldLines.length;
   }
 
   while (cursor < source.length) {
@@ -132,6 +144,11 @@ function applyUpdateToText(original: string, patchLines: string[]): string {
     cursor += 1;
   }
   return joinLines(output);
+}
+
+async function readPatchText(config: LeastConfig, guard: PathGuard, absPath: string): Promise<string> {
+  const stat = await guard.assertTextFile(absPath, config.maxWriteBytes);
+  return (await readTextWithSnapshot(absPath, { maxBytes: config.maxWriteBytes, knownStat: stat })).text;
 }
 
 export async function applyWorkspacePatch(
@@ -186,7 +203,7 @@ export async function applyWorkspacePatch(
       options.authorizePath?.(resolved.relPath);
       if (occupiedTargets.has(resolved.absPath)) throw new LeastError(`Patch targets file more than once: ${action.file}`);
       occupiedTargets.add(resolved.absPath);
-      const before = (await readTextWithSnapshot(resolved.absPath, { maxBytes: config.maxWriteBytes })).text;
+      const before = await readPatchText(config, guard, resolved.absPath);
       const diff = await computeMutationDiff(before, "", resolved.relPath, diffMode, options.maxDiffChars, {
         storageMaxChars: config.outputStoreMaxItemBytes
       });
@@ -199,7 +216,7 @@ export async function applyWorkspacePatch(
     }
     const resolved = guard.resolve(workspace, action.file, { forWrite: true });
     options.authorizePath?.(resolved.relPath);
-    const before = (await readTextWithSnapshot(resolved.absPath, { maxBytes: config.maxWriteBytes })).text;
+    const before = await readPatchText(config, guard, resolved.absPath);
     const after = applyUpdateToText(before, action.lines);
     if (Buffer.byteLength(after, "utf8") > config.maxWriteBytes) {
       throw new LeastError(`Patched file too large: ${action.file}`);
@@ -269,7 +286,7 @@ export async function previewWorkspacePatch(
       }
       if (action.type === "delete") {
         const resolved = guard.resolve(workspace, action.file, { forWrite: true });
-        const before = (await readTextWithSnapshot(resolved.absPath, { maxBytes: config.maxWriteBytes })).text;
+        const before = await readPatchText(config, guard, resolved.absPath);
         const diff = await computeMutationDiff(before, "", resolved.relPath, "full");
         additions += diff.additions ?? 0;
         deletions += diff.deletions ?? 0;
@@ -278,7 +295,7 @@ export async function previewWorkspacePatch(
         continue;
       }
       const resolved = guard.resolve(workspace, action.file, { forWrite: true });
-      const before = (await readTextWithSnapshot(resolved.absPath, { maxBytes: config.maxWriteBytes })).text;
+      const before = await readPatchText(config, guard, resolved.absPath);
       const after = applyUpdateToText(before, action.lines);
       if (Buffer.byteLength(after, "utf8") > config.maxWriteBytes) throw new LeastError(`Patched file too large: ${action.file}`);
       if (hasSecretValue(after)) throw new LeastError("Secret-looking content is blocked from patch preview.");

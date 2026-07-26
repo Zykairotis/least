@@ -128,8 +128,7 @@ export async function readTextWithSnapshot(
     throw new Error(`Not a file: ${absPath}`);
   }
   if (stat.size > maxBytes) {
-    const text = await fsp.readFile(absPath, "utf8");
-    return { text, sha256: sha256Text(text), size: stat.size, cacheHit: false, stat };
+    throw new Error(`File is too large (${stat.size} bytes). Limit: ${maxBytes} bytes.`);
   }
   const cached = getCachedFileSnapshot(absPath, stat, options.ttlMs);
   if (cached) {

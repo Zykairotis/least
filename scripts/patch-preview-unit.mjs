@@ -28,6 +28,45 @@ assert.equal(valid.preview["a.txt"], "one\nTWO\nthree\n");
 assert.deepEqual(valid.conflicts, []);
 assert.equal(await fs.readFile(path.join(root, "a.txt"), "utf8"), "one\ntwo\nthree\n");
 
+await fs.writeFile(path.join(root, "repeated.txt"), "section one\ntarget\nkeep\nsection two\ntarget\nkeep\n", "utf8");
+const ambiguous = await previewWorkspacePatch(config, guard, workspace, `*** Begin Patch
+*** Update File: repeated.txt
+@@
+-target
++CHANGED
+ keep
+*** End Patch`);
+assert.equal(ambiguous.changedFiles.length, 0, "ambiguous hunk must not select the first match");
+assert.match(ambiguous.conflicts[0] ?? "", /ambiguous/);
+
+const disambiguated = await previewWorkspacePatch(config, guard, workspace, `*** Begin Patch
+*** Update File: repeated.txt
+@@
+ section two
+-target
++CHANGED
+ keep
+*** End Patch`);
+assert.equal(disambiguated.preview["repeated.txt"], "section one\ntarget\nkeep\nsection two\nCHANGED\nkeep\n");
+
+const oversized = path.join(root, "oversized.txt");
+await fs.writeFile(oversized, "x".repeat(config.maxWriteBytes + 1), "utf8");
+await assert.rejects(
+  applyWorkspacePatch(config, guard, workspace, `*** Begin Patch
+*** Delete File: oversized.txt
+*** End Patch`, { checkOnly: true, diffMode: "none" }),
+  /too large/
+);
+assert.equal((await fs.stat(oversized)).size, config.maxWriteBytes + 1);
+const oversizedPreview = await previewWorkspacePatch(config, guard, workspace, `*** Begin Patch
+*** Update File: oversized.txt
+@@
+-x
++y
+*** End Patch`);
+assert.equal(oversizedPreview.changedFiles.length, 0);
+assert.match(oversizedPreview.conflicts[0] ?? "", /too large/);
+
 const bad = await previewWorkspacePatch(config, guard, workspace, `*** Begin Patch
 *** Update File: a.txt
 @@

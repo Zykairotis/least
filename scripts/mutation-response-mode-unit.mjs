@@ -56,6 +56,18 @@ assert.ok(fullStored.preview.length <= 600 || fullStored.truncated);
 // Storage should be larger than the 500-char preview when the change is large.
 assert.ok(fullStored.storageDiff.length >= fullStored.preview.length);
 
+const unicodeStored = await computeMutationDiff(
+  Array.from({ length: 3_000 }, (_, index) => `old-${index}-😀`).join("\n"),
+  Array.from({ length: 3_000 }, (_, index) => `new-${index}-😀`).join("\n"),
+  "unicode.ts",
+  "compact",
+  12_000,
+  { storageMaxChars: 10_000 }
+);
+assert.ok(unicodeStored.storageDiff);
+assert.ok(Buffer.byteLength(unicodeStored.storageDiff, "utf8") <= 10_000, "storageDiff must respect UTF-8 byte ceiling");
+assert.equal(unicodeStored.storageTruncated, true);
+
 const compactDiff = await computeMutationDiff("a\n".repeat(5000), "b\n".repeat(5000), "big.ts", "compact", 500);
 assert.ok(compactDiff.preview ?? compactDiff.diff);
 assert.ok((compactDiff.preview ?? compactDiff.diff).length <= 600 || compactDiff.truncated);

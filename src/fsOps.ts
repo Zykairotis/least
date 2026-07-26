@@ -12,6 +12,7 @@ import {
   COMPACT_DIFF_MAX_CHARS,
   FULL_DIFF_MAX_CHARS,
   STORAGE_DIFF_MAX_CHARS,
+  combineDiffParts,
   type DiffComputeMode,
   type PreparedTextContent,
   emptyDiffMeta,
@@ -192,14 +193,12 @@ export async function computeMutationDiff(
   }
   const previewLimit =
     maxChars ?? (mode === "compact" ? COMPACT_DIFF_MAX_CHARS : FULL_DIFF_MAX_CHARS);
-  const storageLimit = Math.max(
-    previewLimit,
-    options.storageMaxChars ?? STORAGE_DIFF_MAX_CHARS
-  );
+  const storageLimit = Math.max(0, Math.min(options.storageMaxChars ?? STORAGE_DIFF_MAX_CHARS, STORAGE_DIFF_MAX_CHARS));
+  const generationLimit = Math.max(previewLimit, storageLimit);
 
-  // Complete (or storage-capped) diff first — this is what retrieval keys should hold.
-  const complete = await makeUnifiedDiffMaybeOffloaded(oldText, newText, relPath, storageLimit);
-  const storageTruncated = complete.diff.includes("[diff truncated");
+  const complete = await makeUnifiedDiffMaybeOffloaded(oldText, newText, relPath, generationLimit);
+  const storage = combineDiffParts([complete.diff], storageLimit);
+  const storageTruncated = storage.truncated || complete.diff.includes("[diff truncated");
 
   let preview = complete.diff;
   let previewTruncated = false;
@@ -213,7 +212,7 @@ export async function computeMutationDiff(
     deletions: complete.deletions,
     changed: complete.changed,
     statsComputed: true,
-    storageDiff: complete.diff,
+    storageDiff: storage.text,
     storageTruncated,
     complete: !storageTruncated,
     preview,
