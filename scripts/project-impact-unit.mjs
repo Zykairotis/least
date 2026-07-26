@@ -1,0 +1,25 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { loadConfig } from '../dist/config.js';
+import { PathGuard, WorkspaceManager } from '../dist/guard.js';
+import { buildProjectMap } from '../dist/projectMapOps.js';
+
+const root = await fs.mkdtemp(path.join(os.tmpdir(), 'least-impact-'));
+await fs.mkdir(path.join(root, 'src'), { recursive: true });
+await fs.mkdir(path.join(root, 'test'), { recursive: true });
+await fs.writeFile(path.join(root, 'src', 'auth.ts'), 'export function auth() { return true; }\n');
+await fs.writeFile(path.join(root, 'src', 'server.ts'), "import { auth } from './auth.js';\nexport const server = auth();\n");
+await fs.writeFile(path.join(root, 'test', 'auth.test.ts'), "import { auth } from '../src/auth.js';\nvoid auth();\n");
+await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { test: 'node --test', build: 'tsc' } }));
+const config = loadConfig(['--root', root]);
+const guard = new PathGuard(config);
+const workspace = new WorkspaceManager(config).openWorkspace(root);
+const result = await buildProjectMap(config, guard, workspace, { changedPaths: ['src/auth.ts'] });
+assert.ok(result.relationships.some((edge) => edge.from === 'src/server.ts' && edge.to === 'src/auth.ts'));
+assert.ok(result.impact?.dependentFiles.some((file) => file.path === 'src/server.ts'));
+assert.ok(result.impact?.relatedTests.some((file) => file.path === 'test/auth.test.ts'));
+assert.ok(result.impact?.riskSignals.some((signal) => signal.id === 'authentication'));
+assert.ok(result.impact?.recommendedCommands.includes('npm test'));
+console.log('project-impact-unit: ok');

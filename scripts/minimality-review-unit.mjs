@@ -13,6 +13,7 @@ await fs.writeFile(path.join(root, "package.json"), JSON.stringify({ dependencie
 await fs.writeFile(path.join(root, "src", "big.ts"), `${"export function f() {\n".repeat(40)}}`, "utf8");
 spawnSync("git", ["init"], { cwd: root, stdio: "ignore" });
 spawnSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+await fs.writeFile(path.join(root, "src", "unused.ts"), `export function UnusedFeature() {\n${"  return 1;\n".repeat(42)}}\n`, "utf8");
 
 const config = loadConfig(["--root", root, "--allow-root", root]);
 const guard = new PathGuard(config);
@@ -22,5 +23,6 @@ const workspace = workspaces.openWorkspace(root);
 const result = await reviewMinimality(config, guard, workspace, { maxFindings: 5 });
 assert.ok(result.findings.length >= 1, "should flag at least one finding");
 assert.match(result.text, /Heuristic minimality review/i);
+assert.ok(result.findings.some((finding) => finding.title === "New file likely dead-on-arrival"), "should flag unreferenced new exported file");
 
 console.log("minimality-review-unit: ok");

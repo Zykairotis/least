@@ -4,16 +4,55 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { LeastConfig } from "./config.js";
 import { WorkspaceManager, PathGuard, LeastError, type Workspace } from "./guard.js";
-import { contextPack } from "./contextPackOps.js";
-import { repoTree, readTextFile, readManyTextFiles, writeTextFile, editTextFile, ensureAiBridge, fileContentSha256 } from "./fsOps.js";
+import { contextPack, invalidateContextPack } from "./contextPackOps.js";
+import {
+  repoTree,
+  readTextFile,
+  readManyTextFiles,
+  writeTextFile,
+  editTextFile,
+  ensureAiBridge,
+  fileContentSha256,
+  planTextEdit,
+  mapWithConcurrency,
+  computeMutationDiff,
+  prepareTextContent,
+  sha256 as sha256Text
+} from "./fsOps.js";
+import {
+  getFileSnapshotCacheStats,
+  invalidateFileSnapshot,
+  readTextWithSnapshot,
+  setCachedFileSnapshot
+} from "./fileSnapshotCache.js";
 import { searchWorkspace, searchWorkspaceContext } from "./searchOps.js";
 import { listWorkspaceFiles } from "./filesOps.js";
 import { warmCommandCapabilities } from "./commandCaps.js";
 import { queryJsonFiles } from "./jsonQueryOps.js";
-import { applyWorkspacePatch } from "./patchOps.js";
-import { runBash, bashRequiresMutationLock } from "./bashOps.js";
+import { applyWorkspacePatch, previewWorkspacePatch } from "./patchOps.js";
+import { runBash, bashRequiresMutationLock, structuredToolSuggestion } from "./bashOps.js";
+import {
+  apiSmokeSuite,
+  formatApiSmokeText,
+  formatLocalHttpText,
+  localHttpJson,
+  localHttpRequest,
+  type HttpMethod
+} from "./httpOps.js";
+import {
+  composeHealth,
+  composeLogs,
+  composePs,
+  composeServices,
+  formatComposeHealthText,
+  formatComposePsText
+} from "./dockerComposeOps.js";
+import { formatPackageRunText, runPackageScript } from "./packageOps.js";
+import { runVitest } from "./testOps.js";
 import { gitDiff, gitLog, gitStatus } from "./gitOps.js";
+import { formatBlameBlock, gitBlameForRange } from "./gitBlameOps.js";
 import { buildProjectMap, invalidateProjectMap } from "./projectMapOps.js";
+import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { readAiBridgeContext, readCodexContext, workspaceSummary } from "./workspaceOps.js";
 import { exportProContext } from "./proContext.js";
 import {
@@ -28,12 +67,14 @@ import {
 import { leastInventory, loadSkill } from "./capabilitiesOps.js";
 import { formatLeastDiscoverText, formatLeastGainText, leastDiscover, leastGain } from "./gainOps.js";
 import { reviewMinimality } from "./minimalityOps.js";
+import { handleWorkflowRequest, listWorkflows } from "./workflowRunner.js";
 import { saveProjectMemory, searchProjectMemory, updateProjectMemory } from "./projectMemory.js";
 import { shapeTextOutput, shellKindFromCommand, type OutputKind } from "./outputShaper.js";
-import { retrieveStoredOutput } from "./toolOutputStore.js";
+import { retrieveStoredOutput, storeMutationDiff } from "./toolOutputStore.js";
+import { commitPreparedFileTransaction } from "./fileTransaction.js";
 import { getLeastPerfSnapshot, measuredToolCall, recordRetrieval, resetLeastPerf } from "./perf.js";
 import { TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, TOOL_CARD_URI_ALIASES, toolCardWidgetHtml } from "./toolCardWidget.js";
-import { redactSensitiveText, redactStructured } from "./redact.js";
+import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
 import { ToolTimeoutError, withTimeout } from "./timeout.js";
 import {
   ToolRegistry,
@@ -45,9 +86,20 @@ import { buildPermissionContext, evaluateBashPermission, evaluateReadPermission,
 import { emitDashboardEvent } from "./dashboardEvents.js";
 import { runHooks } from "./hooks.js";
 import {
+  combineDiffParts,
+  COMPACT_DIFF_MAX_CHARS,
+  diffComputeModeFromResponseMode,
+  FULL_DIFF_MAX_CHARS,
+  maxDiffCharsForMode,
+  mutationResponseModeFromArgs,
+  type MutationResponseMode
+} from "./mutationTypes.js";
+import { writeManyFiles } from "./writeManyOps.js";
+import {
   agentAttachHint,
   agentCancel,
   agentDoctor,
+  agentGraph,
   agentInputFromArgs,
   agentList,
   agentPlan,
@@ -356,13 +408,17 @@ const MINIMAL_TOOLS = new Set([
   "open_workspace",
   "read",
   "write",
+  "write_many",
   "edit",
   "bash",
   "shell",
+  "run_package_script",
+  "run_vitest",
   "show_changes",
   "retrieve_output",
   "least_gain",
   "least_discover",
+  "workflow",
   "agent_list",
   "agent_doctor",
   "agent_plan",
@@ -380,15 +436,19 @@ const STANDARD_TOOLS = new Set([
   "search_context",
   "read_many",
   "read_around",
+  "git_blame_inline",
   "json_query",
   "diff_summary",
   "read_changed_files",
   "context_pack",
   "project_map",
+  "codex_sessions",
+  "read_codex_session",
   "warmup",
   "batch",
   "multi_edit",
   "apply_patch",
+  "diff_apply_preview",
   "load_skill",
   "read_handoff",
   "export_pro_context",
@@ -396,11 +456,13 @@ const STANDARD_TOOLS = new Set([
   "retrieve_output",
   "least_gain",
   "least_discover",
+  "workflow",
   "agent_list",
   "agent_doctor",
   "agent_plan",
   "agent_start",
   "agent_status",
+  "agent_graph",
   "agent_watchdog",
   "agent_tail",
   "agent_result",
@@ -413,16 +475,25 @@ const STANDARD_TOOLS = new Set([
   "review_minimality",
   "project_memory_search",
   "project_memory_save",
-  "project_memory_update"
+  "project_memory_update",
+  "local_http_request",
+  "local_http_json",
+  "api_smoke_suite",
+  "docker_compose_services",
+  "docker_compose_ps",
+  "docker_compose_logs",
+  "docker_compose_health",
+  "run_package_script",
+  "run_vitest"
 ]);
 
 const TOOLSET_TOOLS: Record<LeastConfig["toolset"], Set<string>> = {
   full: new Set<string>(),
   standard: new Set<string>(),
-  explore: new Set(["server_config", "least_perf", "least_gain", "least_discover", "open_current_workspace", "open_workspace", "files", "search_context", "read_many", "read_around", "json_query", "context_pack", "project_map", "retrieve_output", "batch"]),
-  edit: new Set(["server_config", "least_perf", "least_gain", "open_current_workspace", "open_workspace", "context_pack", "read_many", "read_around", "multi_edit", "apply_patch", "show_changes", "retrieve_output", "project_memory_search", "project_memory_save", "project_memory_update", "bash", "shell"]),
+  explore: new Set(["server_config", "least_perf", "least_gain", "least_discover", "open_current_workspace", "open_workspace", "files", "search_context", "read_many", "read_around", "json_query", "context_pack", "project_map", "codex_sessions", "read_codex_session", "retrieve_output", "batch", "local_http_request", "local_http_json", "api_smoke_suite", "docker_compose_services", "docker_compose_ps", "docker_compose_logs", "docker_compose_health"]),
+  edit: new Set(["server_config", "least_perf", "least_gain", "open_current_workspace", "open_workspace", "context_pack", "read_many", "read_around", "write", "write_many", "edit", "multi_edit", "apply_patch", "diff_apply_preview", "show_changes", "retrieve_output", "project_memory_search", "project_memory_save", "project_memory_update", "bash", "shell", "local_http_json", "run_package_script", "run_vitest", "docker_compose_health"]),
   review: new Set(["server_config", "least_perf", "least_gain", "least_discover", "open_current_workspace", "open_workspace", "diff_summary", "read_changed_files", "search_context", "show_changes", "review_minimality", "read_many", "read_around", "retrieve_output", "batch"]),
-  handoff: new Set(["server_config", "least_perf", "open_current_workspace", "open_workspace", "export_pro_context", "handoff_to_agent", "handoff_to_codex", "read_handoff", "batch"])
+  handoff: new Set(["server_config", "least_perf", "open_current_workspace", "open_workspace", "export_pro_context", "handoff_to_agent", "handoff_to_codex", "read_handoff", "agent_graph", "batch"])
 };
 
 const PROJECT_MEMORY_TOOLS = new Set(["project_memory_search", "project_memory_save", "project_memory_update"]);
@@ -430,6 +501,8 @@ const PROJECT_MEMORY_TOOLS = new Set(["project_memory_search", "project_memory_s
 function shouldRegisterTool(config: LeastConfig, name: string): boolean {
   if (config.yoloMode) return true;
   if (PROJECT_MEMORY_TOOLS.has(name) && !config.projectMemory) return false;
+  if (name === "codex_sessions" && config.codexSessions === "off") return false;
+  if (name === "read_codex_session" && config.codexSessions !== "read") return false;
   if (LOCK_TOOLS.has(name)) {
     return config.concurrencyMode === "lease";
   }
@@ -469,6 +542,23 @@ function summarizeToolResult(result: McpToolResultShape | undefined): Record<str
     textBytes,
     structuredKeys: structured ? Object.keys(structured).slice(0, 20) : [],
   };
+}
+
+function summarizeToolInput(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (key === "content" || key === "patch" || key === "old_text" || key === "new_text") {
+      out[key] = typeof value === "string" ? { bytes: Buffer.byteLength(value, "utf8") } : typeof value;
+    } else if (key === "edits" && Array.isArray(value)) {
+      out.edits = value.slice(0, 100).map((item) => {
+        const edit = item && typeof item === "object" ? item as Record<string, unknown> : {};
+        return { path: edit.path, oldBytes: typeof edit.old_text === "string" ? Buffer.byteLength(edit.old_text, "utf8") : 0, newBytes: typeof edit.new_text === "string" ? Buffer.byteLength(edit.new_text, "utf8") : 0 };
+      });
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 const AGENT_DASHBOARD_TOOLS = new Set([
@@ -545,65 +635,75 @@ function registerCodexTool(
     const dashboardSessionId = dashboardWorkspaceId ?? "default";
     const dashboardToolCallId = nextDashboardCallId(name);
     const dashboardStarted = Date.now();
-    emitDashboardEvent({ kind: "tool:start", toolName: name, workspaceId: dashboardWorkspaceId, sessionId: dashboardSessionId, payload: { toolCallId: dashboardToolCallId, input: safeArgs } });
+    emitDashboardEvent({ kind: "tool:start", toolName: name, workspaceId: dashboardWorkspaceId, sessionId: dashboardSessionId, payload: { toolCallId: dashboardToolCallId, input: summarizeToolInput(safeArgs) } });
 
-    // 1. Generic permission check (yoloMode bypasses)
-    if (!_yoloMode && ctx && (ctx.deny.length > 0 || ctx.ask.length > 0 || ctx.allow.length > 0)) {
-      const decision = evaluateRules({
-        ...ctx,
+    const finish = (raw: McpToolResultShape): McpToolResultShape => {
+      const dashboardOutput = compactAgentDashboardOutput(name, raw);
+      emitDashboardEvent({
+        kind: raw?.isError ? "tool:error" : "tool:end",
         toolName: name,
-        toolInput: safeArgs
+        workspaceId: dashboardWorkspaceId,
+        sessionId: dashboardSessionId,
+        durationMs: Date.now() - dashboardStarted,
+        level: raw?.isError ? "error" : undefined,
+        payload: { toolCallId: dashboardToolCallId, outputSummary: summarizeToolResult(raw), ...(dashboardOutput ? { output: dashboardOutput } : {}) }
       });
-      if (decision.decision === "deny") {
-        return errorResult(new LeastError(decision.reason ?? `Tool ${name} denied by permission rules.`));
+      return raw;
+    };
+
+    try {
+      // 1. Generic permission check (yoloMode bypasses)
+      if (!_yoloMode && ctx && (ctx.deny.length > 0 || ctx.ask.length > 0 || ctx.allow.length > 0)) {
+        const decision = evaluateRules({
+          ...ctx,
+          toolName: name,
+          toolInput: safeArgs
+        });
+        if (decision.decision === "deny") {
+          return finish(errorResult(new LeastError(decision.reason ?? `Tool ${name} denied by permission rules.`)));
+        }
+        if (decision.decision === "ask") {
+          return finish(textResult(formatPermissionRequired(name, decision.reason)));
+        }
       }
-      if (decision.decision === "ask") {
-        return textResult(formatPermissionRequired(name, decision.reason));
+
+      // 2. PreToolUse hooks
+      if (config.settings && _defaultRoot) {
+        const preResults = await runHooks(config.settings, _defaultRoot, {
+          event: "PreToolUse",
+          toolName: name,
+          toolInput: safeArgs,
+          workspace: { id: "unknown", root: _defaultRoot },
+          failClosed: true,
+          yoloMode: _yoloMode,
+        });
+        const denial = preResults.find((h) => h.decision !== "allow");
+        if (denial) {
+          return finish(errorResult(new LeastError(denial.reason ?? `PreToolUse hook denied ${name}.`)));
+        }
       }
-    }
 
-    // 2. PreToolUse hooks
-    if (config.settings && _defaultRoot) {
-      const preResults = await runHooks(config.settings, _defaultRoot, {
-        event: "PreToolUse",
-        toolName: name,
-        toolInput: safeArgs,
-        workspace: { id: "unknown", root: _defaultRoot },
-        failClosed: true,
-        yoloMode: _yoloMode,
-      });
-      const denial = preResults.find((h) => h.decision !== "allow");
-      if (denial) {
-        return errorResult(new LeastError(denial.reason ?? `PreToolUse hook denied ${name}.`));
+      // 3. Run the real handler
+      const raw = await handler(safeArgs);
+
+      // 4. PostToolUse hooks (fire-and-forget)
+      if (config.settings && _defaultRoot) {
+        void runHooks(config.settings, _defaultRoot, {
+          event: "PostToolUse",
+          toolName: name,
+          toolInput: safeArgs,
+          context: raw?.isError ? "Error" : undefined,
+          workspace: { id: "unknown", root: _defaultRoot },
+          failClosed: false,
+          yoloMode: _yoloMode,
+        }).catch(() => {});
       }
+
+      return finish(raw);
+    } catch (error) {
+      finish(errorResult(error));
+      throw error;
     }
-
-    // 3. Run the real handler
-    const raw = await handler(safeArgs);
-
-    // 4. PostToolUse hooks (fire-and-forget)
-    if (config.settings && _defaultRoot) {
-      void runHooks(config.settings, _defaultRoot, {
-        event: "PostToolUse",
-        toolName: name,
-        toolInput: safeArgs,
-        context: raw?.isError ? "Error" : undefined,
-        workspace: { id: "unknown", root: _defaultRoot },
-        failClosed: false,
-        yoloMode: _yoloMode,
-      }).catch(() => {});
-    }
-
-    const dashboardOutput = compactAgentDashboardOutput(name, raw);
-    emitDashboardEvent({
-      kind: "tool:end",
-      toolName: name,
-      workspaceId: dashboardWorkspaceId,
-      sessionId: dashboardSessionId,
-      durationMs: Date.now() - dashboardStarted,
-      payload: { toolCallId: dashboardToolCallId, outputSummary: summarizeToolResult(raw), ...(dashboardOutput ? { output: dashboardOutput } : {}) },
-    });
-    return raw;
   };
 
   registerToolCompat(authMode, server, name, options, async (args: Record<string, unknown>) => {
@@ -640,16 +740,15 @@ function registerCodexTool(
               ? (tagged.structuredContent as Record<string, unknown>)
               : undefined;
           logToolCall(name, tagged?.isError ? "error" : "ok", started, structured);
+          // tool:end is emitted once by wrappedHandler; do not duplicate here.
           const result = {
             content: mcpToolResultToText(tagged as McpToolResultShape),
             isError: Boolean(tagged?.isError)
           };
-          emitDashboardEvent({ kind: "tool:end", toolName: name, durationMs: Date.now() - started, workspaceId: workspaceIdFromArgs(args) });
           return result;
         } catch (error) {
           const tagged = tagToolResult(errorResult(error), name, options);
           logToolCall(name, "error", started);
-          emitDashboardEvent({ kind: "tool:error", toolName: name, durationMs: Date.now() - started, level: "error", payload: { message: error instanceof Error ? error.message : String(error) } });
           return {
             content: mcpToolResultToText(tagged as McpToolResultShape),
             isError: true
@@ -669,20 +768,23 @@ function serverInstructions(config: LeastConfig): string {
     "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
     "3. Explore with files, search_context, and read_many. Use files for candidate paths, search_context for symbol hits with nearby code, and read_many when exact file content is needed.",
     "4. Use search for quick line matches and tree only when directory orientation is useful. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
-    "5. Edit with write/edit. After edits, call show_changes once for git status, diff stats, and review diff.",
-    "6. Use bash only for meaningful verification commands such as npm test, npm run build, lint, typecheck, or an existing project script.",
-    "7. Keep tool calls minimal. Prefer one files or search_context call plus show_changes instead of repeated tree/read/bash loops."
+    "5. Mutate files with write / write_many / edit / multi_edit / apply_patch. Use write_many when creating or fully replacing more than one file. Use multi_edit for exact edits to existing files. Use apply_patch for patch-form changes. Prefer response_mode=summary during implementation; call show_changes once after a mutation batch. Avoid repeated single-file write calls when write_many can perform the operation.",
+    "6. Prefer structured tools for common verification: local_http_json / api_smoke_suite for HTTP APIs, docker_compose_health / docker_compose_ps / docker_compose_logs for containers, run_package_script / run_vitest for package scripts and tests.",
+    "7. Use bash only when no structured tool exists. Do not use raw curl/docker compose/pnpm vitest strings when structured tools can do the job.",
+    "8. Keep tool calls minimal. Prefer one files or search_context call plus show_changes instead of repeated tree/read/bash loops. Request full diffs only during explicit review (response_mode=full_diff or retrieve_output)."
   ];
   if (config.yoloMode) {
     lines.push(
       "",
-      "**YOLO MODE**: All permission rules, hooks, and bash gating are disabled. Convenience for trusted local development only. Not for production or untrusted prompts."
+      "**YOLO MODE**: Least-side permission rules, hooks, and bash gating are disabled. Convenience for trusted local development only. Not for production or untrusted prompts.",
+      "Note: --yolo cannot override client/platform tool-call safety that blocks raw shell payloads before they reach Least. Prefer structured tools (local_http_json, docker_compose_*, run_vitest) for normal local-dev operations."
     );
   }
   if (config.concurrencyMode === "lease") {
     lines.push(
       "",
-      "Concurrent clients: acquire_workspace_lock before any write, edit, or mutating bash call.",
+      "Concurrent clients: mutating tools auto-acquire the workspace lease when unlocked; explicit acquire_workspace_lock is optional.",
+      "Keep the same client session (or pass lease_token) across mutations. Release when finished if others may need the workspace.",
       "Read files first and pass expected_sha256 from the read result into write/edit to avoid stale overwrites.",
       "If another session owns the lock, use workspace_lock_status and wait for release or lease expiry."
     );
@@ -707,6 +809,7 @@ const DEFAULT_TOOL_TIMEOUT_MS: Record<string, number> = {
   read: 5_000,
   read_many: 10_000,
   read_around: 5_000,
+  git_blame_inline: 5_000,
   files: 5_000,
   tree: 5_000,
   search: 10_000,
@@ -718,11 +821,14 @@ const DEFAULT_TOOL_TIMEOUT_MS: Record<string, number> = {
   project_map: 30_000,
   warmup: 30_000,
   multi_edit: 15_000,
+  write_many: 30_000,
   apply_patch: 15_000,
+  diff_apply_preview: 15_000,
   show_changes: 10_000,
   export_pro_context: 30_000,
   workspace_snapshot: 10_000,
   batch: 15_000,
+  workflow: 30_000,
   retrieve_output: 10_000,
   least_gain: 5_000,
   least_discover: 5_000,
@@ -731,6 +837,7 @@ const DEFAULT_TOOL_TIMEOUT_MS: Record<string, number> = {
   agent_plan: 5_000,
   agent_start: 120_000,
   agent_status: 10_000,
+  agent_graph: 10_000,
   agent_watchdog: 30_000,
   agent_tail: 10_000,
   agent_result: 30_000,
@@ -755,7 +862,27 @@ async function runWithToolTimeout<T>(
   return withTimeout(name, timeoutMs, fn);
 }
 
-function invalidateDerivedWorkspaceState(workspaceId: string): void {
+/** Mutation impact for granular cache invalidation. */
+export type MutationCacheImpact = "content" | "structure" | "full";
+
+/**
+ * Invalidate derived caches after a mutation.
+ * - content: git + project-map only (file listing stays warm)
+ * - structure: file list + git + project-map (create/delete/move/rename)
+ * - full: everything (unknown bash mutations, etc.)
+ */
+function invalidateDerivedWorkspaceState(workspaceId: string, impact: MutationCacheImpact = "full", changedPaths?: string[]): void {
+  invalidateContextPack(workspaceId);
+  if (impact === "content") {
+    invalidateWorkspaceCaches(workspaceId, { fileList: false, git: true });
+    invalidateProjectMap(workspaceId, changedPaths);
+    return;
+  }
+  if (impact === "structure") {
+    invalidateWorkspaceCaches(workspaceId, { fileList: true, git: true });
+    invalidateProjectMap(workspaceId);
+    return;
+  }
   invalidateWorkspaceCaches(workspaceId);
   invalidateProjectMap(workspaceId);
 }
@@ -817,14 +944,26 @@ function workspaceLockPayload(config: LeastConfig, workspaceId: string): Record<
   return { lock: lockManager(config).status(workspaceId), concurrency_mode: config.concurrencyMode };
 }
 
+/**
+ * Ensure the calling session owns the workspace lease for mutation.
+ * Auto-acquires when unlocked (avoids acquire → mutate round trips).
+ * Still blocks when another session holds the lock.
+ */
 function assertMutationLock(config: LeastConfig, workspaceId: string, sessionId: string, leaseToken?: string): WorkspaceLock | undefined {
   if (config.concurrencyMode === "off") return undefined;
-  return lockManager(config).requireOwner(workspaceId, sessionId, leaseToken);
+  return lockManager(config).ensureOwner(workspaceId, sessionId, leaseToken);
 }
 
 function renewMutationLock(config: LeastConfig, workspaceId: string, sessionId: string, leaseToken?: string): void {
   if (config.concurrencyMode === "off") return;
   lockManager(config).renew(workspaceId, sessionId, leaseToken);
+}
+
+function assertPathPermission(toolName: string, relPath: string): void {
+  if (_yoloMode || !_permCtx) return;
+  const decision = evaluateWritePermission(_permCtx, toolName, relPath);
+  if (decision.decision === "deny") throw new LeastError(decision.reason ?? `Tool ${toolName} denied for ${relPath}.`);
+  if (decision.decision === "ask") throw new LeastError(`Permission required for ${toolName} on ${relPath}: ${decision.reason}`);
 }
 
 async function assertStaleFileState(
@@ -854,6 +993,127 @@ async function assertStaleFileState(
 
 function diffBlock(diff: string): string {
   return `\n\n\`\`\`diff\n${diff}\n\`\`\``;
+}
+
+const responseModeSchema = z
+  .enum(["summary", "compact_diff", "full_diff"])
+  .optional()
+  .describe(
+    "Mutation response detail: summary (metadata only), compact_diff (bounded preview), full_diff (review-oriented). response_mode takes precedence over deprecated include_diff."
+  );
+
+/**
+ * Model-visible text: metadata only. Never embed a full/preview diff body here —
+ * previews live only in structuredContent.diff_preview to avoid 2× payload.
+ */
+function formatMutationText(
+  header: string,
+  lines: string[],
+  options: {
+    responseMode: MutationResponseMode;
+    retrievalKey?: string;
+    diffComplete?: boolean;
+  }
+): string {
+  const body = [`# ${header}`, "", ...lines];
+  if (options.retrievalKey) {
+    const completeLabel =
+      options.diffComplete === false ? "Diff retrieval key (truncated at storage limit)" : "Diff retrieval key";
+    body.push(`${completeLabel}: ${options.retrievalKey}`);
+  } else if (options.responseMode !== "summary") {
+    body.push("Diff preview is in structured content (diff_preview); not duplicated in text.");
+  }
+  return body.join("\n");
+}
+
+function formatDiffStatsLine(additions: number | null | undefined, deletions: number | null | undefined, statsComputed?: boolean): string {
+  if (statsComputed === false || additions === null || deletions === null) {
+    return "Diff stats: omitted";
+  }
+  return `Diff stats: +${additions} -${deletions}`;
+}
+
+/**
+ * Shape mutation diff output:
+ * - Store complete (or storage-capped) diff under a retrieval key.
+ * - Put a bounded preview only in structuredContent.diff_preview.
+ * - Never put the same body in model-visible text.
+ * - diff_complete is true only when a retrieval key was stored successfully
+ *   and the caller marked the payload complete.
+ */
+async function maybeStoreAndShapeDiff(
+  config: LeastConfig,
+  workspace: Workspace,
+  toolName: string,
+  responseMode: MutationResponseMode,
+  options: {
+    storageDiff?: string;
+    previewDiff?: string;
+    changedPaths: string[];
+    complete?: boolean;
+  }
+): Promise<{
+  diff_preview?: string;
+  diff_retrieval_key?: string;
+  diff_complete?: boolean;
+  diff_truncated?: boolean;
+  warning?: string;
+}> {
+  if (responseMode === "summary") {
+    return {};
+  }
+
+  const previewBudget = Math.min(
+    responseMode === "compact_diff" ? COMPACT_DIFF_MAX_CHARS : FULL_DIFF_MAX_CHARS,
+    config.maxOutputBytes
+  );
+  const pathMetaBytes = Buffer.byteLength(options.changedPaths.join(", "), "utf8");
+  const storageBudget = Math.max(1024, config.outputStoreMaxItemBytes - 256 - pathMetaBytes - 128);
+
+  // Re-bound inputs so multi-file callers cannot exceed global budgets even if they skip combine.
+  const previewCombined = options.previewDiff
+    ? combineDiffParts([options.previewDiff], previewBudget)
+    : options.storageDiff
+      ? combineDiffParts([options.storageDiff], previewBudget)
+      : undefined;
+  const storageCombined = options.storageDiff
+    ? combineDiffParts([options.storageDiff], storageBudget)
+    : undefined;
+
+  const preview = previewCombined?.text || undefined;
+  let storage = storageCombined?.text || undefined;
+  if (!storage && !preview) return {};
+
+  let retrievalKey: string | undefined;
+  let storeWarning: string | undefined;
+  if (storage) {
+    retrievalKey = await storeMutationDiff(config, workspace.root, workspace.id, storage, {
+      toolName,
+      changedPaths: options.changedPaths
+    });
+    if (!retrievalKey) {
+      storeWarning =
+        "Full diff could not be stored (secret scan, store disabled, or item exceeds output-store limit).";
+    }
+  }
+
+  // Complete only when a retrieval key points at successfully stored content that was not truncated.
+  const diffComplete =
+    Boolean(retrievalKey) && options.complete !== false && !(storageCombined?.truncated);
+
+  const truncated =
+    Boolean(previewCombined?.truncated) ||
+    Boolean(storageCombined?.truncated) ||
+    options.complete === false ||
+    (Boolean(options.storageDiff) && !retrievalKey);
+
+  return {
+    diff_preview: preview,
+    diff_retrieval_key: retrievalKey,
+    diff_complete: options.storageDiff || preview ? diffComplete : undefined,
+    diff_truncated: truncated,
+    warning: storeWarning
+  };
 }
 
 function diffStats(diff: string): { additions: number; deletions: number; changed: boolean } {
@@ -1082,6 +1342,8 @@ const BATCH_READ_ONLY_TOOLS = new Set([
   "read_changed_files",
   "context_pack",
   "project_map",
+  "codex_sessions",
+  "read_codex_session",
   "warmup",
   "show_changes",
   "read_handoff",
@@ -1092,7 +1354,14 @@ const BATCH_READ_ONLY_TOOLS = new Set([
   "least_gain",
   "least_discover",
   "review_minimality",
-  "project_memory_search"
+  "project_memory_search",
+  "local_http_request",
+  "local_http_json",
+  "api_smoke_suite",
+  "docker_compose_services",
+  "docker_compose_ps",
+  "docker_compose_logs",
+  "docker_compose_health"
 ]);
 
 export function createLeastServer(
@@ -1150,6 +1419,13 @@ export function createLeastServer(
         writeMode: config.writeMode,
         toolMode: config.toolMode,
         toolset: config.toolset,
+        httpTools: config.httpTools,
+        dockerComposeTools: {
+          enabled: config.dockerComposeTools.enabled,
+          defaultComposeDir: config.dockerComposeTools.defaultComposeDir,
+          maxLogTail: config.dockerComposeTools.maxLogTail
+        },
+        packageScriptTools: config.packageScriptTools,
         concurrencyMode: config.concurrencyMode,
         lockLeaseMs: config.lockLeaseMs,
         inheritEnv: config.inheritEnv,
@@ -1186,6 +1462,36 @@ export function createLeastServer(
     authMode,
     registry,
     server,
+    "diff_apply_preview",
+    {
+      title: "Diff Apply Preview",
+      description: "Dry-run a Codex-style patch and return post-patch file previews without writing files.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        patch: z.string().describe("Patch text using the *** Begin Patch / *** End Patch format.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Previewing patch...",
+        "openai/toolInvocation/invoked": "Patch preview ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const result = await runWithToolTimeout("diff_apply_preview", args, async () =>
+        await previewWorkspacePatch(config, guard, workspace, String(strFromArgs(args, "patch") ?? ""))
+      );
+      const text = `# Diff Apply Preview\n\nChanged files: ${result.changedFiles.length}\nDiff stats: +${result.additions} -${result.deletions}\nConflicts: ${result.conflicts.length}\n\n\`\`\`json\n${JSON.stringify({ changedFiles: result.changedFiles, conflicts: result.conflicts, preview: result.preview }, null, 2)}\n\`\`\``;
+      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
     "least_perf",
     {
       title: "Least Performance",
@@ -1203,7 +1509,10 @@ export function createLeastServer(
     async (args) => {
       const windowName = strFromArgs(args, "window") === "lifetime" ? "lifetime" : "session";
       const snapshot = getLeastPerfSnapshot(windowName);
-      const caches = getWorkspaceCacheStats();
+      const caches = {
+        ...getWorkspaceCacheStats(),
+        file_snapshot_cache: getFileSnapshotCacheStats()
+      };
       if (parseBool(args.reset, false)) {
         resetLeastPerf(windowName);
       }
@@ -1308,11 +1617,12 @@ export function createLeastServer(
   const agentStartInputSchema = {
     ...agentWorkspaceSchema,
     agent: z.string().optional().describe("Groundcrew agent profile name. Omit to use agents.default from crew.config.ts."),
-    repository: z.string().optional().describe("Groundcrew repository name. Alias: repo."),
+    repository: z.string().optional().describe("Repository label. Defaults to the workspace folder name; unregistered labels run as direct-folder local agent jobs. Alias: repo."),
     repo: z.string().optional().describe("Alias for repository."),
     title: z.string().optional().describe("Short task title. Default: Local agent task."),
     prompt: z.string().describe("Task prompt to give the local agent."),
     task_id: z.string().optional().describe("Optional explicit Groundcrew task id. Omit to generate one."),
+    depends_on: z.array(z.string()).optional().describe("Optional task ids this job waits for before launching."),
     idempotency_key: z.string().optional().describe("Optional durable idempotency key. agent_start reuses an existing job by task_id first, then by idempotency_key."),
     wait_for_launch: z.boolean().optional().describe("When true, wait briefly for provisioning to reach running/completed/failed-to-launch. Default: false."),
     startup_wait_ms: z.number().int().min(0).max(30000).optional().describe("Maximum app-level wait when wait_for_launch=true. Default: 5000ms."),
@@ -1359,6 +1669,7 @@ export function createLeastServer(
       inputSchema: agentWorkspaceSchema,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Reading local agent profiles...",
         "openai/toolInvocation/invoked": "Local agent profiles ready"
       }
@@ -1381,6 +1692,7 @@ export function createLeastServer(
       inputSchema: agentWorkspaceSchema,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Checking local agent setup...",
         "openai/toolInvocation/invoked": "Local agent setup checked"
       }
@@ -1404,6 +1716,7 @@ export function createLeastServer(
       inputSchema: agentWorkspaceSchema,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Checking local agent terminal backends...",
         "openai/toolInvocation/invoked": "Local agent terminal backends checked"
       }
@@ -1427,6 +1740,7 @@ export function createLeastServer(
       inputSchema: agentWorkspaceSchema,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Listing local agent sessions...",
         "openai/toolInvocation/invoked": "Local agent sessions listed"
       }
@@ -1450,6 +1764,7 @@ export function createLeastServer(
       inputSchema: agentJobInputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Preparing local agent attach commands...",
         "openai/toolInvocation/invoked": "Local agent attach commands ready"
       }
@@ -1480,6 +1795,7 @@ export function createLeastServer(
       inputSchema: agentStartInputSchema,
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Planning local agent launch...",
         "openai/toolInvocation/invoked": "Local agent launch plan ready"
       }
@@ -1505,6 +1821,7 @@ export function createLeastServer(
       inputSchema: agentStartInputSchema,
       annotations: {},
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Submitting local agent job...",
         "openai/toolInvocation/invoked": "Local agent job accepted"
       }
@@ -1537,6 +1854,7 @@ export function createLeastServer(
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Reading local agent status...",
         "openai/toolInvocation/invoked": "Local agent status ready"
       }
@@ -1561,6 +1879,33 @@ export function createLeastServer(
     authMode,
     registry,
     server,
+    "agent_graph",
+    {
+      title: "Agent Graph",
+      description: "Show local agent job dependencies, ready/waiting/running/completed groups, and dependency cycles.",
+      inputSchema: {
+        ...agentWorkspaceSchema,
+        refresh: z.boolean().optional().describe("When true, promote planned jobs whose dependencies are complete. Default: false.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Reading agent graph...",
+        "openai/toolInvocation/invoked": "Agent graph ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const result = await runWithToolTimeout("agent_graph", args, async () => await agentGraph(workspace, { refresh: parseBool(args.refresh, false) }));
+      return textResult(result.text, { workspace_id: workspace.id, root: workspace.root, ...result.structured });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
     "agent_watchdog",
     {
       title: "Agent Watchdog",
@@ -1568,6 +1913,7 @@ export function createLeastServer(
       inputSchema: agentWatchdogInputSchema,
       annotations: {},
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Checking local agent watchdog...",
         "openai/toolInvocation/invoked": "Local agent watchdog checked"
       }
@@ -1611,6 +1957,7 @@ export function createLeastServer(
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Capturing local agent output...",
         "openai/toolInvocation/invoked": "Local agent output captured"
       }
@@ -1648,6 +1995,7 @@ export function createLeastServer(
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Summarizing local agent result...",
         "openai/toolInvocation/invoked": "Local agent result ready"
       }
@@ -1685,6 +2033,7 @@ export function createLeastServer(
       },
       annotations: {},
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Cancelling local agent job...",
         "openai/toolInvocation/invoked": "Local agent job cancelled"
       }
@@ -1720,6 +2069,7 @@ export function createLeastServer(
       inputSchema: agentResumeInputSchema,
       annotations: {},
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Resuming local agent job...",
         "openai/toolInvocation/invoked": "Local agent job resumed"
       }
@@ -1755,6 +2105,7 @@ export function createLeastServer(
       inputSchema: agentCleanupInputSchema,
       annotations: {},
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Scanning stale local agent jobs...",
         "openai/toolInvocation/invoked": "Local agent cleanup finished"
       }
@@ -1826,8 +2177,11 @@ export function createLeastServer(
       timedOut: result.timedOut,
       truncated: result.truncated
     });
+    const suggestion = structuredToolSuggestion(result.command);
     const retrievalHint = shaped.outputMeta.retrievalHint ? `\nRetrieval: ${shaped.outputMeta.retrievalHint}` : "";
-    const text = `# Bash\n\n\`\`\`bash\n$ ${result.command}\n\`\`\`\n\nCWD: ${result.cwd}\nExit: ${result.exitCode}${result.signal ? ` (${result.signal})` : ""}\nDuration: ${result.durationMs} ms${retrievalHint}\n\n## output\n\n\`\`\`text\n${shaped.text}\n\`\`\``;
+    const warningLine = suggestion ? `\nWarning: ${suggestion}` : "";
+    const backendLine = `Backend: ${result.used} on ${result.hostPlatform}${result.backendNote ? `\nNote: ${result.backendNote}` : ""}`;
+    const text = `# Bash\n\n\`\`\`bash\n$ ${result.command}\n\`\`\`\n\nCWD: ${result.cwd}\n${backendLine}\nExit: ${result.exitCode}${result.signal ? ` (${result.signal})` : ""}\nDuration: ${result.durationMs} ms${retrievalHint}${warningLine}\n\n## output\n\n\`\`\`text\n${shaped.text}\n\`\`\``;
     return textResult(text, {
       workspace_id: workspace.id,
       root: workspace.root,
@@ -1837,9 +2191,74 @@ export function createLeastServer(
       visibleBytes: shaped.visibleBytes,
       savedBytes: shaped.savedBytes,
       compacted: shaped.outputMeta.compacted,
-      output_meta: shaped.outputMeta
+      output_meta: shaped.outputMeta,
+      warning: suggestion
     });
   };
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "workflow",
+    {
+      title: "Workflow",
+      description: "Plan, run, resume, or inspect a named Least workflow through a small allowlisted orchestration surface. Starts with video-study dry-run/control flow.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        action: z.enum(["plan", "run", "resume", "status", "cancel"]).describe("Workflow action."),
+        workflow_id: z.string().optional().describe("Workflow id, for example video-study. Required except for action=status with run_id."),
+        run_id: z.string().optional().describe("Existing run id for status/resume/cancel."),
+        input: z.record(z.unknown()).optional().describe("Workflow-specific input object."),
+        dry_run: z.boolean().optional().describe("Preview side effects instead of performing them. Default from settings, usually true."),
+        max_steps: z.number().int().min(1).max(200).optional().describe("Maximum workflow steps to process in this call."),
+        confirm: z.boolean().optional().describe("Confirm bulk/live side effects when the workflow requires confirmation."),
+        confirm_token: z.string().optional().describe("Reserved future confirmation token for high-risk workflow runs.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Running Least workflow...",
+        "openai/toolInvocation/invoked": "Least workflow ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const wfSettings = config.settings?.effective.workflows;
+      const action = strFromArgs(args, "action") as "plan" | "run" | "resume" | "status" | "cancel";
+      const dryRun = parseBool(args.dry_run, wfSettings?.defaultDryRun ?? true);
+      const maxSteps = limitInt(args.max_steps, wfSettings?.maxStepsDefault ?? 3, 1, wfSettings?.maxStepsHardLimit ?? 20);
+      const input = args.input && typeof args.input === "object" && !Array.isArray(args.input) ? args.input as Record<string, unknown> : {};
+      const workflowId = strFromArgs(args, "workflow_id") ?? (action === "status" || action === "cancel" || action === "resume" ? "video-study" : "");
+      if (!workflowId) {
+        const workflows = listWorkflows(wfSettings);
+        return textResult(`# Workflow\n\nKnown workflows:\n${workflows.map((item) => `- ${item.id}: ${item.title}`).join("\n")}`, {
+          workspace_id: workspace.id,
+          root: workspace.root,
+          workflows
+        });
+      }
+      const result = await runWithToolTimeout("workflow", args, async () => await handleWorkflowRequest(workspace, wfSettings, {
+        action,
+        workflowId,
+        runId: strFromArgs(args, "run_id"),
+        input,
+        dryRun,
+        maxSteps,
+        confirm: parseBool(args.confirm, false),
+        confirmToken: strFromArgs(args, "confirm_token")
+      }));
+      const rows = result.verification.map((row) => `| ${row.step ?? ""} | ${row.window ?? ""} | ${row.capability ?? ""} | ${row.status ?? ""} | ${row.title ?? ""} |`).join("\n");
+      const text = `# Workflow\n\nWorkflow: ${result.workflowId}\nRun: ${result.runId}\nStatus: ${result.status}\nDry run: ${result.dryRun}\nSteps remaining: ${result.stepsRemaining}\n\n| Step | Window | Capability | Status | Title |\n|---|---|---|---|---|\n${rows || "| - | - | - | - | - |"}\n\nNext: ${result.nextAction}`;
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        workflows: listWorkflows(wfSettings),
+        ...result
+      });
+    }
+  );
 
   registerCodexTool(
     config,
@@ -1877,6 +2296,13 @@ export function createLeastServer(
         write_mode: config.writeMode,
         skills: inventory.skills,
         mcp_servers: inventory.mcpServers,
+        agent_profiles: inventory.agentSupport.enabledProfiles,
+        agent_tools: inventory.agentSupport.directTools,
+        agent_cli_bridge: {
+          doctor: inventory.agentSupport.cliBridgeDoctor,
+          start_example: inventory.agentSupport.cliBridgeStartExample
+        },
+        agent_discovery_note: inventory.agentSupport.note,
         widget_uri: TOOL_CARD_URI
       });
     }
@@ -1898,6 +2324,7 @@ export function createLeastServer(
         source: z.enum(["workspace", "user", "plugin", "other"]).optional().describe("Optional source when multiple skills share a name."),
         path: z.string().optional().describe("Exact sanitized path from skill_inventory when name/source are still ambiguous."),
         include_global_skills: z.boolean().optional().describe("Also scan installed user/plugin skills. Default: true."),
+        max_skills: z.number().int().min(1).max(500).optional().describe("Maximum discovered skills to scan before matching. Default: 500."),
         max_bytes: z.number().int().min(1000).max(100000).optional().describe("Maximum bytes to return from SKILL.md. Default: 40000.")
       },
       annotations: READ_ONLY_ANNOTATIONS,
@@ -1914,9 +2341,10 @@ export function createLeastServer(
         const raw = strFromArgs(args, "source");
         if (raw === "workspace" || raw === "user" || raw === "plugin" || raw === "other") return raw;
         return undefined;
-      })(),
+        })(),
         path: typeof strFromArgs(args, "path") === "string" ? strFromArgs(args, "path") : undefined,
         includeGlobal: parseBool(args.include_global_skills, true),
+        maxSkills: limitInt(args.max_skills, 500, 1, 500),
         maxBytes: limitInt(args.max_bytes, 40_000, 1_000, 100_000)
       });
       const truncated = loaded.truncated ? "\n\n[truncated: increase max_bytes if more context is required]" : "";
@@ -2003,6 +2431,13 @@ export function createLeastServer(
         skill_counts: summary.skillCounts,
         tree: summary.tree,
         git_status: summary.gitStatus,
+        agent_profiles: summary.agentDiscovery.enabledProfiles,
+        agent_tools: summary.agentDiscovery.directTools,
+        agent_cli_bridge: {
+          doctor: summary.agentDiscovery.cliBridgeDoctor,
+          start_example: summary.agentDiscovery.cliBridgeStartExample
+        },
+        agent_discovery_note: summary.agentDiscovery.note,
         bash_mode: config.bashMode,
         shell_backend: config.shellBackend,
         write_mode: config.writeMode,
@@ -2050,7 +2485,7 @@ export function createLeastServer(
     "acquire_workspace_lock",
     {
       title: "Acquire Workspace Lock",
-      description: "Acquire exclusive mutation rights for this workspace. Required before write, edit, or mutating bash when concurrency mode is lease.",
+      description: "Acquire exclusive mutation rights for this workspace. Optional in lease mode: mutations auto-acquire when unlocked. Use to pre-claim the lease or obtain lease_token for reconnects.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
         client_label: z.string().optional().describe("Optional human label for lock visibility, for example chatgpt or grok.")
@@ -2226,6 +2661,13 @@ export function createLeastServer(
         skill_counts: summary.skillCounts,
         tree: summary.tree,
         git_status: summary.gitStatus,
+        agent_profiles: summary.agentDiscovery.enabledProfiles,
+        agent_tools: summary.agentDiscovery.directTools,
+        agent_cli_bridge: {
+          doctor: summary.agentDiscovery.cliBridgeDoctor,
+          start_example: summary.agentDiscovery.cliBridgeStartExample
+        },
+        agent_discovery_note: summary.agentDiscovery.note,
         bash_mode: config.bashMode,
         shell_backend: config.shellBackend,
         write_mode: config.writeMode,
@@ -2471,14 +2913,15 @@ export function createLeastServer(
     "project_map",
     {
       title: "Project Map",
-      description: "Build a lightweight symbol and file map for the workspace.",
+      description: "Build a cached symbol, import-relationship, entrypoint, project-type, and optional change-impact map for the workspace.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
         refresh: z.boolean().optional().describe("Ignore the cached project map and rebuild. Default: false."),
         globs: z.array(z.string()).optional().describe("Optional file globs to restrict indexing."),
         include_imports: z.boolean().optional().describe("Include import edges. Default: true."),
         include_exports: z.boolean().optional().describe("Include exported symbols. Default: true."),
-        include_tests: z.boolean().optional().describe("Include test files. Default: true.")
+        include_tests: z.boolean().optional().describe("Include test files. Default: true."),
+        changed_paths: z.array(z.string()).max(500).optional().describe("Optional changed files. Adds transitive dependents, related tests, risk signals, and recommended checks.")
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
@@ -2494,12 +2937,78 @@ export function createLeastServer(
           globs: Array.isArray(args.globs) ? args.globs.filter((item): item is string => typeof item === "string") : undefined,
           includeImports: parseBool(args.include_imports, true),
           includeExports: parseBool(args.include_exports, true),
-          includeTests: parseBool(args.include_tests, true)
+          includeTests: parseBool(args.include_tests, true),
+          changedPaths: Array.isArray(args.changed_paths) ? args.changed_paths.filter((item): item is string => typeof item === "string") : undefined
         })
       );
       return textResult(result.text, { workspace_id: workspace.id, root: workspace.root, ...result });
     }
   );
+
+  if (config.codexSessions !== "off") {
+    registerCodexTool(
+      config,
+      authMode,
+      registry,
+      server,
+      "codex_sessions",
+      {
+        title: "Codex Sessions",
+        description: "Opt-in metadata browser for bounded local Codex JSONL session history.",
+        inputSchema: {
+          max_sessions: z.number().int().min(1).max(200).optional(),
+          query: z.string().optional()
+        },
+        annotations: READ_ONLY_ANNOTATIONS
+      },
+      async (args) => {
+        const result = await listCodexSessions(config, {
+          maxSessions: typeof args.max_sessions === "number" ? args.max_sessions : undefined,
+          query: strFromArgs(args, "query")
+        });
+        const rows = result.sessions.map((session) => `- ${session.session_id}  ${session.title ?? "(untitled)"}${session.project_dir ? `  cwd=${session.project_dir}` : ""}`).join("\n") || "- No sessions found.";
+        return textResult(`# Codex Sessions\n\nMode: ${config.codexSessions}\nTotal matched: ${result.total_found}\n\n${rows}`, { ...result, codex_sessions_mode: config.codexSessions });
+      }
+    );
+  }
+
+  if (config.codexSessions === "read") {
+    registerCodexTool(
+      config,
+      authMode,
+      registry,
+      server,
+      "read_codex_session",
+      {
+        title: "Read Codex Session",
+        description: "Opt-in bounded Codex transcript reader. Reads slices, not whole JSONL files.",
+        inputSchema: {
+          session_id: z.string().optional(),
+          source_path: z.string().optional(),
+          direction: z.enum(["head", "tail"]).optional(),
+          cursor: z.number().int().min(0).optional(),
+          max_messages: z.number().int().min(1).max(400).optional(),
+          max_total_bytes: z.number().int().min(4000).max(400000).optional(),
+          exclude_tool_outputs: z.boolean().optional(),
+          max_tool_output_bytes: z.number().int().min(0).max(400000).optional()
+        },
+        annotations: READ_ONLY_ANNOTATIONS
+      },
+      async (args) => {
+        const result = await readCodexSession(config, {
+          sessionId: strFromArgs(args, "session_id"),
+          sourcePath: strFromArgs(args, "source_path"),
+          direction: args.direction === "head" ? "head" : args.direction === "tail" ? "tail" : undefined,
+          cursor: typeof args.cursor === "number" ? args.cursor : undefined,
+          maxMessages: typeof args.max_messages === "number" ? args.max_messages : undefined,
+          maxTotalBytes: typeof args.max_total_bytes === "number" ? args.max_total_bytes : undefined,
+          excludeToolOutputs: typeof args.exclude_tool_outputs === "boolean" ? args.exclude_tool_outputs : undefined,
+          maxToolOutputBytes: typeof args.max_tool_output_bytes === "number" ? args.max_tool_output_bytes : undefined
+        });
+        return textResult(result.text, { ...result, message_count: result.messages.length, codex_sessions_mode: config.codexSessions });
+      }
+    );
+  }
 
   registerCodexTool(
     config,
@@ -2548,6 +3057,7 @@ export function createLeastServer(
       },
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Listing workspace files...",
         "openai/toolInvocation/invoked": "Workspace files listed"
       }
@@ -2764,8 +3274,45 @@ export function createLeastServer(
           signal
         })
       );
-      const text = `# Read Around\n\nPath: ${result.path}\nAnchor line: ${line}\nLines: ${result.startLine}-${result.endLine}\n${result.sha256 ? `SHA-256: ${result.sha256}\n` : ""}\n\`\`\`text\n${result.text}\n\`\`\``;
-      return textResult(text, { workspace_id: workspace.id, root: workspace.root, anchor_line: line, ...result });
+      const blame = config.blameInline
+        ? await gitBlameForRange(config, guard, workspace, result.path, result.startLine, result.endLine)
+        : [];
+      const blameBlock = config.blameInline ? `\n\n\`\`\`text\n${formatBlameBlock(blame) || "blame: unavailable"}\n\`\`\`` : "";
+      const text = `# Read Around\n\nPath: ${result.path}\nAnchor line: ${line}\nLines: ${result.startLine}-${result.endLine}\n${result.sha256 ? `SHA-256: ${result.sha256}\n` : ""}\n\`\`\`text\n${result.text}\n\`\`\`${blameBlock}`;
+      return textResult(text, { workspace_id: workspace.id, root: workspace.root, anchor_line: line, blame, ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "git_blame_inline",
+    {
+      title: "Git Blame Inline",
+      description: "Return compact git blame metadata for a file line range.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        path: z.string().describe("File path relative to workspace root."),
+        start_line: z.number().int().min(1).describe("First line to blame."),
+        end_line: z.number().int().min(1).describe("Last line to blame.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Reading git blame...",
+        "openai/toolInvocation/invoked": "Git blame ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const startLine = limitInt(args.start_line, 1, 1, Number.MAX_SAFE_INTEGER);
+      const endLine = limitInt(args.end_line, startLine, startLine, Number.MAX_SAFE_INTEGER);
+      const blame = await runWithToolTimeout("git_blame_inline", args, () =>
+        gitBlameForRange(config, guard, workspace, strFromArgs(args, "path") ?? "", startLine, endLine)
+      );
+      const text = `# Git Blame Inline\n\nPath: ${strFromArgs(args, "path") ?? ""}\nLines: ${startLine}-${endLine}\n\n\`\`\`text\n${formatBlameBlock(blame) || "blame: unavailable"}\n\`\`\``;
+      return textResult(text, { workspace_id: workspace.id, root: workspace.root, blame });
     }
   );
 
@@ -2955,7 +3502,8 @@ export function createLeastServer(
     "write",
     {
       title: "Write File",
-      description: "Create or overwrite a meaningful text file inside the workspace. Returns a unified diff; do not create empty placeholder files.",
+      description:
+        "Create or overwrite a meaningful text file inside the workspace. Default response is summary metadata (SHA-256, bytes). Use write_many for multiple complete files. Prefer response_mode=summary during implementation.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
         path: z.string().describe("File path relative to workspace root."),
@@ -2964,6 +3512,11 @@ export function createLeastServer(
         overwrite: z.boolean().optional().describe("Allow overwriting existing files. Default: true."),
         expected_sha256: z.string().optional().describe("SHA-256 from read. Rejects stale writes when the file changed."),
         expect_absent: z.boolean().optional().describe("When true with expected_sha256, require that the file does not exist yet."),
+        response_mode: responseModeSchema,
+        include_diff: z
+          .boolean()
+          .optional()
+          .describe("Deprecated. false→summary, true→full_diff. Prefer response_mode. Default: summary."),
         lease_token: z.string().optional().describe("Lease token returned by acquire_workspace_lock. Use this when the client session may reconnect between tool calls.")
       },
       annotations: LOCAL_WRITE_ANNOTATIONS,
@@ -2990,13 +3543,40 @@ export function createLeastServer(
       const resolved = guard.resolve(workspace, filePath, { forWrite: true });
       assertWriteToolAllowed(config, resolved.relPath);
       await assertStaleFileState(config, guard, workspace, filePath, args);
-      const result = await writeTextFile(config, guard, workspace, filePath, String(strFromArgs(args, "content") ?? ""), {
+      const responseMode = mutationResponseModeFromArgs(args, "summary");
+      const diffMode = diffComputeModeFromResponseMode(responseMode);
+      const prepared = prepareTextContent(String(strFromArgs(args, "content") ?? ""));
+      const result = await writeTextFile(config, guard, workspace, filePath, prepared.text, {
         createDirs: parseBool(args.create_dirs, true),
-        overwrite: parseBool(args.overwrite, true)
+        overwrite: parseBool(args.overwrite, true),
+        diffMode,
+        maxDiffChars: maxDiffCharsForMode(responseMode),
+        prepared
       });
       renewMutationLock(config, workspace.id, sessionId, leaseToken);
-      invalidateDerivedWorkspaceState(workspace.id);
-      const text = `# Write File\n\nPath: ${result.path}\nExisted before: ${result.existed}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\nDiff stats: +${result.diff.additions} -${result.diff.deletions}${diffBlock(result.diff.diff)}`;
+      invalidateDerivedWorkspaceState(workspace.id, result.existed ? "content" : "structure");
+      const shaped = await maybeStoreAndShapeDiff(config, workspace, "write", responseMode, {
+        storageDiff: result.diff.storageDiff,
+        previewDiff: result.diff.preview ?? result.diff.diff,
+        changedPaths: [result.path],
+        complete: result.diff.complete
+      });
+      const text = formatMutationText(
+        "Write File",
+        [
+          `Path: ${result.path}`,
+          `Existed before: ${result.existed}`,
+          `Bytes: ${result.bytes}`,
+          `SHA-256: ${result.sha256}`,
+          formatDiffStatsLine(
+            result.diff.statsComputed === false ? null : result.diff.additions,
+            result.diff.statsComputed === false ? null : result.diff.deletions,
+            result.diff.statsComputed
+          ),
+          `Response mode: ${responseMode}`
+        ],
+        { responseMode, retrievalKey: shaped.diff_retrieval_key, diffComplete: shaped.diff_complete }
+      );
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
@@ -3004,9 +3584,143 @@ export function createLeastServer(
         existed: result.existed,
         bytes: result.bytes,
         sha256: result.sha256,
-        additions: result.diff.additions,
-        deletions: result.diff.deletions,
-        diff: result.diff.diff
+        additions: result.diff.statsComputed === false ? null : result.diff.additions,
+        deletions: result.diff.statsComputed === false ? null : result.diff.deletions,
+        diff_stats_computed: result.diff.statsComputed !== false && responseMode !== "summary",
+        response_mode: responseMode,
+        diff_preview: shaped.diff_preview,
+        diff_retrieval_key: shaped.diff_retrieval_key,
+        diff_complete: shaped.diff_complete,
+        diff_truncated: shaped.diff_truncated
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "write_many",
+    {
+      title: "Write Many Files",
+      description:
+        "Create or overwrite multiple complete text files in one transactional batch (full preflight, temp files, sequential renames, best-effort rollback). Not crash-safe multi-file FS atomicity; external processes may observe partial renames. Prefer over repeated write for multi-file generation. Default response_mode=summary.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        files: z
+          .array(
+            z.object({
+              path: z.string().describe("File path relative to workspace root."),
+              content: z.string().describe("Complete file contents."),
+              create_dirs: z.boolean().optional().describe("Create parent directories. Default: true."),
+              overwrite: z.boolean().optional().describe("Allow overwrite. Default: true."),
+              expected_sha256: z.string().optional().describe("Optional stale-write protection SHA-256."),
+              expect_absent: z.boolean().optional().describe("Require that the file does not exist yet.")
+            })
+          )
+          .min(1)
+          .max(200)
+          .describe("Files to write atomically."),
+        atomic: z.boolean().optional().describe("Atomic multi-file commit. Default: true (only supported mode)."),
+        response_mode: responseModeSchema,
+        concurrency: z
+          .number()
+          .int()
+          .min(1)
+          .max(32)
+          .optional()
+          .describe("Bounded concurrency for temporary-file writes. Default: 8."),
+        lease_token: z.string().optional().describe("Lease token returned by acquire_workspace_lock.")
+      },
+      annotations: LOCAL_WRITE_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Writing multiple files...",
+        "openai/toolInvocation/invoked": "Files written"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const sessionId = sessionIdFrom(options);
+      const leaseToken = leaseTokenFromArgs(args);
+      assertMutationLock(config, workspace.id, sessionId, leaseToken);
+      const responseMode = mutationResponseModeFromArgs(args, "summary");
+      const rawFiles = Array.isArray(args.files) ? args.files : [];
+      const files = rawFiles.map((item) => {
+        if (!item || typeof item !== "object") throw new LeastError("Each write_many item must be an object.");
+        const entry = item as Record<string, unknown>;
+        return {
+          path: String(entry.path ?? ""),
+          content: String(entry.content ?? ""),
+          createDirs: parseBool(entry.create_dirs, true),
+          overwrite: parseBool(entry.overwrite, true),
+          expectedSha256: typeof entry.expected_sha256 === "string" ? entry.expected_sha256 : undefined,
+          expectAbsent: parseBool(entry.expect_absent, false) || undefined
+        };
+      });
+      const result = await writeManyFiles(config, guard, workspace, files, {
+        responseMode,
+        concurrency: typeof args.concurrency === "number" ? args.concurrency : 8,
+        atomic: parseBool(args.atomic, true),
+        authorizePath: (relPath) => {
+          assertWriteToolAllowed(config, relPath);
+          assertPathPermission("write_many", relPath);
+        }
+      });
+      renewMutationLock(config, workspace.id, sessionId, leaseToken);
+      invalidateDerivedWorkspaceState(
+        workspace.id,
+        result.impact,
+        result.files.map((f) => f.path)
+      );
+      const shaped = await maybeStoreAndShapeDiff(config, workspace, "write_many", responseMode, {
+        storageDiff: result.storageDiff,
+        previewDiff: result.previewDiff,
+        changedPaths: result.files.map((f) => f.path),
+        complete: result.diffComplete
+      });
+      const warnings = [result.warning, shaped.warning].filter(Boolean);
+      const text = formatMutationText(
+        "Write Many",
+        [
+          `Changed files: ${result.changed_files}`,
+          `Created: ${result.created_files}`,
+          `Overwritten: ${result.overwritten_files}`,
+          `Total bytes: ${result.total_bytes}`,
+          formatDiffStatsLine(result.additions, result.deletions, result.diff_stats_computed),
+          `Response mode: ${responseMode}`,
+          ...warnings.map((w) => `Warning: ${w}`),
+          "",
+          ...result.files.slice(0, 40).map((f) => `- ${f.path} (${f.bytes} B, ${f.existed ? "overwrite" : "create"})`),
+          ...(result.files.length > 40 ? [`...and ${result.files.length - 40} more`] : [])
+        ],
+        { responseMode, retrievalKey: shaped.diff_retrieval_key, diffComplete: shaped.diff_complete }
+      );
+      return textResult(text, {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        changed_files: result.changed_files,
+        created_files: result.created_files,
+        overwritten_files: result.overwritten_files,
+        total_bytes: result.total_bytes,
+        additions: result.additions,
+        deletions: result.deletions,
+        diff_stats_computed: result.diff_stats_computed,
+        files: result.files.map((f) => ({
+          path: f.path,
+          existed: f.existed,
+          bytes: f.bytes,
+          sha256: f.sha256,
+          additions: f.additions,
+          deletions: f.deletions
+        })),
+        response_mode: responseMode,
+        diff_preview: shaped.diff_preview,
+        diff_retrieval_key: shaped.diff_retrieval_key,
+        diff_complete: shaped.diff_complete,
+        diff_truncated: shaped.diff_truncated || result.diffTruncated,
+        warning: warnings.length ? warnings.join(" ") : undefined
       });
     }
   );
@@ -3019,7 +3733,8 @@ export function createLeastServer(
     "edit",
     {
       title: "Edit File",
-      description: "Apply a targeted exact text replacement inside a workspace text file. Returns a unified diff.",
+      description:
+        "Apply a targeted exact text replacement inside a workspace text file. Default response_mode=summary. Pass response_mode=compact_diff or full_diff when you need the diff back.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
         path: z.string().describe("File path relative to workspace root."),
@@ -3028,6 +3743,11 @@ export function createLeastServer(
         replace_all: z.boolean().optional().describe("Replace all occurrences. Default: false."),
         expected_replacements: z.number().int().min(1).optional().describe("Fail if actual replacement count differs."),
         expected_sha256: z.string().optional().describe("SHA-256 from read. Rejects stale edits when the file changed."),
+        response_mode: responseModeSchema,
+        include_diff: z
+          .boolean()
+          .optional()
+          .describe("Deprecated. false→summary, true→full_diff. Prefer response_mode. Default: summary."),
         lease_token: z.string().optional().describe("Lease token returned by acquire_workspace_lock. Use this when the client session may reconnect between tool calls.")
       },
       annotations: LOCAL_WRITE_ANNOTATIONS,
@@ -3055,13 +3775,45 @@ export function createLeastServer(
       const resolved = guard.resolve(workspace, filePath, { forWrite: true });
       assertWriteToolAllowed(config, resolved.relPath);
       await assertStaleFileState(config, guard, workspace, filePath, args);
-      const result = await editTextFile(config, guard, workspace, filePath, String(strFromArgs(args, "old_text") ?? ""), String(strFromArgs(args, "new_text") ?? ""), {
-        replaceAll: parseBool(args.replace_all, false),
-        expectedReplacements: limitInt(args.expected_replacements, 1, 1, 10_000)
-      });
+      const responseMode = mutationResponseModeFromArgs(args, "summary");
+      const result = await editTextFile(
+        config,
+        guard,
+        workspace,
+        filePath,
+        String(strFromArgs(args, "old_text") ?? ""),
+        String(strFromArgs(args, "new_text") ?? ""),
+        {
+          replaceAll: parseBool(args.replace_all, false),
+          expectedReplacements: limitInt(args.expected_replacements, 1, 1, 10_000),
+          diffMode: diffComputeModeFromResponseMode(responseMode),
+          maxDiffChars: maxDiffCharsForMode(responseMode)
+        }
+      );
       renewMutationLock(config, workspace.id, sessionId, leaseToken);
-      invalidateDerivedWorkspaceState(workspace.id);
-      const text = `# Edit File\n\nPath: ${result.path}\nReplacements: ${result.replacements}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\nDiff stats: +${result.diff.additions} -${result.diff.deletions}${diffBlock(result.diff.diff)}`;
+      invalidateDerivedWorkspaceState(workspace.id, "content");
+      const shaped = await maybeStoreAndShapeDiff(config, workspace, "edit", responseMode, {
+        storageDiff: result.diff.storageDiff,
+        previewDiff: result.diff.preview ?? result.diff.diff,
+        changedPaths: [result.path],
+        complete: result.diff.complete
+      });
+      const text = formatMutationText(
+        "Edit File",
+        [
+          `Path: ${result.path}`,
+          `Replacements: ${result.replacements}`,
+          `Bytes: ${result.bytes}`,
+          `SHA-256: ${result.sha256}`,
+          formatDiffStatsLine(
+            result.diff.statsComputed === false ? null : result.diff.additions,
+            result.diff.statsComputed === false ? null : result.diff.deletions,
+            result.diff.statsComputed
+          ),
+          `Response mode: ${responseMode}`
+        ],
+        { responseMode, retrievalKey: shaped.diff_retrieval_key, diffComplete: shaped.diff_complete }
+      );
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
@@ -3069,9 +3821,14 @@ export function createLeastServer(
         replacements: result.replacements,
         bytes: result.bytes,
         sha256: result.sha256,
-        additions: result.diff.additions,
-        deletions: result.diff.deletions,
-        diff: result.diff.diff
+        additions: result.diff.statsComputed === false ? null : result.diff.additions,
+        deletions: result.diff.statsComputed === false ? null : result.diff.deletions,
+        diff_stats_computed: result.diff.statsComputed !== false && responseMode !== "summary",
+        response_mode: responseMode,
+        diff_preview: shaped.diff_preview,
+        diff_retrieval_key: shaped.diff_retrieval_key,
+        diff_complete: shaped.diff_complete,
+        diff_truncated: shaped.diff_truncated
       });
     }
   );
@@ -3084,7 +3841,7 @@ export function createLeastServer(
     "multi_edit",
     {
       title: "Multi Edit",
-      description: "Apply several exact text edits across files in one call.",
+      description: "Apply several exact text edits across files in one call. Preflights files in parallel and commits only after all edits validate. Default response_mode=summary.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
         edits: z
@@ -3101,7 +3858,11 @@ export function createLeastServer(
           .max(100)
           .describe("Exact text edits to apply."),
         expected_sha256s: z.record(z.string()).optional().describe("Optional map of expected file sha256 values keyed by path."),
-        include_diff: z.boolean().optional().describe("Include the combined diff. Default: true."),
+        response_mode: responseModeSchema,
+        include_diff: z
+          .boolean()
+          .optional()
+          .describe("Deprecated. false→summary, true→full_diff. Prefer response_mode. Default: summary."),
         lease_token: z.string().optional().describe("Lease token returned by acquire_workspace_lock.")
       },
       annotations: LOCAL_WRITE_ANNOTATIONS,
@@ -3116,57 +3877,228 @@ export function createLeastServer(
       const sessionId = sessionIdFrom(options);
       const leaseToken = leaseTokenFromArgs(args);
       assertMutationLock(config, workspace.id, sessionId, leaseToken);
+      const responseMode = mutationResponseModeFromArgs(args, "summary");
+      const diffMode = diffComputeModeFromResponseMode(responseMode);
+      const maxDiffChars = maxDiffCharsForMode(responseMode);
       const rawEdits = Array.isArray(args.edits) ? args.edits : [];
       if (!rawEdits.length) throw new LeastError("edits must include at least one item.");
       const expectedShaMap =
         args.expected_sha256s && typeof args.expected_sha256s === "object" && !Array.isArray(args.expected_sha256s)
           ? (args.expected_sha256s as Record<string, unknown>)
           : {};
-      const results: Array<Record<string, unknown>> = [];
-      const diffs: string[] = [];
+
+      type PlannedEdit = {
+        path: string;
+        relPath: string;
+        absPath: string;
+        oldText: string;
+        newText: string;
+        replaceAll: boolean;
+        expectedReplacements?: number;
+        expectedSha?: string;
+      };
+
+      const plannedInputs: PlannedEdit[] = [];
       for (const item of rawEdits) {
         if (!item || typeof item !== "object") throw new LeastError("Each multi_edit item must be an object.");
         const edit = item as Record<string, unknown>;
         const filePath = String(edit.path ?? "");
         const resolved = guard.resolve(workspace, filePath, { forWrite: true });
         assertWriteToolAllowed(config, resolved.relPath);
+        assertPathPermission("multi_edit", resolved.relPath);
         const expected =
           typeof expectedShaMap[filePath] === "string"
-            ? expectedShaMap[filePath]
+            ? String(expectedShaMap[filePath])
             : typeof expectedShaMap[resolved.relPath] === "string"
-              ? expectedShaMap[resolved.relPath]
+              ? String(expectedShaMap[resolved.relPath])
               : undefined;
-        if (typeof expected === "string") {
-          await assertStaleFileState(config, guard, workspace, resolved.relPath, { expected_sha256: expected });
-        }
-        const result = await editTextFile(
-          config,
-          guard,
-          workspace,
-          filePath,
-          String(edit.old_text ?? ""),
-          String(edit.new_text ?? ""),
-          {
-            replaceAll: parseBool(edit.replace_all, false),
-            expectedReplacements: typeof edit.expected_replacements === "number" ? edit.expected_replacements : undefined
-          }
-        );
-        results.push(result);
-        diffs.push(result.diff.diff);
+        plannedInputs.push({
+          path: filePath,
+          relPath: resolved.relPath,
+          absPath: resolved.absPath,
+          oldText: String(edit.old_text ?? ""),
+          newText: String(edit.new_text ?? ""),
+          replaceAll: parseBool(edit.replace_all, false),
+          expectedReplacements: typeof edit.expected_replacements === "number" ? edit.expected_replacements : undefined,
+          expectedSha: expected
+        });
       }
+
+      // Group sequential edits by file so multi-hunk changes to one file apply in order.
+      const order: string[] = [];
+      const byFile = new Map<string, PlannedEdit[]>();
+      for (const planned of plannedInputs) {
+        const key = planned.relPath;
+        if (!byFile.has(key)) {
+          byFile.set(key, []);
+          order.push(key);
+        }
+        byFile.get(key)!.push(planned);
+      }
+
+      type FilePlan = {
+        relPath: string;
+        absPath: string;
+        before: string;
+        after: string;
+        afterBuffer: Buffer;
+        replacements: number;
+        editCount: number;
+        digest: string;
+        bytes: number;
+        originalBuffer: Buffer;
+        additions: number | null;
+        deletions: number | null;
+        statsComputed: boolean;
+        storageDiff?: string;
+        previewDiff?: string;
+        complete?: boolean;
+      };
+
+      // Parallel preflight across distinct files; no writes until all validate.
+      const maxBytes = Math.max(config.maxWriteBytes, config.maxReadBytes);
+      const filePlans = await mapWithConcurrency(order, 8, async (relPath) => {
+        const edits = byFile.get(relPath)!;
+        const first = edits[0]!;
+        const stat = await guard.assertTextFile(first.absPath, maxBytes);
+        const snapshot = await readTextWithSnapshot(first.absPath, { maxBytes, knownStat: stat });
+        if (first.expectedSha && snapshot.sha256 !== first.expectedSha) {
+          throw new StaleFileStateError(relPath, first.expectedSha, snapshot.sha256);
+        }
+        const before = snapshot.text;
+        let current = before;
+        let totalReplacements = 0;
+        for (const edit of edits) {
+          const planned = planTextEdit(current, edit.oldText, edit.newText, {
+            replaceAll: edit.replaceAll,
+            expectedReplacements: edit.expectedReplacements,
+            relPath
+          });
+          current = planned.after;
+          totalReplacements += planned.replacements;
+        }
+        const prepared = prepareTextContent(current);
+        if (prepared.bytes > config.maxWriteBytes) {
+          throw new LeastError(`Edited file would be too large (${prepared.bytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
+        }
+        if (hasSecretValue(prepared.text)) {
+          throw new LeastError("Secret-looking content is blocked from edit. Use placeholders such as [REDACTED_SECRET] in handoff files.");
+        }
+        const diffMeta = await computeMutationDiff(before, prepared.text, relPath, diffMode, maxDiffChars, {
+          storageMaxChars: config.outputStoreMaxItemBytes
+        });
+        return {
+          relPath,
+          absPath: first.absPath,
+          before,
+          after: prepared.text,
+          afterBuffer: prepared.buffer,
+          replacements: totalReplacements,
+          editCount: edits.length,
+          digest: prepared.sha256,
+          bytes: prepared.bytes,
+          originalBuffer: Buffer.from(before, "utf8"),
+          additions: diffMeta.additions,
+          deletions: diffMeta.deletions,
+          statsComputed: diffMeta.statsComputed,
+          storageDiff: diffMeta.storageDiff,
+          previewDiff: diffMeta.preview,
+          complete: diffMeta.complete
+        } satisfies FilePlan;
+      });
+
+      // Commit with prepared originals (no re-read).
+      await commitPreparedFileTransaction(
+        filePlans.map((plan) => ({
+          type: "write" as const,
+          absPath: plan.absPath,
+          content: plan.after,
+          buffer: plan.afterBuffer,
+          original: plan.originalBuffer,
+          existed: true
+        })),
+        { concurrency: 8 }
+      );
+
+      const results: Array<Record<string, unknown>> = [];
+      const storageParts: string[] = [];
+      const previewParts: string[] = [];
+      let anyIncomplete = false;
+      for (const plan of filePlans) {
+        invalidateFileSnapshot(plan.absPath);
+        try {
+          const stat = await fsp.stat(plan.absPath);
+          setCachedFileSnapshot(plan.absPath, stat, plan.after, plan.digest);
+        } catch {
+          // Best-effort snapshot warm.
+        }
+        results.push({
+          path: plan.relPath,
+          replacements: plan.replacements,
+          edit_count: plan.editCount,
+          bytes: plan.bytes,
+          sha256: plan.digest,
+          additions: plan.additions,
+          deletions: plan.deletions
+        });
+        if (plan.storageDiff) storageParts.push(plan.storageDiff);
+        if (plan.previewDiff) previewParts.push(plan.previewDiff);
+        if (plan.complete === false) anyIncomplete = true;
+      }
+
       renewMutationLock(config, workspace.id, sessionId, leaseToken);
-      invalidateDerivedWorkspaceState(workspace.id);
-      const includeDiff = parseBool(args.include_diff, true);
-      const additions = results.reduce((sum, item) => sum + Number((item.diff as { additions?: number })?.additions ?? 0), 0);
-      const deletions = results.reduce((sum, item) => sum + Number((item.diff as { deletions?: number })?.deletions ?? 0), 0);
-      const text = `# Multi Edit\n\nEdits: ${results.length}\nDiff stats: +${additions} -${deletions}${includeDiff ? diffBlock(diffs.join("\n\n")) : "\n\nDiff omitted by request."}`;
+      invalidateDerivedWorkspaceState(
+        workspace.id,
+        "content",
+        filePlans.map((plan) => plan.relPath)
+      );
+      const statsComputed = responseMode !== "summary" && filePlans.some((p) => p.statsComputed);
+      const additions = statsComputed
+        ? results.reduce((sum, item) => sum + Number(item.additions ?? 0), 0)
+        : null;
+      const deletions = statsComputed
+        ? results.reduce((sum, item) => sum + Number(item.deletions ?? 0), 0)
+        : null;
+      const previewBudget = Math.min(
+        responseMode === "compact_diff" ? COMPACT_DIFF_MAX_CHARS : FULL_DIFF_MAX_CHARS,
+        config.maxOutputBytes
+      );
+      const pathMetaBytes = Buffer.byteLength(filePlans.map((p) => p.relPath).join(", "), "utf8");
+      const storageBudget = Math.max(1024, config.outputStoreMaxItemBytes - 256 - pathMetaBytes - 128);
+      const combinedPreview = combineDiffParts(previewParts, previewBudget);
+      const combinedStorage = combineDiffParts(storageParts, storageBudget);
+      const combinedComplete =
+        storageParts.length > 0 && !anyIncomplete && !combinedStorage.truncated && combinedStorage.omittedParts === 0;
+      const shaped = await maybeStoreAndShapeDiff(config, workspace, "multi_edit", responseMode, {
+        storageDiff: combinedStorage.text || undefined,
+        previewDiff: combinedPreview.text || undefined,
+        changedPaths: filePlans.map((p) => p.relPath),
+        complete: storageParts.length ? combinedComplete : undefined
+      });
+      const text = formatMutationText(
+        "Multi Edit",
+        [
+          `Edits: ${plannedInputs.length}`,
+          `Files: ${results.length}`,
+          formatDiffStatsLine(additions, deletions, statsComputed),
+          `Response mode: ${responseMode}`,
+          ...(shaped.warning ? [`Warning: ${shaped.warning}`] : [])
+        ],
+        { responseMode, retrievalKey: shaped.diff_retrieval_key, diffComplete: shaped.diff_complete }
+      );
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
         edits: results,
         additions,
         deletions,
-        diff: includeDiff ? diffs.join("\n\n") : undefined
+        diff_stats_computed: statsComputed,
+        response_mode: responseMode,
+        diff_preview: shaped.diff_preview,
+        diff_retrieval_key: shaped.diff_retrieval_key,
+        diff_complete: shaped.diff_complete,
+        diff_truncated: shaped.diff_truncated || combinedPreview.truncated || combinedStorage.truncated,
+        warning: shaped.warning
       });
     }
   );
@@ -3179,12 +4111,16 @@ export function createLeastServer(
     "apply_patch",
     {
       title: "Apply Patch",
-      description: "Apply a Codex-style Begin Patch block across one or more files.",
+      description: "Apply a Codex-style Begin Patch block across one or more files. Default response_mode=summary.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
         patch: z.string().describe("Patch text using the *** Begin Patch / *** End Patch format."),
         check_only: z.boolean().optional().describe("Validate without writing files. Default: false."),
-        include_diff: z.boolean().optional().describe("Include the combined diff. Default: true."),
+        response_mode: responseModeSchema,
+        include_diff: z
+          .boolean()
+          .optional()
+          .describe("Deprecated. false→summary, true→full_diff. Prefer response_mode. Default: summary."),
         lease_token: z.string().optional().describe("Lease token returned by acquire_workspace_lock.")
       },
       annotations: LOCAL_WRITE_ANNOTATIONS,
@@ -3199,21 +4135,56 @@ export function createLeastServer(
       const sessionId = sessionIdFrom(options);
       const leaseToken = leaseTokenFromArgs(args);
       assertMutationLock(config, workspace.id, sessionId, leaseToken);
+      const responseMode = mutationResponseModeFromArgs(args, "summary");
       const result = await applyWorkspacePatch(config, guard, workspace, String(strFromArgs(args, "patch") ?? ""), {
-        checkOnly: parseBool(args.check_only, false)
+        checkOnly: parseBool(args.check_only, false),
+        authorizePath: (relPath) => {
+          assertWriteToolAllowed(config, relPath);
+          assertPathPermission("apply_patch", relPath);
+        },
+        diffMode: diffComputeModeFromResponseMode(responseMode),
+        maxDiffChars: maxDiffCharsForMode(responseMode)
       });
       renewMutationLock(config, workspace.id, sessionId, leaseToken);
       if (!parseBool(args.check_only, false)) {
-        invalidateDerivedWorkspaceState(workspace.id);
+        for (const relPath of result.changedFiles) invalidateFileSnapshot(guard.resolve(workspace, relPath, { forWrite: true }).absPath);
+        invalidateDerivedWorkspaceState(workspace.id, result.impact, result.changedFiles);
       }
-      const includeDiff = parseBool(args.include_diff, true);
-      const text = `# Apply Patch\n\nChanged files: ${result.changedFiles.length}\nCheck only: ${parseBool(args.check_only, false)}\nDiff stats: +${result.additions} -${result.deletions}${includeDiff ? diffBlock(result.diff) : "\n\nDiff omitted by request."}`;
+      const shaped = await maybeStoreAndShapeDiff(config, workspace, "apply_patch", responseMode, {
+        storageDiff: responseMode === "summary" ? undefined : result.diff,
+        previewDiff: responseMode === "summary" ? undefined : result.diff,
+        changedPaths: result.changedFiles,
+        complete: true
+      });
+      const text = formatMutationText(
+        "Apply Patch",
+        [
+          `Changed files: ${result.changedFiles.length}`,
+          `Check only: ${parseBool(args.check_only, false)}`,
+          formatDiffStatsLine(
+            responseMode === "summary" ? null : result.additions,
+            responseMode === "summary" ? null : result.deletions,
+            responseMode !== "summary"
+          ),
+          `Impact: ${result.impact}`,
+          `Response mode: ${responseMode}`
+        ],
+        { responseMode, retrievalKey: shaped.diff_retrieval_key, diffComplete: shaped.diff_complete }
+      );
       return textResult(text, {
         workspace_id: workspace.id,
         root: workspace.root,
-        ...result,
+        changedFiles: result.changedFiles,
+        additions: responseMode === "summary" ? null : result.additions,
+        deletions: responseMode === "summary" ? null : result.deletions,
+        diff_stats_computed: responseMode !== "summary",
+        impact: result.impact,
         check_only: parseBool(args.check_only, false),
-        diff: includeDiff ? result.diff : undefined
+        response_mode: responseMode,
+        diff_preview: shaped.diff_preview,
+        diff_retrieval_key: shaped.diff_retrieval_key,
+        diff_complete: shaped.diff_complete,
+        diff_truncated: shaped.diff_truncated
       });
     }
   );
@@ -3227,10 +4198,11 @@ export function createLeastServer(
     {
       title: "Bash",
       description:
-        "Run one allowlisted shell command in the workspace. LEAST_BASH_MODE=safe allows tests/build scripts; readonly allows rg/head/tail-style inspection; full allows arbitrary commands. Prefer files/search_context/read_many for repo exploration. Do not chain commands with &&, pipes, redirects, or shell file readers.",
+        "Run one allowlisted shell command in the workspace. LEAST_BASH_MODE=safe allows tests/build scripts; readonly allows rg/head/tail-style inspection; full allows arbitrary commands. Prefer files/search_context/read_many for repo exploration. Prefer local_http_json for HTTP/API calls, docker_compose_* for Docker Compose inspection, and run_package_script/run_vitest for package scripts and tests. Use bash only when no structured tool exists. Do not chain commands with &&, pipes, redirects, or shell file readers.",
       inputSchema: shellInputSchema,
       annotations: BASH_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Running bash command...",
         "openai/toolInvocation/invoked": "Bash command finished"
       }
@@ -3247,15 +4219,432 @@ export function createLeastServer(
     {
       title: "Shell",
       description:
-        "Run a shell command using the configured shell backend. This is an alias for bash with the current schema, including lease_token for lease-mode clients that reconnect between tool calls.",
+        "Run a shell command using the configured shell backend. Alias for bash. Prefer local_http_json, docker_compose_*, and run_vitest over raw curl/docker/pnpm vitest strings when possible.",
       inputSchema: shellInputSchema,
       annotations: BASH_ANNOTATIONS,
       _meta: {
+        ...toolCardMeta(),
         "openai/toolInvocation/invoking": "Running shell command...",
         "openai/toolInvocation/invoked": "Shell command finished"
       }
     },
     runShellTool
+  );
+
+  const httpMethodSchema = z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]);
+  const httpQuerySchema = z.record(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional();
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "local_http_request",
+    {
+      title: "Local HTTP Request",
+      description:
+        "Make a local HTTP request without shell/curl. Use this instead of bash/curl for localhost API checks. Allows localhost, 127.0.0.1, ::1, and host.docker.internal by default. Blocks external hosts unless configured.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        method: httpMethodSchema.describe("HTTP method."),
+        url: z.string().optional().describe("Full URL. Prefer baseUrl+path when possible."),
+        baseUrl: z.string().optional().describe("Base URL, for example http://localhost:6795."),
+        path: z.string().optional().describe("Path relative to baseUrl, for example /api/tools/catalog."),
+        query: httpQuerySchema.describe("Optional query parameters."),
+        headers: z.record(z.string()).optional().describe("Optional request headers."),
+        origin: z.string().optional().describe("Optional Origin header value."),
+        json: z.unknown().optional().describe("Optional JSON body (serialized internally)."),
+        bodyText: z.string().optional().describe("Optional raw body text when not using json."),
+        timeoutMs: z.number().int().min(100).max(600000).optional().describe("Timeout in ms. Default from settings."),
+        maxBodyBytes: z.number().int().min(1000).max(20000000).optional().describe("Max response body bytes."),
+        followRedirects: z.boolean().optional().describe("Follow redirects. Default false.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Calling local HTTP...",
+        "openai/toolInvocation/invoked": "Local HTTP finished"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const method = String(strFromArgs(args, "method") ?? "GET").toUpperCase() as HttpMethod;
+      const result = await localHttpRequest(
+        {
+          method,
+          url: strFromArgs(args, "url"),
+          baseUrl: strFromArgs(args, "baseUrl") ?? strFromArgs(args, "base_url"),
+          path: strFromArgs(args, "path"),
+          query: (args.query as Record<string, string | number | boolean | null | undefined> | undefined) ?? undefined,
+          headers: (args.headers as Record<string, string> | undefined) ?? undefined,
+          origin: strFromArgs(args, "origin"),
+          json: args.json,
+          bodyText: strFromArgs(args, "bodyText") ?? strFromArgs(args, "body_text"),
+          timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : typeof args.timeout_ms === "number" ? args.timeout_ms : undefined,
+          maxBodyBytes: typeof args.maxBodyBytes === "number" ? args.maxBodyBytes : undefined,
+          followRedirects: parseBool(args.followRedirects ?? args.follow_redirects, false)
+        },
+        config
+      );
+      return textResult(formatLocalHttpText("Local HTTP Request", result), {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ...result
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "local_http_json",
+    {
+      title: "Local HTTP JSON",
+      description:
+        "Convenience tool for local JSON APIs. Sets Accept/Content-Type application/json. Use this instead of bash/curl for localhost JSON GET/POST. Preferred tool for local API smoke checks.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).describe("HTTP method."),
+        url: z.string().optional().describe("Full URL."),
+        baseUrl: z.string().optional().describe("Base URL, for example http://localhost:6795."),
+        path: z.string().optional().describe("Path relative to baseUrl."),
+        query: httpQuerySchema.describe("Optional query parameters."),
+        origin: z.string().optional().describe("Optional Origin header value."),
+        json: z.unknown().optional().describe("Optional JSON body."),
+        timeoutMs: z.number().int().min(100).max(600000).optional().describe("Timeout in ms.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Calling local JSON API...",
+        "openai/toolInvocation/invoked": "Local JSON API finished"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const method = String(strFromArgs(args, "method") ?? "GET").toUpperCase() as Exclude<HttpMethod, "HEAD">;
+      const result = await localHttpJson(
+        {
+          method,
+          url: strFromArgs(args, "url"),
+          baseUrl: strFromArgs(args, "baseUrl") ?? strFromArgs(args, "base_url"),
+          path: strFromArgs(args, "path"),
+          query: (args.query as Record<string, string | number | boolean | null | undefined> | undefined) ?? undefined,
+          origin: strFromArgs(args, "origin"),
+          json: args.json,
+          timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : typeof args.timeout_ms === "number" ? args.timeout_ms : undefined
+        },
+        config
+      );
+      return textResult(formatLocalHttpText("Local HTTP JSON", result), {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ...result
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "api_smoke_suite",
+    {
+      title: "API Smoke Suite",
+      description:
+        "Run several local HTTP checks in one structured call with optional status and JSON-path expectations. Use instead of multiple curl commands.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        baseUrl: z.string().describe("Base URL shared by all checks."),
+        origin: z.string().optional().describe("Optional Origin header for all checks."),
+        checks: z
+          .array(
+            z.object({
+              name: z.string().optional(),
+              method: httpMethodSchema,
+              path: z.string(),
+              query: httpQuerySchema,
+              json: z.unknown().optional(),
+              expectedStatus: z.union([z.number().int(), z.array(z.number().int())]).optional(),
+              expectJsonPath: z
+                .array(
+                  z.object({
+                    path: z.string(),
+                    equals: z.unknown().optional(),
+                    exists: z.boolean().optional(),
+                    type: z.enum(["string", "number", "boolean", "array", "object", "null"]).optional()
+                  })
+                )
+                .optional()
+            })
+          )
+          .min(1)
+          .describe("Ordered list of HTTP checks."),
+        stopOnFailure: z.boolean().optional().describe("Stop after first failure. Default false."),
+        timeoutMs: z.number().int().min(100).max(600000).optional()
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Running API smoke suite...",
+        "openai/toolInvocation/invoked": "API smoke suite finished"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const result = await apiSmokeSuite(
+        {
+          baseUrl: String(strFromArgs(args, "baseUrl") ?? strFromArgs(args, "base_url") ?? ""),
+          origin: strFromArgs(args, "origin"),
+          checks: (args.checks as any[]) ?? [],
+          stopOnFailure: parseBool(args.stopOnFailure ?? args.stop_on_failure, false),
+          timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : undefined
+        },
+        config
+      );
+      return textResult(formatApiSmokeText(result), {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ...result
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "docker_compose_services",
+    {
+      title: "Docker Compose Services",
+      description: "List valid Docker Compose service names. Use instead of bash docker compose config --services.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        composeDir: z.string().optional().describe("Compose project directory relative to workspace or absolute under allowed roots. Default from settings (docker)."),
+        projectName: z.string().optional().describe("Optional compose project name (-p).")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Listing compose services...",
+        "openai/toolInvocation/invoked": "Compose services ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const result = await composeServices(config, workspace, {
+        composeDir: strFromArgs(args, "composeDir") ?? strFromArgs(args, "compose_dir"),
+        projectName: strFromArgs(args, "projectName") ?? strFromArgs(args, "project_name")
+      });
+      const text = `# Docker Compose Services\n\n${result.services.map((s) => `- ${s}`).join("\n") || "(none)"}\n\nDir: ${result.composeDir}`;
+      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "docker_compose_ps",
+    {
+      title: "Docker Compose PS",
+      description: "Show Docker Compose service status without raw docker shell. Use instead of bash docker compose ps.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        composeDir: z.string().optional().describe("Compose project directory. Default from settings."),
+        projectName: z.string().optional().describe("Optional compose project name."),
+        format: z.enum(["table", "json"]).optional().describe("Preferred format. Default json with table fallback.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Reading compose status...",
+        "openai/toolInvocation/invoked": "Compose status ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const result = await composePs(config, workspace, {
+        composeDir: strFromArgs(args, "composeDir") ?? strFromArgs(args, "compose_dir"),
+        projectName: strFromArgs(args, "projectName") ?? strFromArgs(args, "project_name"),
+        format: (strFromArgs(args, "format") as "table" | "json" | undefined) ?? "json"
+      });
+      return textResult(formatComposePsText(result), { workspace_id: workspace.id, root: workspace.root, ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "docker_compose_logs",
+    {
+      title: "Docker Compose Logs",
+      description: "Fetch Docker Compose service logs safely without shell interpolation. Use instead of bash docker compose logs.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        composeDir: z.string().optional().describe("Compose project directory. Default from settings."),
+        projectName: z.string().optional().describe("Optional compose project name."),
+        service: z.string().describe("Service name (validated against compose config)."),
+        tail: z.number().int().min(1).max(5000).optional().describe("Log tail lines. Default 200, max from settings."),
+        since: z.string().optional().describe("Optional docker --since value."),
+        timestamps: z.boolean().optional().describe("Include timestamps. Default false.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Reading compose logs...",
+        "openai/toolInvocation/invoked": "Compose logs ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const result = await composeLogs(config, workspace, {
+        composeDir: strFromArgs(args, "composeDir") ?? strFromArgs(args, "compose_dir"),
+        projectName: strFromArgs(args, "projectName") ?? strFromArgs(args, "project_name"),
+        service: String(strFromArgs(args, "service") ?? ""),
+        tail: typeof args.tail === "number" ? args.tail : undefined,
+        since: strFromArgs(args, "since"),
+        timestamps: parseBool(args.timestamps, false)
+      });
+      const text = `# Docker Compose Logs\n\nService: ${result.service}\nExit: ${result.exitCode}${result.truncated ? "\nTruncated: true" : ""}\n\n## logs\n\n\`\`\`text\n${result.logs || "(empty)"}\n\`\`\``;
+      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "docker_compose_health",
+    {
+      title: "Docker Compose Health",
+      description: "One-shot Docker Compose health summary. Prefer this for “are containers OK?” instead of bash docker compose ps.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        composeDir: z.string().optional().describe("Compose project directory. Default from settings."),
+        projectName: z.string().optional().describe("Optional compose project name."),
+        includeLogsForUnhealthy: z.boolean().optional().describe("Include recent logs for unhealthy/exited services."),
+        logTail: z.number().int().min(1).max(5000).optional().describe("Log tail when includeLogsForUnhealthy is true.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        "openai/toolInvocation/invoking": "Checking compose health...",
+        "openai/toolInvocation/invoked": "Compose health ready"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const result = await composeHealth(config, workspace, {
+        composeDir: strFromArgs(args, "composeDir") ?? strFromArgs(args, "compose_dir"),
+        projectName: strFromArgs(args, "projectName") ?? strFromArgs(args, "project_name"),
+        includeLogsForUnhealthy: parseBool(args.includeLogsForUnhealthy ?? args.include_logs_for_unhealthy, false),
+        logTail: typeof args.logTail === "number" ? args.logTail : typeof args.log_tail === "number" ? args.log_tail : undefined
+      });
+      return textResult(formatComposeHealthText(result), { workspace_id: workspace.id, root: workspace.root, ...result });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "run_package_script",
+    {
+      title: "Run Package Script",
+      description:
+        "Execute a package.json script via pnpm/npm/yarn without raw shell strings. Prefer this over bash for typecheck/build/test scripts.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        packageManager: z.enum(["pnpm", "npm", "yarn"]).optional().describe("Package manager. Default pnpm."),
+        filter: z.string().optional().describe("Workspace filter (pnpm --filter / yarn workspace)."),
+        script: z.string().describe("Script name, for example typecheck."),
+        args: z.array(z.string()).optional().describe("Extra script args."),
+        cwd: z.string().optional().describe("Working directory relative to workspace. Default ."),
+        timeoutMs: z.number().int().min(1000).max(3600000).optional().describe("Timeout in ms. Default 180000."),
+        lease_token: z.string().optional().describe("Lease token when concurrency mode is lease.")
+      },
+      annotations: BASH_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Running package script...",
+        "openai/toolInvocation/invoked": "Package script finished"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const sessionId = sessionIdFrom(options);
+      const leaseToken = leaseTokenFromArgs(args);
+      assertMutationLock(config, workspace.id, sessionId, leaseToken);
+      const result = await runPackageScript(config, guard, workspace, {
+        packageManager: (strFromArgs(args, "packageManager") ?? strFromArgs(args, "package_manager")) as any,
+        filter: strFromArgs(args, "filter"),
+        script: String(strFromArgs(args, "script") ?? ""),
+        args: Array.isArray(args.args) ? args.args.map(String) : undefined,
+        cwd: strFromArgs(args, "cwd"),
+        timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : typeof args.timeout_ms === "number" ? args.timeout_ms : undefined
+      });
+      renewMutationLock(config, workspace.id, sessionId, leaseToken);
+      return textResult(formatPackageRunText("Package Script", result), {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ...result
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    authMode,
+    registry,
+    server,
+    "run_vitest",
+    {
+      title: "Run Vitest",
+      description:
+        "Run isolated Vitest files via `pnpm --filter <pkg> exec vitest run <files>`. Prefer this over bash/pnpm test to avoid running more tests than intended.",
+      inputSchema: {
+        workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use default workspace."),
+        packageFilter: z.string().optional().describe("pnpm workspace package filter, for example @zside/frontend."),
+        files: z.array(z.string()).optional().describe("Test file paths relative to package/cwd."),
+        testNamePattern: z.string().optional().describe("Optional vitest --testNamePattern."),
+        run: z.boolean().optional().describe("Pass vitest run (default true)."),
+        timeoutMs: z.number().int().min(1000).max(3600000).optional().describe("Timeout in ms."),
+        cwd: z.string().optional().describe("Working directory relative to workspace. Default ."),
+        lease_token: z.string().optional().describe("Lease token when concurrency mode is lease.")
+      },
+      annotations: BASH_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Running vitest...",
+        "openai/toolInvocation/invoked": "Vitest finished"
+      }
+    },
+    async (args) => {
+      const workspace = workspaces.getWorkspace(workspaceIdFromArgs(args));
+      const sessionId = sessionIdFrom(options);
+      const leaseToken = leaseTokenFromArgs(args);
+      assertMutationLock(config, workspace.id, sessionId, leaseToken);
+      const result = await runVitest(config, guard, workspace, {
+        packageFilter: strFromArgs(args, "packageFilter") ?? strFromArgs(args, "package_filter"),
+        files: Array.isArray(args.files) ? args.files.map(String) : undefined,
+        testNamePattern: strFromArgs(args, "testNamePattern") ?? strFromArgs(args, "test_name_pattern"),
+        run: args.run === undefined ? true : parseBool(args.run, true),
+        timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : typeof args.timeout_ms === "number" ? args.timeout_ms : undefined,
+        cwd: strFromArgs(args, "cwd")
+      });
+      renewMutationLock(config, workspace.id, sessionId, leaseToken);
+      return textResult(formatPackageRunText("Vitest", result), {
+        workspace_id: workspace.id,
+        root: workspace.root,
+        ...result
+      });
+    }
   );
 
   registerCodexTool(
@@ -3675,7 +5064,7 @@ export function createLeastServer(
         maxTotalBytes: limitInt(args.max_total_bytes, 500_000, 1_000, 5_000_000)
       });
       renewMutationLock(config, workspace.id, sessionId, leaseToken);
-      invalidateDerivedWorkspaceState(workspace.id);
+      invalidateDerivedWorkspaceState(workspace.id, "structure");
       const text = `# Export Pro Context\n\nWrote ${result.path}.\nBytes: ${result.bytes}\nFiles included: ${result.filesIncluded.length}\nFiles skipped: ${result.filesSkipped.length}\nTruncated: ${result.truncated}\n\nPaste ${result.path} into a high-context planning model when MCP tools are unavailable, then save the returned plan with least pro-apply.`;
       return textResult(text, {
         workspace_id: workspace.id,
@@ -3731,7 +5120,7 @@ export function createLeastServer(
         eventName: "handoff_to_agent"
       });
       renewMutationLock(config, workspace.id, sessionId, leaseToken);
-      invalidateDerivedWorkspaceState(workspace.id);
+      invalidateDerivedWorkspaceState(workspace.id, "structure");
 
       const text = `# Handoff To Agent
 
@@ -3801,7 +5190,7 @@ ${result.prompt}
         eventName: "handoff_to_codex"
       });
       renewMutationLock(config, workspace.id, sessionId, leaseToken);
-      invalidateDerivedWorkspaceState(workspace.id);
+      invalidateDerivedWorkspaceState(workspace.id, "structure");
       const text = `# Handoff To Codex
 
 Wrote ${result.planPath}.

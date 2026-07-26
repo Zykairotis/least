@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 import type { Workspace } from "./guard.js";
 import { LeastError } from "./guard.js";
 import type { AgentCancelInput, AgentJobRecord, AgentPlanInput, AgentStartInput, AgentStatusInput } from "./agentTypes.js";
@@ -6,6 +7,7 @@ import {
   createAgentJob,
   findAgentJobByIdempotencyKey,
   findAgentJobByTask,
+  listAgentJobs,
   makeAgentTaskId,
   resolveAgentJob,
   writeAgentJob
@@ -17,6 +19,10 @@ import {
   refreshJobFromGroundcrew
 } from "./agentGroundcrewAdapter.js";
 import { classifyAgentLaunchRecovery, enqueueAgentLaunch, waitForAgentLaunch } from "./agentLaunchCoordinator.js";
+import { planDag } from "./agentDag.js";
+import { refreshDirectAgentJobFromArtifacts } from "./agentDirectLaunch.js";
+import { refreshAgentDeckJob, stopAgentDeckSession } from "./agentDeck.js";
+import { loadEffectiveLocalAgentConfig } from "./agentConfig.js";
 import { summarizeAgentResult } from "./agentResult.js";
 import { tailAgentJob } from "./agentTail.js";
 import { waitForAgentArtifacts } from "./agentTerminalLogs.js";
@@ -57,6 +63,12 @@ function uniqueWarnings(items: Array<string | undefined>): string[] {
   return [...new Set(items.filter((item): item is string => typeof item === "string" && item.trim().length > 0))];
 }
 
+function stringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim());
+  return items.length ? [...new Set(items)] : undefined;
+}
+
 function missingArtifactDetailMessage(root: string, checked: readonly string[], elapsedMs: number): string {
   return `Completed terminal exited successfully, but no result artifacts appeared in ${elapsedMs}ms at ${root}. Expected one of: ${checked.join(", ")}.`;
 }
@@ -75,6 +87,7 @@ function jobStructured(job: AgentJobRecord, watchdog?: AgentWatchdogResult): Rec
     idle_timeout_ms: job.idleTimeoutMs,
     deadline_at: job.watchdog?.deadlineAt,
     idle_deadline_at: job.watchdog?.idleDeadlineAt,
+    depends_on: job.dependsOn ?? [],
     last_activity_at: job.watchdog?.lastActivityAt,
     last_output_at: job.watchdog?.lastOutputAt,
     watchdog_last_checked_at: job.watchdog?.lastCheckedAt,
@@ -89,6 +102,7 @@ function jobStructured(job: AgentJobRecord, watchdog?: AgentWatchdogResult): Rec
     interrupt_error: job.watchdog?.interruptError,
     detail: job.detail,
     terminal: job.terminal,
+    agent_deck: job.agentDeck,
     ...(watchdog
       ? {
           watchdog: {
@@ -120,6 +134,69 @@ export function normalizeAgentStartupWaitMs(value: unknown): number {
 export async function agentDoctor(workspace: Workspace): Promise<{ text: string; structured: Record<string, unknown> }> {
   const result = await runAgentDoctor(workspace);
   return { text: result.text, structured: result.structured as unknown as Record<string, unknown> };
+}
+
+async function refreshManagedAgentJob(workspace: Workspace, seedJob: AgentJobRecord): Promise<AgentJobRecord> {
+  const job = await refreshDirectAgentJobFromArtifacts(workspace, seedJob);
+  if (!job.agentDeck?.sessionId) return job;
+  const local = await loadEffectiveLocalAgentConfig(workspace);
+  return await refreshAgentDeckJob(workspace, job, local.config.sessionManager);
+}
+
+async function evaluateAgentDeckWatchdog(
+  workspace: Workspace,
+  seedJob: AgentJobRecord,
+  enforce: boolean
+): Promise<AgentWatchdogResult> {
+  let job = await refreshManagedAgentJob(workspace, seedJob);
+  const warnings: string[] = [];
+  const now = new Date();
+  const deadline = job.watchdog?.deadlineAt ? Date.parse(job.watchdog.deadlineAt) : Number.NaN;
+  const idleDeadline = job.watchdog?.idleDeadlineAt ? Date.parse(job.watchdog.idleDeadlineAt) : Number.NaN;
+  const reason = Number.isFinite(deadline) && now.getTime() >= deadline
+    ? "wall-clock"
+    : Number.isFinite(idleDeadline) && now.getTime() >= idleDeadline
+      ? "idle"
+      : undefined;
+  if (!reason) {
+    return { job, checked: true, timedOut: false, interrupted: false, warnings };
+  }
+  if (!enforce) {
+    warnings.push(`Timeout detected (${reason}) but enforcement was disabled.`);
+    return { job, checked: true, timedOut: true, timeoutReason: reason, interrupted: false, warnings };
+  }
+  const local = await loadEffectiveLocalAgentConfig(workspace);
+  const attemptedAt = now.toISOString();
+  try {
+    job = await stopAgentDeckSession(
+      workspace,
+      job,
+      local.config.sessionManager,
+      "timeout-soft",
+      `Least watchdog stopped Agent Deck session after ${reason} timeout.`
+    );
+    job = await writeAgentJob(workspace, {
+      ...job,
+      watchdog: {
+        deadlineAt: job.watchdog?.deadlineAt ?? isoAfter(job.createdAt, job.timeoutMs),
+        idleDeadlineAt: job.watchdog?.idleDeadlineAt ?? isoAfter(job.createdAt, job.idleTimeoutMs),
+        lastActivityAt: job.watchdog?.lastActivityAt ?? job.createdAt,
+        lastOutputAt: job.watchdog?.lastOutputAt,
+        lastOutputHash: job.watchdog?.lastOutputHash,
+        lastRunStateHash: job.watchdog?.lastRunStateHash,
+        lastCheckedAt: attemptedAt,
+        timedOutAt: attemptedAt,
+        timeoutReason: reason,
+        interruptAttemptedAt: attemptedAt,
+        interruptError: undefined
+      }
+    });
+    return { job, checked: true, timedOut: true, timeoutReason: reason, interrupted: true, warnings };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    warnings.push(message);
+    return { job, checked: true, timedOut: true, timeoutReason: reason, interrupted: false, interruptError: message, warnings };
+  }
 }
 
 async function refreshTerminalMetadataBestEffort(workspace: Workspace, job: AgentJobRecord): Promise<AgentJobRecord> {
@@ -259,12 +336,14 @@ export async function agentList(): Promise<{ text: string; structured: Record<st
 export function agentPlan(input: AgentPlanInput): { text: string; structured: Record<string, unknown> } {
   const selectedAgent = input.agent?.trim() || "groundcrew-default";
   const title = coerceString(input.title, "Local agent task");
-  const taskId = makeAgentTaskId(title);
+  const taskId = planTaskId(title, input.taskId);
   const risk = input.mode === "analysis" || input.mode === "review" ? "low" : "medium";
   const requiresApproval = risk !== "low";
   const createdAt = new Date().toISOString();
-  const deadlineAt = isoAfter(createdAt, input.timeoutMs);
-  const idleDeadlineAt = isoAfter(createdAt, input.idleTimeoutMs);
+  const timeoutMs = normalizeAgentTimeoutMs(input.timeoutMs);
+  const idleTimeoutMs = normalizeAgentIdleTimeoutMs(input.idleTimeoutMs);
+  const deadlineAt = isoAfter(createdAt, timeoutMs);
+  const idleDeadlineAt = isoAfter(createdAt, idleTimeoutMs);
   const structured = {
     plan_id: `plan_${taskId}`,
     selected_agent: selectedAgent,
@@ -272,10 +351,11 @@ export function agentPlan(input: AgentPlanInput): { text: string; structured: Re
     task_id: taskId,
     title,
     mode: input.mode ?? "implementation",
-    timeout_ms: input.timeoutMs,
-    idle_timeout_ms: input.idleTimeoutMs,
+    timeout_ms: timeoutMs,
+    idle_timeout_ms: idleTimeoutMs,
     deadline_at: deadlineAt,
     idle_deadline_at: idleDeadlineAt,
+    depends_on: input.dependsOn ?? [],
     risk,
     requires_approval: requiresApproval,
     warnings: [
@@ -293,6 +373,7 @@ export function agentPlan(input: AgentPlanInput): { text: string; structured: Re
     `Mode: ${structured.mode}`,
     `Risk: ${risk}`,
     `Requires approval: ${requiresApproval}`,
+    `Depends on: ${(input.dependsOn ?? []).join(", ") || "none"}`,
     `Deadline: ${deadlineAt}`,
     `Idle deadline: ${idleDeadlineAt}`,
     "",
@@ -313,14 +394,24 @@ export async function agentStart(workspace: Workspace, input: AgentStartInput): 
     throw new LeastError("No agent provided and Groundcrew config has no agents.default.");
   }
 
-  const existing = await resolveExistingStart(workspace, input);
+  const title = coerceString(input.title, "Local agent task");
+  const timeoutMs = normalizeAgentTimeoutMs(input.timeoutMs);
+  const idleTimeoutMs = normalizeAgentIdleTimeoutMs(input.idleTimeoutMs);
+  const normalizedInput: AgentStartInput = {
+    ...input,
+    title,
+    timeoutMs,
+    idleTimeoutMs
+  };
+
+  const existing = await resolveExistingStart(workspace, normalizedInput);
   if (existing) {
     let returned = existing;
     let recoveryRestarted = false;
     const recovery = await classifyAgentLaunchRecovery(workspace, existing);
     returned = recovery.job;
-    if (recovery.classification === "recovery-required" && recovery.recoverySafe && (input.taskId || input.idempotencyKey)) {
-      enqueueAgentLaunch(workspace, returned, { ...input, agent: returned.agent });
+    if (recovery.classification === "recovery-required" && recovery.recoverySafe && (normalizedInput.taskId || normalizedInput.idempotencyKey)) {
+      enqueueAgentLaunch(workspace, returned, { ...normalizedInput, agent: returned.agent });
       recoveryRestarted = true;
       returned = await writeAgentJob(workspace, {
         ...returned,
@@ -333,11 +424,11 @@ export async function agentStart(workspace: Workspace, input: AgentStartInput): 
         }
       });
     } else if (isLaunchPending(returned)) {
-      enqueueAgentLaunch(workspace, returned, { ...input, agent: returned.agent });
+      enqueueAgentLaunch(workspace, returned, { ...normalizedInput, agent: returned.agent });
     }
     let startupWaitElapsed = false;
-    if (input.waitForLaunch) {
-      const wait = await waitForAgentLaunch(workspace, existing.jobId, normalizeAgentStartupWaitMs(input.startupWaitMs));
+    if (normalizedInput.waitForLaunch) {
+      const wait = await waitForAgentLaunch(workspace, existing.jobId, normalizeAgentStartupWaitMs(normalizedInput.startupWaitMs));
       returned = wait.job;
       startupWaitElapsed = !wait.settled;
     }
@@ -360,24 +451,30 @@ export async function agentStart(workspace: Workspace, input: AgentStartInput): 
     return { text, structured };
   }
 
-  const taskId = planTaskId(input.title, input.taskId);
+  const taskId = planTaskId(title, normalizedInput.taskId);
   let job = await createAgentJob({
     workspace,
     taskId,
     agent,
-    repository: input.repository,
-    title: input.title,
-    prompt: input.prompt,
-    timeoutMs: input.timeoutMs,
-    idleTimeoutMs: input.idleTimeoutMs,
-    idempotencyKey: input.idempotencyKey
+    repository: normalizedInput.repository,
+    title,
+    prompt: normalizedInput.prompt,
+    timeoutMs,
+    idleTimeoutMs,
+    idempotencyKey: normalizedInput.idempotencyKey,
+    dependsOn: normalizedInput.dependsOn
   });
 
-  enqueueAgentLaunch(workspace, job, input);
+  const dag = planDag(await listAgentJobs(workspace));
+  if ((job.dependsOn ?? []).length && dag.waiting.includes(job.taskId)) {
+    job = await writeAgentJob(workspace, { ...job, state: "planned", detail: `Waiting for dependencies: ${(job.dependsOn ?? []).join(", ")}` });
+  } else {
+    enqueueAgentLaunch(workspace, job, normalizedInput);
+  }
 
   let startupWaitElapsed = false;
-  if (input.waitForLaunch) {
-    const wait = await waitForAgentLaunch(workspace, job.jobId, normalizeAgentStartupWaitMs(input.startupWaitMs));
+  if (normalizedInput.waitForLaunch) {
+    const wait = await waitForAgentLaunch(workspace, job.jobId, normalizeAgentStartupWaitMs(normalizedInput.startupWaitMs));
     job = wait.job;
     startupWaitElapsed = !wait.settled;
   }
@@ -400,19 +497,68 @@ export async function agentStart(workspace: Workspace, input: AgentStartInput): 
   return { text, structured };
 }
 
+export async function promoteReadyAgentJobs(workspace: Workspace): Promise<AgentJobRecord[]> {
+  const jobs = await listAgentJobs(workspace);
+  const dag = planDag(jobs);
+  const promoted: AgentJobRecord[] = [];
+  for (const taskId of dag.ready) {
+    const job = jobs.find((item) => item.taskId === taskId);
+    if (!job || job.state !== "planned" || !(job.dependsOn ?? []).length) continue;
+    const next = await writeAgentJob(workspace, { ...job, state: "accepted", detail: undefined });
+    enqueueAgentLaunch(workspace, next, {
+      workspaceId: workspace.id,
+      workspaceRoot: workspace.root,
+      agent: next.agent,
+      repository: next.repository,
+      title: next.title,
+      prompt: "",
+      taskId: next.taskId,
+      timeoutMs: next.timeoutMs,
+      idleTimeoutMs: next.idleTimeoutMs,
+      dependsOn: next.dependsOn
+    });
+    promoted.push(next);
+  }
+  return promoted;
+}
+
+export async function agentGraph(workspace: Workspace, options: { refresh?: boolean } = {}): Promise<{ text: string; structured: Record<string, unknown> }> {
+  if (options.refresh) await promoteReadyAgentJobs(workspace);
+  const jobs = await listAgentJobs(workspace);
+  const dag = planDag(jobs);
+  const structured = { graph: dag };
+  const text = [
+    "# Agent Graph",
+    "",
+    `Jobs: ${dag.nodes.length}`,
+    `Ready: ${dag.ready.length}`,
+    `Waiting: ${dag.waiting.length}`,
+    `Running: ${dag.running.length}`,
+    `Completed: ${dag.completed.length}`,
+    `Cycles: ${dag.cycles.length}`,
+    "",
+    textBlock("Graph", structured)
+  ].join("\n");
+  return { text, structured };
+}
+
 export async function agentStatus(workspace: Workspace, input: AgentStatusInput): Promise<{ text: string; structured: Record<string, unknown> }> {
-  const job = await resolveAgentJob(workspace, input);
+  const job = await refreshManagedAgentJob(workspace, await resolveAgentJob(workspace, input));
   let watchdog: AgentWatchdogResult;
   try {
-    const runtime = await loadGroundcrewRuntime();
-    const config = await runtime.loadConfig();
-    watchdog = await evaluateAgentWatchdog({
-      workspace,
-      runtime,
-      config,
-      job,
-      enforce: input.enforceTimeouts === true
-    });
+    if (job.agentDeck?.sessionId) {
+      watchdog = await evaluateAgentDeckWatchdog(workspace, job, input.enforceTimeouts === true);
+    } else {
+      const runtime = await loadGroundcrewRuntime();
+      const config = await runtime.loadConfig();
+      watchdog = await evaluateAgentWatchdog({
+        workspace,
+        runtime,
+        config,
+        job,
+        enforce: input.enforceTimeouts === true
+      });
+    }
   } catch (error) {
     watchdog = {
       job,
@@ -429,6 +575,7 @@ export async function agentStatus(workspace: Workspace, input: AgentStatusInput)
     : shouldRefreshTerminalMetadata(watchdog.job)
       ? await refreshTerminalMetadataBestEffort(workspace, watchdog.job)
       : watchdog.job;
+  if (terminalJob.state === "completed") await promoteReadyAgentJobs(workspace);
   const structured = {
     ...jobStructured(terminalJob, watchdog),
     recovery_status: recovery.classification,
@@ -440,18 +587,22 @@ export async function agentStatus(workspace: Workspace, input: AgentStatusInput)
 }
 
 export async function agentWatchdog(workspace: Workspace, input: AgentStatusInput): Promise<{ text: string; structured: Record<string, unknown> }> {
-  const job = await resolveAgentJob(workspace, input);
+  const job = await refreshManagedAgentJob(workspace, await resolveAgentJob(workspace, input));
   let watchdog: AgentWatchdogResult;
   try {
-    const runtime = await loadGroundcrewRuntime();
-    const config = await runtime.loadConfig();
-    watchdog = await evaluateAgentWatchdog({
-      workspace,
-      runtime,
-      config,
-      job,
-      enforce: input.enforceTimeouts !== false
-    });
+    if (job.agentDeck?.sessionId) {
+      watchdog = await evaluateAgentDeckWatchdog(workspace, job, input.enforceTimeouts !== false);
+    } else {
+      const runtime = await loadGroundcrewRuntime();
+      const config = await runtime.loadConfig();
+      watchdog = await evaluateAgentWatchdog({
+        workspace,
+        runtime,
+        config,
+        job,
+        enforce: input.enforceTimeouts !== false
+      });
+    }
   } catch (error) {
     watchdog = {
       job,
@@ -461,13 +612,14 @@ export async function agentWatchdog(workspace: Workspace, input: AgentStatusInpu
       warnings: [error instanceof Error ? error.message : String(error)]
     };
   }
+  if (watchdog.job.state === "completed") await promoteReadyAgentJobs(workspace);
   const structured = jobStructured(watchdog.job, watchdog);
   const text = ["# Agent Watchdog", "", `Job: ${watchdog.job.jobId}`, `Task: ${watchdog.job.taskId}`, `State: ${watchdog.job.state}`, `Timed out: ${watchdog.timedOut}`, `Timeout reason: ${watchdog.timeoutReason ?? "none"}`, `Interrupted: ${watchdog.interrupted}`, watchdog.warnings.length ? `Warnings: ${watchdog.warnings.join("; ")}` : undefined, "", textBlock("Watchdog", structured)].filter((part): part is string => typeof part === "string").join("\n");
   return { text, structured };
 }
 
 export async function agentTail(workspace: Workspace, input: AgentStatusInput & { lines?: number }): Promise<{ text: string; structured: Record<string, unknown> }> {
-  let job = await resolveAgentJob(workspace, input);
+  let job = await refreshManagedAgentJob(workspace, await resolveAgentJob(workspace, input));
   if (shouldRefreshTerminalMetadata(job)) {
     job = await refreshTerminalMetadataBestEffort(workspace, job);
   }
@@ -513,7 +665,7 @@ export async function agentTail(workspace: Workspace, input: AgentStatusInput & 
 }
 
 export async function agentResult(workspace: Workspace, input: AgentStatusInput & { includeDiff?: boolean; includeTail?: boolean; diffMaxChars?: number; tailLines?: number }): Promise<{ text: string; structured: Record<string, unknown> }> {
-  let job = await resolveAgentJob(workspace, input);
+  let job = await refreshManagedAgentJob(workspace, await resolveAgentJob(workspace, input));
   if (shouldRefreshTerminalMetadata(job)) {
     job = await refreshTerminalMetadataBestEffort(workspace, job);
   }
@@ -558,13 +710,25 @@ export async function agentResult(workspace: Workspace, input: AgentStatusInput 
 
 export async function agentCancel(workspace: Workspace, input: AgentCancelInput): Promise<{ text: string; structured: Record<string, unknown> }> {
   const job = await resolveAgentJob(workspace, input);
-  const runtime = await loadGroundcrewRuntime();
-  const config = await runtime.loadConfig();
-  await runtime.interruptWorkspace(config, {
-    task: job.taskId,
-    ...(input.reason === undefined ? {} : { reason: input.reason })
-  });
-  const refreshed = await refreshJobFromGroundcrew({ workspace, runtime, config, job });
+  let refreshed: AgentJobRecord;
+  if (job.agentDeck?.sessionId) {
+    const local = await loadEffectiveLocalAgentConfig(workspace);
+    refreshed = await stopAgentDeckSession(
+      workspace,
+      job,
+      local.config.sessionManager,
+      "cancelled",
+      input.reason ?? "Cancelled through Least."
+    );
+  } else {
+    const runtime = await loadGroundcrewRuntime();
+    const config = await runtime.loadConfig();
+    await runtime.interruptWorkspace(config, {
+      task: job.taskId,
+      ...(input.reason === undefined ? {} : { reason: input.reason })
+    });
+    refreshed = await refreshJobFromGroundcrew({ workspace, runtime, config, job });
+  }
   const structured = {
     ...jobStructured(refreshed),
     worktree_preserved: true,
@@ -647,16 +811,18 @@ export async function agentAttachHint(workspace: Workspace, input: AgentStatusIn
 }
 
 export function agentInputFromArgs(args: Record<string, unknown>, workspace: Workspace): AgentStartInput {
+  const defaultRepository = path.basename(workspace.root) || workspace.id || "workspace";
   return {
     workspaceId: workspace.id,
     workspaceRoot: workspace.root,
     agent: typeof args.agent === "string" ? args.agent : undefined,
-    repository: coerceString(args.repository ?? args.repo, ""),
+    repository: coerceString(args.repository ?? args.repo, defaultRepository),
     title: coerceString(args.title, "Local agent task"),
     prompt: coerceString(args.prompt, ""),
     mode: typeof args.mode === "string" ? args.mode : undefined,
     taskId: typeof args.task_id === "string" ? args.task_id : undefined,
     idempotencyKey: typeof args.idempotency_key === "string" ? args.idempotency_key : undefined,
+    dependsOn: stringList(args.depends_on),
     waitForLaunch: args.wait_for_launch === true,
     startupWaitMs: normalizeAgentStartupWaitMs(args.startup_wait_ms),
     timeoutMs: normalizeAgentTimeoutMs(args.timeout_ms),

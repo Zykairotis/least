@@ -7,10 +7,20 @@ interface ConnectionsPanelProps {
 export function ConnectionsPanel({ connections }: ConnectionsPanelProps) {
   return (
     <div>
-      <h2 className="section-title">Connections ({connections.length})</h2>
-      {connections.length === 0 && <div className="empty-state">No active connections</div>}
+      <div className="page-header">
+        <div>
+          <div className="page-title">Connections</div>
+          <div className="page-subtitle">{connections.length} active MCP / API sessions</div>
+        </div>
+      </div>
+      {connections.length === 0 && (
+        <div className="empty-state">
+          <strong>No active connections</strong>
+          Sessions appear when ChatGPT, Grok, OpenAI, or other clients attach.
+        </div>
+      )}
       {connections.length > 0 && (
-        <div style={{ overflowX: "auto" }}>
+        <div className="table-shell" style={{ overflowX: "auto" }}>
           <table className="data-table">
             <thead>
               <tr>

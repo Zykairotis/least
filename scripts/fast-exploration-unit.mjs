@@ -14,6 +14,7 @@ import { workspaceSummary } from "../dist/workspaceOps.js";
 import { queryJsonFiles, resolveJsonPointer } from "../dist/jsonQueryOps.js";
 import { runBash } from "../dist/bashOps.js";
 import { createLeastServer } from "../dist/server.js";
+import { clearDashboardEvents, getRecentDashboardEvents } from "../dist/dashboardEvents.js";
 
 async function makeRepo() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "least-fast-explore-"));
@@ -154,6 +155,25 @@ const batch = await registry.invoke("batch", {
 assert.equal(batch.isError, false, "batch should succeed for read-only tools");
 assert.ok(batch.content.includes("# Batch"), "batch should return batch output");
 
+
+const structuredBatch = await registry.invoke("batch", {
+  calls: [
+    { tool: "local_http_request", args: { method: "GET", url: "http://localhost:1/__least_batch_probe__" } },
+    { tool: "local_http_json", args: { method: "GET", url: "http://localhost:1/__least_batch_probe__" } },
+    { tool: "api_smoke_suite", args: { baseUrl: "http://localhost:1", checks: [{ method: "GET", path: "/__least_batch_probe__" }] } },
+    { tool: "docker_compose_services", args: { composeDir: "." } },
+    { tool: "docker_compose_ps", args: { composeDir: "." } },
+    { tool: "docker_compose_logs", args: { composeDir: ".", service: "__least_missing_service__" } },
+    { tool: "docker_compose_health", args: { composeDir: "." } }
+  ],
+  max_parallel: 1
+});
+assert.equal(structuredBatch.isError, false, "batch wrapper should complete for safe structured read-only tools");
+for (const tool of ["local_http_request", "local_http_json", "api_smoke_suite", "docker_compose_services", "docker_compose_ps", "docker_compose_logs", "docker_compose_health"]) {
+  assert.ok(structuredBatch.content.includes("## ") && structuredBatch.content.includes(tool), "batch should include structured tool " + tool);
+  assert.ok(!structuredBatch.content.includes("Tool " + tool + " is not allowed in batch"), "batch should allow structured tool " + tool);
+}
+
 const perf = await registry.invoke("least_perf", { window: "session" });
 assert.equal(perf.isError, false, "least_perf should succeed");
 assert.ok(perf.content.includes("Least Performance"), "least_perf should include telemetry heading");
@@ -192,6 +212,16 @@ const multiEdit = await registry.invoke("multi_edit", {
 });
 assert.equal(multiEdit.isError, false, "multi_edit should succeed");
 assert.ok(multiEdit.content.includes("Multi Edit"), "multi_edit should render");
+
+clearDashboardEvents();
+const failedEdit = await registry.invoke("multi_edit", {
+  edits: [{ path: "src/scratch.ts", old_text: "missing text", new_text: "x" }]
+});
+assert.equal(failedEdit.isError, true);
+const lifecycle = getRecentDashboardEvents().filter((event) => event.toolName === "multi_edit");
+assert.equal(lifecycle.filter((event) => event.kind === "tool:start").length, 1, "failed call should emit one start");
+assert.equal(lifecycle.filter((event) => event.kind === "tool:error").length, 1, "failed call should emit one terminal error");
+assert.equal(lifecycle.filter((event) => event.kind === "tool:end").length, 0, "failed call should not emit success end");
 
 const patchApply = await registry.invoke("apply_patch", {
   patch: `*** Begin Patch

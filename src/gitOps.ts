@@ -57,7 +57,8 @@ export async function gitStatus(
     args.push("--", resolved.relPath);
   }
   const value = await runGit(workspace, args, config.maxOutputBytes);
-  setCachedGitValue(workspace.id, cacheKey, value, 1_500);
+  // Longer than typical model reasoning pauses so related status/diff calls hit cache.
+  setCachedGitValue(workspace.id, cacheKey, value, 10_000);
   return value;
 }
 
@@ -78,8 +79,29 @@ export async function gitDiff(config: LeastConfig, guard: PathGuard, workspace: 
     args.push("--", resolved.relPath);
   }
   const value = await runGit(workspace, args, config.maxOutputBytes);
-  setCachedGitValue(workspace.id, cacheKey, value, 1_500);
+  setCachedGitValue(workspace.id, cacheKey, value, 10_000);
   return value;
+}
+// ponytail: a single shared grep helper is enough; if we need regex/word flags, add opts then.
+export async function gitGrepList(
+  workspace: Workspace,
+  pattern: string,
+  maxOutputBytes: number,
+  options: { word?: boolean; filesOnly?: boolean; pathspec?: string } = {}
+): Promise<string> {
+  const args = ["grep", "--color=never", "-n"];
+  if (options.filesOnly) args.push("-l");
+  if (options.word) args.push("-w");
+  args.push("--", pattern);
+  if (options.pathspec) args.push(options.pathspec);
+  try {
+    const result = await runCappedProcess({ command: "git", args, cwd: workspace.root, maxOutputBytes, backend: "git", allowNonZeroExit: true });
+    if (result.code === 1 && !result.stdout.trim() && !result.stderr.trim()) return "";
+    if (result.code !== 0 && !result.timedOut) return result.stderr.trim() || result.stdout.trim() || `git exited with status ${result.code}`;
+    return redactSensitiveText(result.stdout.trim());
+  } catch (error) {
+    return `git unavailable or failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 export async function gitLog(config: LeastConfig, workspace: Workspace, maxCount = 8): Promise<string> {

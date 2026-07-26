@@ -75,6 +75,21 @@ export const ToolSettingsSchema = z.object({
 });
 export type ToolSettings = z.infer<typeof ToolSettingsSchema>;
 
+export const WorkflowSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  allowed: z.array(z.string()).optional(),
+  defaultDryRun: z.boolean().optional(),
+  maxStepsDefault: z.number().int().min(1).max(50).optional(),
+  maxStepsHardLimit: z.number().int().min(1).max(200).optional(),
+  requireConfirmationForBulk: z.boolean().optional(),
+  stateDir: z.string().optional(),
+  localMcpAllowlist: z.record(z.object({
+    enabled: z.boolean().optional(),
+    tools: z.array(z.string()).optional(),
+  })).optional(),
+});
+export type WorkflowSettings = z.infer<typeof WorkflowSettingsSchema>;
+
 // ── Output settings ──────────────────────────────────────────────
 
 export const OutputSettingsSchema = z.object({
@@ -83,6 +98,39 @@ export const OutputSettingsSchema = z.object({
   storeTtlMs: z.number().int().min(60_000).max(7 * 86_400_000).optional(),
 });
 export type OutputSettings = z.infer<typeof OutputSettingsSchema>;
+
+// ── Local HTTP tools ─────────────────────────────────────────────
+
+export const HttpSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  allowedHosts: z.array(z.string()).optional(),
+  allowedPorts: z.array(z.number().int().min(1).max(65535)).optional(),
+  allowExternal: z.boolean().optional(),
+  maxBodyBytes: z.number().int().min(1_000).max(20_000_000).optional(),
+  defaultTimeoutMs: z.number().int().min(100).max(600_000).optional(),
+  allowRedirects: z.boolean().optional(),
+});
+export type HttpSettings = z.infer<typeof HttpSettingsSchema>;
+
+// ── Docker Compose tools ─────────────────────────────────────────
+
+export const DockerComposeSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  defaultComposeDir: z.string().optional(),
+  maxLogTail: z.number().int().min(1).max(50_000).optional(),
+  allowRestart: z.boolean().optional(),
+  allowUpDown: z.boolean().optional(),
+});
+export type DockerComposeSettings = z.infer<typeof DockerComposeSettingsSchema>;
+
+// ── Package script / test tools ──────────────────────────────────
+
+export const PackageScriptSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  allowedManagers: z.array(z.enum(["pnpm", "npm", "yarn"])).optional(),
+  defaultTimeoutMs: z.number().int().min(1_000).max(3_600_000).optional(),
+});
+export type PackageScriptSettings = z.infer<typeof PackageScriptSettingsSchema>;
 
 // ── Top-level settings shape ─────────────────────────────────────
 
@@ -93,6 +141,10 @@ export const LeastSettingsSchema = z.object({
   hooks: HookSettingsSchema.optional(),
   paths: PathSettingsSchema.optional(),
   tools: ToolSettingsSchema.optional(),
+  workflows: WorkflowSettingsSchema.optional(),
   output: OutputSettingsSchema.optional(),
+  http: HttpSettingsSchema.optional(),
+  dockerCompose: DockerComposeSettingsSchema.optional(),
+  packageScripts: PackageScriptSettingsSchema.optional(),
 });
 export type LeastSettings = z.infer<typeof LeastSettingsSchema>;

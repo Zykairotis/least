@@ -80,6 +80,7 @@ export async function createAgentJob(input: {
   timeoutMs: number;
   idleTimeoutMs: number;
   idempotencyKey?: string;
+  dependsOn?: string[];
 }): Promise<AgentJobRecord> {
   const jobId = makeAgentJobId(input.taskId);
   const promptFile = agentPromptPath(input.workspace, jobId);
@@ -98,6 +99,7 @@ export async function createAgentJob(input: {
     title: input.title,
     promptFile,
     state: "accepted",
+    dependsOn: input.dependsOn,
     idempotencyKey: input.idempotencyKey,
     requestHash: makeAgentRequestHash({
       agent: input.agent,

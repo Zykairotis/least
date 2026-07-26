@@ -10,6 +10,9 @@ import { redactSensitiveText } from "./redact.js";
 export interface BashResult {
   command: string;
   cwd: string;
+  used: ShellBackend;
+  hostPlatform: string;
+  backendNote?: string;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   durationMs: number;
@@ -218,6 +221,33 @@ const BASH_READ_ONLY_PREFIXES = [
   "git ls-files"
 ];
 
+/**
+ * Soft guidance when a raw bash command looks like a structured-tool candidate.
+ * Does not block execution — helps models prefer local_http_json / docker_compose_* / run_vitest.
+ */
+export function structuredToolSuggestion(command: string): string | undefined {
+  const normalized = compact(command).toLowerCase();
+  if (/^(curl|wget)\b/.test(normalized)) {
+    return "This command could be expressed as local_http_json (or local_http_request / api_smoke_suite) and may be more reliable through structured tools.";
+  }
+  if (/^docker\s+compose\s+(ps|logs|config)\b/.test(normalized) || /^docker-compose\s+(ps|logs|config)\b/.test(normalized)) {
+    if (/\blogs\b/.test(normalized)) {
+      return "This command could be expressed as docker_compose_logs and may be more reliable through structured tools.";
+    }
+    if (/\bps\b/.test(normalized)) {
+      return "This command could be expressed as docker_compose_ps or docker_compose_health and may be more reliable through structured tools.";
+    }
+    return "This command could be expressed as docker_compose_services / docker_compose_ps and may be more reliable through structured tools.";
+  }
+  if (/\bvitest\b/.test(normalized) || /(?:pnpm|npm|yarn)\b.*\btest\b/.test(normalized)) {
+    if (/\bvitest\b/.test(normalized)) {
+      return "This command could be expressed as run_vitest and may be more reliable through structured tools.";
+    }
+    return "This command could be expressed as run_package_script or run_vitest and may be more reliable through structured tools.";
+  }
+  return undefined;
+}
+
 /** Whether bash requires workspace mutation lock under lease concurrency mode. */
 export function bashRequiresMutationLock(config: LeastConfig, command: string): boolean {
   if (config.bashMode === "off") return false;
@@ -346,6 +376,21 @@ async function shellSpec(config: LeastConfig, cwd?: string): Promise<{ command: 
   }
 }
 
+function resolvedShellBackend(config: LeastConfig): ShellBackend {
+  return config.shellBackend === "auto" ? (process.platform === "win32" ? "cmd" : "bash") : config.shellBackend;
+}
+
+function shellBackendNote(backend: ShellBackend): string | undefined {
+  if (process.platform !== "win32") return undefined;
+  if (backend === "bash") {
+    return "Windows host with bash backend: commands run through whichever bash is on PATH and may use POSIX/WSL semantics instead of native Windows paths.";
+  }
+  if (backend === "wsl") {
+    return "Windows host with explicit WSL backend: commands run inside WSL/Linux semantics.";
+  }
+  return undefined;
+}
+
 function trimOutput(value: string, maxBytes: number): { value: string; truncated: boolean } {
   const buffer = Buffer.from(value, "utf8");
   if (buffer.byteLength <= maxBytes) return { value, truncated: false };
@@ -366,6 +411,8 @@ export async function runBash(
   const cwd = cwdResolved.absPath;
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs ?? 30_000, 180_000));
   const start = Date.now();
+  const used = resolvedShellBackend(config);
+  const backendNote = shellBackendNote(used);
 
   return new Promise((resolve, reject) => {
     void (async () => {
@@ -409,6 +456,9 @@ export async function runBash(
       resolve({
         command,
         cwd: path.relative(workspace.root, cwd) || ".",
+        used,
+        hostPlatform: process.platform,
+        backendNote,
         exitCode,
         signal,
         durationMs: Date.now() - start,

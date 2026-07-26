@@ -87,17 +87,35 @@ export function setCachedGitValue(workspaceId: string, key: string, value: strin
   return entry;
 }
 
-export function invalidateWorkspaceCaches(workspaceId?: string): void {
+export type WorkspaceCacheInvalidationScope = {
+  /** Clear file-list / glob listing cache. Default: true when workspaceId omitted; else caller chooses. */
+  fileList?: boolean;
+  /** Clear git status/diff/log cache. Default: true. */
+  git?: boolean;
+};
+
+/**
+ * Invalidate workspace caches.
+ * Prefer granular scopes: content-only edits keep file-list cache warm.
+ */
+export function invalidateWorkspaceCaches(workspaceId?: string, scope: WorkspaceCacheInvalidationScope = {}): void {
+  const clearFileList = scope.fileList !== false;
+  const clearGit = scope.git !== false;
+
   if (!workspaceId) {
-    fileListCache.clear();
-    gitCache.clear();
+    if (clearFileList) fileListCache.clear();
+    if (clearGit) gitCache.clear();
     return;
   }
-  for (const key of [...fileListCache.keys()]) {
-    if (key.startsWith(`${workspaceId}:`)) fileListCache.delete(key);
+  if (clearFileList) {
+    for (const key of [...fileListCache.keys()]) {
+      if (key.startsWith(`${workspaceId}:`)) fileListCache.delete(key);
+    }
   }
-  for (const key of [...gitCache.keys()]) {
-    if (key.startsWith(`${workspaceId}:`)) gitCache.delete(key);
+  if (clearGit) {
+    for (const key of [...gitCache.keys()]) {
+      if (key.startsWith(`${workspaceId}:`)) gitCache.delete(key);
+    }
   }
 }
 

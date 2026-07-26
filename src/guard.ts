@@ -6,6 +6,7 @@ import path from "node:path";
 import { minimatch } from "minimatch";
 import type { LeastConfig } from "./config.js";
 import { expandHome } from "./config.js";
+import { getCachedFileSnapshot } from "./fileSnapshotCache.js";
 
 export interface Workspace {
   id: string;
@@ -149,6 +150,14 @@ export class PathGuard {
     }
 
     if (options.forWrite) {
+      try {
+        if (fs.lstatSync(absPath).isSymbolicLink()) {
+          throw new LeastError(`Refusing to write through a symbolic link: ${inputPath}`);
+        }
+      } catch (error) {
+        if (error instanceof LeastError) throw error;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
       const parent = closestExistingParent(path.dirname(absPath));
       const realParent = maybeRealpath(parent);
       if (realParent && !isSubpath(realParent, workspace.root)) {
@@ -184,7 +193,7 @@ export class PathGuard {
     if (stat.size > maxBytes) {
       throw new LeastError(`File is too large (${stat.size} bytes). Limit: ${maxBytes} bytes.`);
     }
-    await this.assertReadableTextFileSample(absPath, stat);
+    if (!getCachedFileSnapshot(absPath, stat)) await this.assertReadableTextFileSample(absPath, stat);
     return stat;
   }
 

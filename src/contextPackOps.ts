@@ -1,4 +1,5 @@
 import path from "node:path";
+import fsp from "node:fs/promises";
 import type { LeastConfig } from "./config.js";
 import { readManyTextFiles } from "./fsOps.js";
 import type { Workspace } from "./guard.js";
@@ -16,6 +17,14 @@ import {
 } from "./contextRanker.js";
 import { buildProjectMap, importNeighborPaths } from "./projectMapOps.js";
 import { memoryPathsForContext, searchProjectMemory } from "./projectMemory.js";
+
+const resultCache = new Map<string, { createdAt: number; value: ContextPackResult }>();
+const RESULT_CACHE_TTL_MS = 5_000;
+
+export function invalidateContextPack(workspaceId?: string): void {
+  if (!workspaceId) return resultCache.clear();
+  for (const key of resultCache.keys()) if (key.startsWith(`${workspaceId}:`)) resultCache.delete(key);
+}
 
 export interface ContextPackSnippet {
   path: string;
@@ -63,6 +72,8 @@ export interface ContextPackOptions {
   maxTokensEstimate?: number;
   includeGitStatus?: boolean;
   includePackageContext?: boolean;
+  /** Force import-neighbor project map. Default: only when query/paths signal need it. */
+  includeImportNeighbors?: boolean;
   signal?: AbortSignal;
 }
 
@@ -96,6 +107,30 @@ function branchFromStatus(status: string | undefined): string | undefined {
   return line.replace("##", "").trim();
 }
 
+/**
+ * Build import neighbors only when the request signals they help ranking.
+ * Cold project-map can parse up to 1,000 files — skip for broad listing-only packs.
+ */
+function shouldBuildImportNeighbors(options: ContextPackOptions, seedPaths: string[]): boolean {
+  if (options.includeImportNeighbors === false) return false;
+  if (options.includeImportNeighbors === true) return seedPaths.length > 0;
+  if (seedPaths.length === 0) return false;
+  const profile = options.profile ?? "edit";
+  // Explore/review packs usually need files + git, not a full import graph rebuild.
+  if (profile === "explore" || profile === "review") {
+    const query = (options.query ?? "").toLowerCase();
+    const task = options.task.toLowerCase();
+    return /\b(import|exports?|module|symbol|callers?|callees?|dependency|dependencies|refactor)\b/.test(`${query} ${task}`);
+  }
+  const query = (options.query ?? "").toLowerCase();
+  const task = options.task.toLowerCase();
+  const importSignal =
+    Boolean(options.query) ||
+    Boolean(options.paths?.length) ||
+    /\b(import|exports?|module|symbol|callers?|callees?|dependency|dependencies|refactor)\b/.test(`${query} ${task}`);
+  return importSignal || profile === "edit" || profile === "debug";
+}
+
 export async function contextPack(
   config: LeastConfig,
   guard: PathGuard,
@@ -109,18 +144,51 @@ export async function contextPack(
   const skipped: Array<{ path: string; reason: string }> = [];
 
   for (const relPath of options.paths ?? []) candidateFiles.push(relPath);
-  for (const glob of options.globs ?? []) {
-    const files = await listWorkspaceFiles(config, guard, workspace, { glob, maxResults: options.maxFiles, trackedOnly: false, includeHidden: false });
-    candidateFiles.push(...files.files);
-  }
-  if (options.query) {
-    const search = await searchWorkspaceContext(config, guard, workspace, {
-      query: options.query,
-      maxResults: options.maxSnippets,
-      beforeLines: 3,
-      afterLines: 6,
-      signal: options.signal
-    });
+
+  // Run independent discovery work concurrently: globs, query search, git, memory, optional package.
+  const globPromise = Promise.all(
+    (options.globs ?? []).map(async (glob) => {
+      const files = await listWorkspaceFiles(config, guard, workspace, {
+        glob,
+        maxResults: options.maxFiles,
+        trackedOnly: false,
+        includeHidden: false
+      });
+      return files.files;
+    })
+  );
+
+  const searchPromise = options.query
+    ? searchWorkspaceContext(config, guard, workspace, {
+        query: options.query,
+        maxResults: options.maxSnippets,
+        beforeLines: 3,
+        afterLines: 6,
+        signal: options.signal
+      })
+    : Promise.resolve(undefined);
+
+  const gitPromise = options.includeGitStatus ? gitStatus(config, workspace) : Promise.resolve(undefined);
+  const memoryPathsPromise = memoryPathsForContext(config, workspace, options.task);
+  const memoryRecordsPromise = config.projectMemory
+    ? searchProjectMemory(workspace, options.task, { maxResults: 6 })
+    : Promise.resolve([]);
+  const packagePromise = options.includePackageContext
+    ? queryJsonFiles(config, guard, workspace, { path: "package.json", pointer: "/", maxResults: 1 }).catch(() => undefined)
+    : Promise.resolve(undefined);
+
+  const [globResults, search, gitStatusText, memoryPaths, memoryRecords, packageResult] = await Promise.all([
+    globPromise,
+    searchPromise,
+    gitPromise,
+    memoryPathsPromise,
+    memoryRecordsPromise,
+    packagePromise
+  ]);
+
+  for (const files of globResults) candidateFiles.push(...files);
+
+  if (search) {
     for (const match of search.matches.slice(0, options.maxSnippets)) {
       const { startLine, endLine } = linesFromContext(match.context);
       snippets.push({
@@ -135,21 +203,36 @@ export async function contextPack(
   }
 
   if (candidateFiles.length < options.maxFiles) {
-    const listed = await listWorkspaceFiles(config, guard, workspace, { maxResults: Math.max(options.maxFiles * 3, 40), trackedOnly: false, includeHidden: false });
+    const listed = await listWorkspaceFiles(config, guard, workspace, {
+      maxResults: Math.max(options.maxFiles * 3, 40),
+      trackedOnly: false,
+      includeHidden: false
+    });
     candidateFiles.push(...listed.files);
   }
 
-  const gitStatusText = options.includeGitStatus ? await gitStatus(config, workspace) : undefined;
   const changedFiles = gitStatusText ? parseGitStatusEntries(gitStatusText).map((entry) => entry.path) : [];
-  const memoryPaths = await memoryPathsForContext(config, workspace, options.task);
-  const memoryRecords = config.projectMemory ? await searchProjectMemory(workspace, options.task, { maxResults: 6 }) : [];
+  const candidateState = await Promise.all(unique(candidateFiles).map(async (relPath) => {
+    try {
+      const stat = await fsp.stat(guard.resolve(workspace, relPath).absPath, { bigint: true });
+      return `${relPath}:${stat.size}:${stat.mtimeNs}`;
+    } catch {
+      return `${relPath}:missing`;
+    }
+  }));
+  const stateKey = `${workspace.id}:${JSON.stringify({ options: { ...options, signal: undefined }, candidateState, gitStatusText })}`;
+  const cached = resultCache.get(stateKey);
+  if (cached && Date.now() - cached.createdAt < RESULT_CACHE_TTL_MS) return cached.value;
+  const seedForImports = unique([...candidateFiles, ...changedFiles]).slice(0, 12);
 
   let importNeighbors: string[] = [];
-  try {
-    const projectMap = await buildProjectMap(config, guard, workspace, { includeImports: true, includeTests: false });
-    importNeighbors = importNeighborPaths(projectMap.symbols, unique(candidateFiles).slice(0, 12));
-  } catch {
-    importNeighbors = [];
+  if (shouldBuildImportNeighbors(options, seedForImports)) {
+    try {
+      const projectMap = await buildProjectMap(config, guard, workspace, { includeImports: true, includeTests: false });
+      importNeighbors = importNeighborPaths(projectMap.symbols, seedForImports);
+    } catch {
+      importNeighbors = [];
+    }
   }
 
   const ranked = rankContextFiles({
@@ -163,7 +246,10 @@ export async function contextPack(
   });
   const uniqueCandidates = ranked.slice(0, options.maxFiles).map((item) => item.path);
 
-  const filesToRead = uniqueCandidates.filter((file) => !snippets.some((snippet) => snippet.path === file)).map((file) => ({ path: file }));
+  // Reuse search snippets instead of re-reading matched files.
+  const filesToRead = uniqueCandidates
+    .filter((file) => !snippets.some((snippet) => snippet.path === file))
+    .map((file) => ({ path: file }));
   const read = filesToRead.length
     ? await readManyTextFiles(config, guard, workspace, filesToRead, {
         maxTotalBytes: maxBytes,
@@ -191,8 +277,8 @@ export async function contextPack(
   const missing = uniqueCandidates.filter((candidate) => !snippets.some((snippet) => snippet.path === candidate));
   for (const file of missing) skipped.push({ path: file, reason: "excluded by byte budget or read truncation" });
 
-  let packageContext: Record<string, unknown> | undefined;
-  if (options.includePackageContext) {
+  let packageContext = summarizePackageContext(packageResult?.hits[0]);
+  if (options.includePackageContext && !packageContext) {
     const packageJsonPath = uniqueCandidates.find((file) => path.basename(file) === "package.json") ?? "package.json";
     const pkg = await queryJsonFiles(config, guard, workspace, { path: packageJsonPath, pointer: "/", maxResults: 1 });
     packageContext = summarizePackageContext(pkg.hits[0]);
@@ -245,7 +331,7 @@ export async function contextPack(
     skipped.length ? `\n## Skipped\n\n${skipped.map((item) => `- ${item.path}: ${item.reason}`).join("\n")}` : ""
   ];
 
-  return {
+  const result: ContextPackResult = {
     text: textParts.join("\n"),
     summary: summaryParts.join(" "),
     task: options.task,
@@ -264,4 +350,7 @@ export async function contextPack(
     suggestedNextCalls: nextCalls,
     truncated: Boolean(read.truncated) || snippets.length > options.maxSnippets
   };
+  resultCache.set(stateKey, { createdAt: Date.now(), value: result });
+  if (resultCache.size > 32) resultCache.delete(resultCache.keys().next().value!);
+  return result;
 }

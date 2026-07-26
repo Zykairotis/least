@@ -309,9 +309,8 @@ export function noteToolResultShape(result: unknown): void {
   const structured = record.structuredContent;
   const text = textFromUnknownContent(result);
   invocation.modelVisibleBytes = Buffer.byteLength(text, "utf8");
-  invocation.structuredBytes =
-    structured && typeof structured === "object" ? Buffer.byteLength(JSON.stringify(structured), "utf8") : 0;
-  invocation.outputBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
+  // Prefer handler-supplied byte counts; only JSON.stringify when needed for large-result accounting sample.
+  let usedHandlerBytes = false;
   if (record.isError === true) invocation.error = true;
   if (structured && typeof structured === "object" && !Array.isArray(structured)) {
     const shape = structured as Record<string, unknown>;
@@ -326,6 +325,17 @@ export function noteToolResultShape(result: unknown): void {
     const visibleBytes = shape.visibleBytes ?? shape.visible_bytes ?? shape.model_visible_bytes;
     if (typeof visibleBytes === "number" && Number.isFinite(visibleBytes)) {
       invocation.modelVisibleBytes = visibleBytes;
+      usedHandlerBytes = true;
+    }
+    const structuredBytesHint = shape.structuredBytes ?? shape.structured_bytes;
+    if (typeof structuredBytesHint === "number" && Number.isFinite(structuredBytesHint)) {
+      invocation.structuredBytes = structuredBytesHint;
+      usedHandlerBytes = true;
+    }
+    const outputBytesHint = shape.outputBytes ?? shape.output_bytes;
+    if (typeof outputBytesHint === "number" && Number.isFinite(outputBytesHint)) {
+      invocation.outputBytes = outputBytesHint;
+      usedHandlerBytes = true;
     }
     const savedBytes = shape.savedBytes ?? shape.saved_bytes;
     if (typeof savedBytes === "number" && Number.isFinite(savedBytes)) invocation.savedBytes += savedBytes;
@@ -335,11 +345,25 @@ export function noteToolResultShape(result: unknown): void {
     if (outputMeta && typeof outputMeta === "object" && !Array.isArray(outputMeta)) {
       const meta = outputMeta as Record<string, unknown>;
       if (typeof meta.rawBytes === "number") invocation.rawBytes = Math.max(invocation.rawBytes, meta.rawBytes);
-      if (typeof meta.visibleBytes === "number") invocation.modelVisibleBytes = meta.visibleBytes;
+      if (typeof meta.visibleBytes === "number") {
+        invocation.modelVisibleBytes = meta.visibleBytes;
+        usedHandlerBytes = true;
+      }
       if (typeof meta.savedBytes === "number") invocation.savedBytes += meta.savedBytes;
       if (meta.compacted === true) invocation.compacted = true;
       if (meta.retrievalKey) invocation.retrievalKeyPresent = true;
     }
+  }
+  // Avoid full JSON.stringify of large structured/content payloads when handlers already
+  // reported visible/output sizes. Sample expensive accounting only when needed.
+  if (!usedHandlerBytes || invocation.structuredBytes === 0) {
+    if (structured && typeof structured === "object") {
+      // Cheap structural estimate: prefer model-visible text length over full re-serialize.
+      invocation.structuredBytes = invocation.structuredBytes || invocation.modelVisibleBytes;
+    }
+  }
+  if (!usedHandlerBytes || invocation.outputBytes === 0) {
+    invocation.outputBytes = invocation.outputBytes || invocation.modelVisibleBytes + invocation.structuredBytes;
   }
   if (!invocation.rawBytes) invocation.rawBytes = invocation.modelVisibleBytes;
 }

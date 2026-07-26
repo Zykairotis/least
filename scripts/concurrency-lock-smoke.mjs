@@ -143,22 +143,33 @@ try {
     const sha = readA.structured.sha256;
     if (!sha) throw new Error("read did not return sha256");
 
+    // Auto-acquire: first mutator claims the lease without explicit acquire_workspace_lock.
+    const writeA = await callTool(clientA.client, "write", {
+      path: testFile,
+      content: "version-2\n",
+      expected_sha256: sha
+    });
+    if (writeA.isError) {
+      throw new Error(`session A auto-acquire write failed: ${writeA.text}`);
+    }
+
     const deniedWrite = await callTool(clientB.client, "write", {
       path: testFile,
       content: "blocked\n"
     });
     if (!deniedWrite.isError || deniedWrite.structured.error !== "workspace_locked") {
-      throw new Error(`expected workspace_locked on write without lock, got ${JSON.stringify(deniedWrite.structured)}`);
+      throw new Error(`expected workspace_locked on write while other session owns lease, got ${JSON.stringify(deniedWrite.structured)}`);
     }
 
     const readAllowed = await callTool(clientB.client, "read", { path: testFile });
-    if (!readAllowed.text.includes("version-1")) {
+    if (!readAllowed.text.includes("version-2")) {
       throw new Error("session B read should succeed while locked");
     }
 
+    // Explicit acquire is still available for lease_token / pre-claim; A already owns via auto-acquire.
     const acquireA = await callTool(clientA.client, "acquire_workspace_lock", { client_label: "chatgpt" });
     if (acquireA.isError || !acquireA.structured.acquired) {
-      throw new Error(`session A failed to acquire lock: ${JSON.stringify(acquireA.structured)}`);
+      throw new Error(`session A failed to re-acquire own lock: ${JSON.stringify(acquireA.structured)}`);
     }
     const leaseToken = acquireA.structured.lease_token;
     if (typeof leaseToken !== "string" || !leaseToken) {
@@ -168,15 +179,6 @@ try {
     const deniedB = await callTool(clientB.client, "acquire_workspace_lock", { client_label: "grok" });
     if (!deniedB.isError || !deniedB.structured.locked_by_other) {
       throw new Error(`session B should be denied lock acquisition: ${JSON.stringify(deniedB.structured)}`);
-    }
-
-    const writeA = await callTool(clientA.client, "write", {
-      path: testFile,
-      content: "version-2\n",
-      expected_sha256: sha
-    });
-    if (writeA.isError) {
-      throw new Error(`session A write failed: ${writeA.text}`);
     }
 
     const staleWrite = await callTool(clientA.client, "write", {

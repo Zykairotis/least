@@ -9,6 +9,7 @@ import { readTextFile, repoTree, ensureAiBridge } from "./fsOps.js";
 import { gitDiff, gitLog, gitStatus } from "./gitOps.js";
 import { discoverSkillInventory } from "./capabilitiesOps.js";
 import type { SkillInventoryItem } from "./capabilitiesOps.js";
+import { discoverAgentSupport, type AgentDiscoverySummary } from "./agentDiscovery.js";
 
 export interface WorkspaceSummary {
   text: string;
@@ -21,6 +22,7 @@ export interface WorkspaceSummary {
   skillCounts: Record<string, number>;
   tree?: string;
   gitStatus: string;
+  agentDiscovery: AgentDiscoverySummary;
 }
 
 export interface CodexContext {
@@ -185,11 +187,29 @@ export async function workspaceSummary(
 
   const status = await gitStatus(config, workspace);
   const log = options.includeRecentCommits ? await gitLog(config, workspace, 5) : "";
+  const agentDiscovery = await discoverAgentSupport(workspace);
   const skillText = options.includeSkills
     ? `Skills: ${counts.total} total (${counts.workspace ?? 0} workspace, ${counts.user ?? 0} user, ${counts.plugin ?? 0} plugin, ${counts.other ?? 0} other).`
     : "Skills: skipped. Pass include_skills=true if skill discovery is needed.";
   const commitsSection = options.includeRecentCommits ? `\n\n## Recent commits\n\n${log}` : "";
-  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n## Git status\n\n${status}${commitsSection}${treeText ? `\n\n## Files\n\n${treeText}` : ""}`;
+  const agentText = agentDiscovery.available
+    ? [
+        "## Local Agents",
+        "",
+        `Enabled profiles: ${agentDiscovery.enabledProfiles.join(", ")}`,
+        `Direct agent tools: ${agentDiscovery.directTools.join(", ")}`,
+        agentDiscovery.note ?? "",
+        "",
+        "Use direct agent_* tools if your client exposes them.",
+        `Fallback CLI doctor bridge: ${agentDiscovery.cliBridgeDoctor}`,
+        `Fallback CLI start example: ${agentDiscovery.cliBridgeStartExample}`
+      ].filter(Boolean).join("\n")
+    : [
+        "## Local Agents",
+        "",
+        agentDiscovery.note ?? "No enabled local agent profiles were discovered."
+      ].join("\n");
+  const text = `# Workspace\n\nWorkspace: ${workspace.id}\nRoot: ${workspace.root}\nBash mode: ${config.bashMode}\nWrite mode: ${config.writeMode}\nTool mode: ${config.toolMode}\n\n${agentsText}\n${skillText}\n\n${agentText}\n\n## Git status\n\n${status}${commitsSection}${treeText ? `\n\n## Files\n\n${treeText}` : ""}`;
 
   return {
     text,
@@ -201,7 +221,8 @@ export async function workspaceSummary(
     skillInventory,
     skillCounts: counts,
     tree: treeText,
-    gitStatus: status
+    gitStatus: status,
+    agentDiscovery
   };
 }
 

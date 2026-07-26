@@ -23,6 +23,7 @@ LEAST_YOLO=1 least start
 
 ## What it does NOT bypass
 
+- ChatGPT / client platform tool-call safety that may reject raw shell payloads **before** they reach Least (for example some `curl` JSON POSTs). Prefer structured tools such as `local_http_json`, `docker_compose_ps`, and `run_vitest` for routine local-dev work.
 - ChatGPT platform approval prompts for local connector actions
 - Operating-system permissions
 - MCP host security rules outside Least

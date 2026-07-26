@@ -137,11 +137,15 @@ Standard mode exposes:
 - `batch` — run multiple read-only Least tools in one request.
 - `load_skill` — load bounded `SKILL.md` instructions for a discovered workspace, user, or plugin skill by name, with optional source/path disambiguation.
 - `read` — read text files with line numbers.
-- `write` — create/overwrite files and return a diff. Controlled by `LEAST_WRITE_MODE`.
-- `edit` — exact text replacement and return a diff. Controlled by `LEAST_WRITE_MODE`.
-- `multi_edit` — apply multiple exact edits across files in one call.
-- `apply_patch` — apply a Codex-style patch block inside the workspace.
-- `bash` — run allowlisted shell commands in the workspace. Controlled by `LEAST_BASH_MODE`.
+- `write` — create/overwrite one complete file. Default `response_mode=summary` (SHA-256, bytes, stats). Controlled by `LEAST_WRITE_MODE`.
+- `write_many` — atomically create/overwrite many complete files in one call (preferred over repeated `write`). Default `response_mode=summary`.
+- `edit` — exact text replacement. Default `response_mode=summary`. Controlled by `LEAST_WRITE_MODE`.
+- `multi_edit` — apply multiple exact edits across files in one atomic call. Default `response_mode=summary`.
+- `apply_patch` — apply a Codex-style patch block inside the workspace. Default `response_mode=summary`.
+- `bash` — run allowlisted shell commands in the workspace. Controlled by `LEAST_BASH_MODE`. Prefer structured tools below for HTTP, Docker Compose, and tests.
+- `local_http_request` / `local_http_json` / `api_smoke_suite` — localhost HTTP/JSON API calls without raw curl (blocks external hosts by default).
+- `docker_compose_services` / `docker_compose_ps` / `docker_compose_logs` / `docker_compose_health` — Docker Compose inspection without raw docker shell.
+- `run_package_script` / `run_vitest` — package scripts and isolated Vitest runs without fragile shell strings.
 - `diff_summary` — compact changed-file summary with line counts and rough risk classification.
 - `read_changed_files` — read changed source/test/config files for review without manual file picking.
 - `show_changes` — one review-oriented summary with git status, untracked summaries, diff stats, and optional compact diff.
@@ -151,6 +155,9 @@ Standard mode exposes:
 - `read_handoff` — read `.ai-bridge` files.
 - `export_pro_context` — write `.ai-bridge/pro-context.md` for models that cannot call MCP tools directly.
 - `handoff_to_agent` — write `.ai-bridge/current-plan.md` for Codex, OpenCode, Pi, or a custom local implementation agent without executing local commands.
+- `agent_list` / `agent_doctor` / `agent_terminal_doctor` / `agent_sessions` / `agent_attach_hint` — inspect configured local agent profiles, terminal backends, sessions, and attach options.
+- `agent_plan` / `agent_start` / `agent_status` / `agent_watchdog` / `agent_tail` / `agent_result` — plan, launch, monitor, tail, and collect durable results from local Groundcrew-backed agents.
+- `agent_cancel` / `agent_resume` / `agent_cleanup` — manage existing local agent runs without dropping back to ad hoc shell commands.
 
 Minimal mode exposes only:
 
@@ -211,6 +218,37 @@ The watcher writes the same review files as `execute-handoff`:
 .ai-bridge/execution-log.jsonl
 ```
 
+### Agent tool visibility and stale-chat verification
+
+Least treats live MCP `tools/list` as the source of truth for local agent lifecycle visibility. The intended priority order is:
+
+1. Use direct `agent_*` tools when your client exposes them.
+2. If direct tools are missing from the client manifest, use `open_workspace` / `least_inventory` and follow the Windows-native PowerShell CLI bridge examples they return.
+
+`least start` and `least doctor` now print a compact agent-surface summary after the local MCP server is healthy or when a live server is already bound on the target port. That summary shows:
+
+- enabled local agent profiles
+- whether live MCP `tools/list` includes the core lifecycle tools `agent_start`, `agent_status`, `agent_tail`, and `agent_result`
+- a stale-chat warning when the live MCP server is correct but an already-open chat may still have an old manifest
+- the fallback PowerShell CLI bridge doctor command for this workspace
+
+Official verification sequence for direct `Xacho.agent_*` exposure:
+
+1. Restart Least from the current `X:\least` build.
+2. Confirm the live MCP `tools/list` includes at least `agent_start`, `agent_status`, `agent_tail`, and `agent_result`.
+3. Reconnect or refresh the ChatGPT custom connector/server.
+4. Open a brand-new chat.
+
+Existing chats may keep a stale connector manifest even when the live MCP server is already correct. When Least prints `Live MCP tools are correct; if ChatGPT does not show Xacho.agent_*, reconnect the connector and open a new chat.`, treat that as the supported next step rather than a local runtime failure.
+
+The PowerShell CLI bridge always runs from the Least install directory and passes the target project with `--root`. This means an empty or new folder does not need its own `package.json` just to start an agent:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Set-Location -LiteralPath 'X:\least'; npm run agent:cli -- start --root 'X:\SamplePrk' --agent oh-my-pi --prompt 'Inspect this folder and report what you find.'"
+```
+
+If the target folder name is not registered in `crew.config.ts`, Least treats it as a direct-folder job: the agent runs in that folder, logs/results are written under that folder's `.ai-bridge/agent-runs`, and Groundcrew worktree provisioning is skipped.
+
 ## Output efficiency
 
 Least compacts noisy tool output (large diffs, search hits, test logs) deterministically at the tool boundary. Compacted results include a retrieval key when raw output is stored locally under `.least/cache/tool-output/`.
@@ -241,10 +279,20 @@ For implementation work, the shortest high-signal loop is usually:
 ```text
 open_current_workspace
 context_pack
-multi_edit or apply_patch
-show_changes
+write_many / multi_edit / apply_patch   # prefer write_many for multi-file generation
+show_changes                            # once after the mutation batch
 bash
 ```
+
+Mutation response modes (`response_mode`):
+
+| Mode | Use when |
+| --- | --- |
+| `summary` | Default for all mutation tools — metadata only, no full unified diff |
+| `compact_diff` | Bounded preview when a diff is needed inline |
+| `full_diff` | Explicit review — or retrieve a stored diff via `retrieve_output` using `diff_retrieval_key` |
+
+Deprecated: `include_diff` still works (`false`→`summary`, `true`→`full_diff`); prefer `response_mode`.
 
 For review work:
 
@@ -1212,7 +1260,7 @@ The launcher defaults to `workspace` in normal coding mode and `handoff` in hand
 `LEAST_TOOL_MODE=standard` is the default. It exposes the normal coding loop plus `show_changes`, Pro context export, and generic agent handoff.
 
 ```text
-minimal   smallest surface for demos and simple coding: open/read/write/edit/bash/show_changes
+minimal   smallest surface for demos and simple coding: open/read/write/write_many/edit/bash/show_changes
 standard  default surface for normal coding plus handoff/export
 full      all tools, including inventory, workspace snapshots, raw git tools, codex_context, and compatibility wrappers
 ```
@@ -1278,7 +1326,7 @@ Call server_config first.
 Then call open_current_workspace with include_tree=false.
 If you need global skill or MCP server names, ask me to restart Least with --tool-mode full.
 
-Act as a coding agent. Inspect the relevant files, make the requested source edits with write/edit, then verify with search/read/bash and show_changes when useful.
+Act as a coding agent. Inspect the relevant files, make the requested source edits with write_many/write/edit/multi_edit, prefer response_mode=summary during implementation, then verify with search/read/bash and show_changes once after the mutation batch.
 
 Keep changes scoped to the request. Do not use handoff_to_agent unless I explicitly ask for planning-only handoff.
 ```

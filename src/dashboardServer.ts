@@ -102,9 +102,18 @@ export async function startDashboardServer(config: LeastConfig): Promise<http.Se
       "Connection": "keep-alive",
       "X-Accel-Buffering": "no",
     });
+    // Prefer Last-Event-ID (browser auto-reconnect) over query param.
+    const headerId = req.headers["last-event-id"];
+    const sinceFromHeader = typeof headerId === "string" ? Number.parseInt(headerId, 10) : Number.NaN;
+    const sinceFromQuery = typeof req.query.since === "string" ? Number.parseInt(req.query.since, 10) : Number.NaN;
+    const sinceId = Number.isFinite(sinceFromHeader) && sinceFromHeader > 0
+      ? sinceFromHeader
+      : Number.isFinite(sinceFromQuery) && sinceFromQuery > 0
+        ? sinceFromQuery
+        : 0;
+
     const snapshot = buildDashboardSnapshot(200);
     sendSSE(res, "snapshot", { ok: true, ...snapshot });
-    const sinceId = typeof req.query.since === "string" ? parseInt(req.query.since, 10) : 0;
     if (sinceId > 0) {
       const backlog = getDashboardEventsSince(sinceId);
       for (const event of backlog) sendSSE(res, "dashboard", event, event.id);
@@ -113,12 +122,19 @@ export async function startDashboardServer(config: LeastConfig): Promise<http.Se
     setDashboardClientCount(_connectedClients.size);
     setDashboardStreaming(true);
     ensureGitPolling(config);
+    // Push current git state immediately so UI is not empty until first poll tick.
+    void updateGitSnapshot(config).catch(() => {});
     const unsub = subscribeDashboardEvents((event: DashboardEvent) => {
       try { sendSSE(res, "dashboard", event, event.id); } catch { unsub(); }
     });
     const heartbeat = setInterval(() => {
-      try { res.write(": heartbeat\n\n"); } catch { clearInterval(heartbeat); }
-    }, 15_000);
+      try {
+        // Named heartbeat event so clients can show "live" without full snapshot.
+        sendSSE(res, "heartbeat", { ts: new Date().toISOString(), clients: _connectedClients.size });
+      } catch {
+        clearInterval(heartbeat);
+      }
+    }, 12_000);
     req.on("close", () => {
       clearInterval(heartbeat); unsub();
       _connectedClients.delete(clientId);
@@ -155,9 +171,10 @@ export async function startDashboardServer(config: LeastConfig): Promise<http.Se
 
 function ensureGitPolling(config: LeastConfig): void {
   if (_gitInterval) return;
-  const intervalMs = Number(process.env.LEAST_DASHBOARD_GIT_INTERVAL_MS) || 2_000;
+  // Default 5s — event-driven tool activity already refreshes snapshot on the client.
+  const intervalMs = Number(process.env.LEAST_DASHBOARD_GIT_INTERVAL_MS) || 5_000;
   _gitInterval = setInterval(async () => {
-    for (const _ of _connectedClients) { /* keep alive */ }
+    if (_connectedClients.size === 0) return;
     try { await updateGitSnapshot(config); } catch { /* best-effort */ }
   }, intervalMs);
   _gitInterval.unref();

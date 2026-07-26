@@ -97,8 +97,21 @@ export interface AgentJobRecord {
     workspaceName?: string;
     runState?: Record<string, unknown>;
   };
+  agentDeck?: {
+    sessionId: string;
+    profile?: string;
+    group?: string;
+    command?: string;
+    resolvedCommand?: string;
+    tool?: string;
+    status?: string;
+    tmuxSession?: string;
+    worktreePath?: string;
+    worktreeBranch?: string;
+  };
   terminal?: AgentTerminalMetadata;
   detail?: string;
+  dependsOn?: string[];
 }
 
 export interface AgentPlanInput {
@@ -106,11 +119,13 @@ export interface AgentPlanInput {
   workspaceRoot: string;
   agent?: string;
   repository: string;
-  title: string;
+  title?: string;
   prompt: string;
   mode?: string;
-  timeoutMs: number;
-  idleTimeoutMs: number;
+  taskId?: string;
+  timeoutMs?: number;
+  idleTimeoutMs?: number;
+  dependsOn?: string[];
 }
 
 export interface AgentStartInput extends AgentPlanInput {

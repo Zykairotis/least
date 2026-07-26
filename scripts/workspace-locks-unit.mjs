@@ -47,6 +47,18 @@ const emptyRelease = manager.release(workspaceId, "session-b");
 assert.equal(emptyRelease.released, false);
 assert.equal(emptyRelease.reason, "no_lock");
 
+// Auto-acquire via ensureOwner when unlocked.
+const autoWs = "ws_auto";
+const autoLock = manager.ensureOwner(autoWs, "session-auto", undefined, "auto-label");
+assert.ok(autoLock.leaseToken);
+assert.equal(autoLock.ownerSessionId, "session-auto");
+// Same owner renews.
+const autoAgain = manager.ensureOwner(autoWs, "session-auto");
+assert.equal(autoAgain.leaseToken, autoLock.leaseToken);
+// Other owner blocked.
+assert.throws(() => manager.ensureOwner(autoWs, "session-other"), /locked by another session/);
+manager.release(autoWs, "session-auto");
+
 const shortManager = new WorkspaceLockManager(30);
 const shortWs = "ws_expire";
 let shortResult = shortManager.acquire(shortWs, "session-expire");

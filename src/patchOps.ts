@@ -1,12 +1,14 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { LeastConfig } from "./config.js";
-import { makeUnifiedDiffMaybeOffloaded } from "./fsOps.js";
+import { computeMutationDiff, type DiffComputeMode } from "./fsOps.js";
 import type { Workspace } from "./guard.js";
 import { LeastError, PathGuard } from "./guard.js";
 import { hasSecretValue } from "./redact.js";
+import { readTextWithSnapshot } from "./fileSnapshotCache.js";
+import { commitFileTransaction, type FileTransactionChange } from "./fileTransaction.js";
 
-type PatchAction =
+export type PatchAction =
   | { type: "add"; file: string; lines: string[] }
   | { type: "delete"; file: string }
   | { type: "update"; file: string; moveTo?: string; lines: string[] };
@@ -16,6 +18,16 @@ export interface ApplyPatchResult {
   additions: number;
   deletions: number;
   diff: string;
+  /** content = only existing file contents; structure = add/delete/move/rename. */
+  impact: "content" | "structure";
+}
+
+export interface PatchPreviewResult {
+  changedFiles: string[];
+  additions: number;
+  deletions: number;
+  preview: Record<string, string>;
+  conflicts: string[];
 }
 
 function splitLines(text: string): string[] {
@@ -26,7 +38,7 @@ function joinLines(lines: string[]): string {
   return lines.join("\n");
 }
 
-function parsePatch(patch: string): PatchAction[] {
+export function parsePatch(patch: string): PatchAction[] {
   const lines = patch.replace(/\r\n/g, "\n").split("\n");
   if (lines[0] !== "*** Begin Patch") {
     throw new LeastError("apply_patch expects patch text starting with *** Begin Patch.");
@@ -127,74 +139,159 @@ export async function applyWorkspacePatch(
   guard: PathGuard,
   workspace: Workspace,
   patch: string,
-  options: { checkOnly?: boolean } = {}
+  options: {
+    checkOnly?: boolean;
+    authorizePath?: (relPath: string) => void;
+    /** Control unified-diff generation. Default: full. */
+    diffMode?: DiffComputeMode;
+    maxDiffChars?: number;
+  } = {}
 ): Promise<ApplyPatchResult> {
   const actions = parsePatch(patch);
   const changedFiles: string[] = [];
   let additions = 0;
   let deletions = 0;
-  const diffs: string[] = [];
+  const storageParts: string[] = [];
+  let impact: "content" | "structure" = "content";
+  const diffMode: DiffComputeMode = options.diffMode ?? "full";
 
+  const changes: FileTransactionChange[] = [];
+  const occupiedTargets = new Set<string>();
   for (const action of actions) {
     if (action.type === "add") {
+      impact = "structure";
       const resolved = guard.resolve(workspace, action.file, { forWrite: true });
+      options.authorizePath?.(resolved.relPath);
+      if (occupiedTargets.has(resolved.absPath)) throw new LeastError(`Patch targets file more than once: ${action.file}`);
+      occupiedTargets.add(resolved.absPath);
+      if (await fs.access(resolved.absPath).then(() => true, () => false)) throw new LeastError(`Refusing to overwrite existing file: ${action.file}`);
       const content = joinLines(action.lines);
       if (Buffer.byteLength(content, "utf8") > config.maxWriteBytes) {
         throw new LeastError(`Patched file too large: ${action.file}`);
       }
       if (hasSecretValue(content)) throw new LeastError("Secret-looking content is blocked from patch write.");
-      const diff = await makeUnifiedDiffMaybeOffloaded("", content, resolved.relPath);
-      additions += diff.additions;
-      deletions += diff.deletions;
-      diffs.push(diff.diff);
+      const diff = await computeMutationDiff("", content, resolved.relPath, diffMode, options.maxDiffChars, {
+        storageMaxChars: config.outputStoreMaxItemBytes
+      });
+      additions += diff.additions ?? 0;
+      deletions += diff.deletions ?? 0;
+      if (diff.storageDiff) storageParts.push(diff.storageDiff);
       changedFiles.push(resolved.relPath);
-      if (!options.checkOnly) {
-        await fs.mkdir(path.dirname(resolved.absPath), { recursive: true });
-        await fs.writeFile(resolved.absPath, content, "utf8");
-      }
+      changes.push({ type: "write", absPath: resolved.absPath, content, mustNotExist: true });
       continue;
     }
     if (action.type === "delete") {
+      impact = "structure";
       const resolved = guard.resolve(workspace, action.file, { forWrite: true });
-      const before = await fs.readFile(resolved.absPath, "utf8");
-      const diff = await makeUnifiedDiffMaybeOffloaded(before, "", resolved.relPath);
-      additions += diff.additions;
-      deletions += diff.deletions;
-      diffs.push(diff.diff);
+      options.authorizePath?.(resolved.relPath);
+      if (occupiedTargets.has(resolved.absPath)) throw new LeastError(`Patch targets file more than once: ${action.file}`);
+      occupiedTargets.add(resolved.absPath);
+      const before = (await readTextWithSnapshot(resolved.absPath, { maxBytes: config.maxWriteBytes })).text;
+      const diff = await computeMutationDiff(before, "", resolved.relPath, diffMode, options.maxDiffChars, {
+        storageMaxChars: config.outputStoreMaxItemBytes
+      });
+      additions += diff.additions ?? 0;
+      deletions += diff.deletions ?? 0;
+      if (diff.storageDiff) storageParts.push(diff.storageDiff);
       changedFiles.push(resolved.relPath);
-      if (!options.checkOnly) {
-        await fs.unlink(resolved.absPath);
-      }
+      changes.push({ type: "delete", absPath: resolved.absPath });
       continue;
     }
     const resolved = guard.resolve(workspace, action.file, { forWrite: true });
-    const before = await fs.readFile(resolved.absPath, "utf8");
+    options.authorizePath?.(resolved.relPath);
+    const before = (await readTextWithSnapshot(resolved.absPath, { maxBytes: config.maxWriteBytes })).text;
     const after = applyUpdateToText(before, action.lines);
     if (Buffer.byteLength(after, "utf8") > config.maxWriteBytes) {
       throw new LeastError(`Patched file too large: ${action.file}`);
     }
     if (hasSecretValue(after)) throw new LeastError("Secret-looking content is blocked from patch edit.");
     const targetPath = action.moveTo ? guard.resolve(workspace, action.moveTo, { forWrite: true }) : resolved;
-    const diff = await makeUnifiedDiffMaybeOffloaded(before, after, targetPath.relPath);
-    additions += diff.additions;
-    deletions += diff.deletions;
-    diffs.push(diff.diff);
+    options.authorizePath?.(targetPath.relPath);
+    if (occupiedTargets.has(targetPath.absPath)) throw new LeastError(`Patch targets file more than once: ${targetPath.relPath}`);
+    occupiedTargets.add(targetPath.absPath);
+    if (action.moveTo && targetPath.absPath !== resolved.absPath && await fs.access(targetPath.absPath).then(() => true, () => false)) {
+      throw new LeastError(`Refusing to overwrite existing move destination: ${targetPath.relPath}`);
+    }
+    if (action.moveTo && targetPath.absPath !== resolved.absPath) {
+      impact = "structure";
+    }
+    const diff = await computeMutationDiff(before, after, targetPath.relPath, diffMode, options.maxDiffChars, {
+      storageMaxChars: config.outputStoreMaxItemBytes
+    });
+    additions += diff.additions ?? 0;
+    deletions += diff.deletions ?? 0;
+    if (diff.storageDiff) storageParts.push(diff.storageDiff);
     changedFiles.push(targetPath.relPath);
-    if (!options.checkOnly) {
-      if (action.moveTo && targetPath.absPath !== resolved.absPath) {
-        await fs.mkdir(path.dirname(targetPath.absPath), { recursive: true });
-        await fs.writeFile(targetPath.absPath, after, "utf8");
-        await fs.unlink(resolved.absPath);
-      } else {
-        await fs.writeFile(resolved.absPath, after, "utf8");
-      }
+    changes.push({ type: "write", absPath: targetPath.absPath, content: after, mustNotExist: Boolean(action.moveTo && targetPath.absPath !== resolved.absPath) });
+    if (action.moveTo && targetPath.absPath !== resolved.absPath) {
+      changes.push({ type: "delete", absPath: resolved.absPath });
     }
   }
+
+  if (!options.checkOnly) await commitFileTransaction(changes);
 
   return {
     changedFiles,
     additions,
     deletions,
-    diff: diffs.join("\n\n")
+    // Prefer storage-complete combined diff for retrieval.
+    diff: storageParts.join("\n\n"),
+    impact
   };
+}
+
+export async function previewWorkspacePatch(
+  config: LeastConfig,
+  guard: PathGuard,
+  workspace: Workspace,
+  patch: string
+): Promise<PatchPreviewResult> {
+  const actions = parsePatch(patch);
+  const changedFiles: string[] = [];
+  const preview: Record<string, string> = {};
+  const conflicts: string[] = [];
+  let additions = 0;
+  let deletions = 0;
+
+  for (const action of actions) {
+    try {
+      if (action.type === "add") {
+        const resolved = guard.resolve(workspace, action.file, { forWrite: true });
+        const content = joinLines(action.lines);
+        if (Buffer.byteLength(content, "utf8") > config.maxWriteBytes) throw new LeastError(`Patched file too large: ${action.file}`);
+        if (hasSecretValue(content)) throw new LeastError("Secret-looking content is blocked from patch preview.");
+        const diff = await computeMutationDiff("", content, resolved.relPath, "full");
+        additions += diff.additions ?? 0;
+        deletions += diff.deletions ?? 0;
+        changedFiles.push(resolved.relPath);
+        preview[resolved.relPath] = content;
+        continue;
+      }
+      if (action.type === "delete") {
+        const resolved = guard.resolve(workspace, action.file, { forWrite: true });
+        const before = (await readTextWithSnapshot(resolved.absPath, { maxBytes: config.maxWriteBytes })).text;
+        const diff = await computeMutationDiff(before, "", resolved.relPath, "full");
+        additions += diff.additions ?? 0;
+        deletions += diff.deletions ?? 0;
+        changedFiles.push(resolved.relPath);
+        preview[resolved.relPath] = "";
+        continue;
+      }
+      const resolved = guard.resolve(workspace, action.file, { forWrite: true });
+      const before = (await readTextWithSnapshot(resolved.absPath, { maxBytes: config.maxWriteBytes })).text;
+      const after = applyUpdateToText(before, action.lines);
+      if (Buffer.byteLength(after, "utf8") > config.maxWriteBytes) throw new LeastError(`Patched file too large: ${action.file}`);
+      if (hasSecretValue(after)) throw new LeastError("Secret-looking content is blocked from patch preview.");
+      const targetPath = action.moveTo ? guard.resolve(workspace, action.moveTo, { forWrite: true }) : resolved;
+      const diff = await computeMutationDiff(before, after, targetPath.relPath, "full");
+      additions += diff.additions ?? 0;
+      deletions += diff.deletions ?? 0;
+      changedFiles.push(targetPath.relPath);
+      preview[targetPath.relPath] = after;
+    } catch (error) {
+      conflicts.push(`${action.file}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  return { changedFiles, additions, deletions, preview, conflicts };
 }

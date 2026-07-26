@@ -1,6 +1,6 @@
 import type { LeastConfig } from "./config.js";
 import type { DashboardState, ServerInfo, RuntimeInfo, ConnectionInfo, ToolLiveStats, ToolCallEvent, HookStats, LogEvent, GitDashboardState, DashboardEvent, HookEventRecord } from "./dashboardTypes.js";
-import { getRecentDashboardEvents, getDashboardEventsSince } from "./dashboardEvents.js";
+import { getRecentDashboardEvents, dashboardEventCount, emitDashboardEvent } from "./dashboardEvents.js";
 import { listStoredAgentJobs, listStoredAgentTerminalSessions } from "./dashboardStore.js";
 import { getLeastPerfSnapshot, getGainSnapshot, type PerfWindowName } from "./perf.js";
 import { gitStatus } from "./gitOps.js";
@@ -40,9 +40,21 @@ export function removeConnection(id: string): void {
   }
 }
 
-export function recordHookEvent(hook: HookEventRecord): void {
-  _hookEvents.push(hook);
+let _hookSeq = 0;
+
+export function recordHookEvent(hook: Omit<HookEventRecord, "id"> & { id?: number }): void {
+  _hookSeq += 1;
+  const record: HookEventRecord = {
+    ...hook,
+    id: hook.id && hook.id > 0 ? hook.id : _hookSeq,
+    ts: hook.ts || new Date().toISOString()
+  };
+  _hookEvents.push(record);
   if (_hookEvents.length > 1000) _hookEvents = _hookEvents.slice(-1000);
+}
+
+export function getRecentHookEvents(limit = 100): HookEventRecord[] {
+  return _hookEvents.slice(-Math.max(1, limit));
 }
 
 export function getHookStats(): HookStats {
@@ -115,7 +127,7 @@ export async function updateGitSnapshot(config: LeastConfig): Promise<void> {
     const unstaged = entries.filter((l) => /^\s[MADRUC?]/.test(l)).length;
     const untracked = entries.filter((l) => /^\?\?/.test(l)).length;
 
-    _gitState = {
+    const next: GitDashboardState = {
       branch,
       status: status.slice(0, 2000),
       changedFiles: entries.length,
@@ -125,6 +137,28 @@ export async function updateGitSnapshot(config: LeastConfig): Promise<void> {
       lastSnapshotAt: new Date().toISOString(),
       available: true,
     };
+    const firstSnapshot = !_gitState.lastSnapshotAt;
+    const changed =
+      next.branch !== _gitState.branch ||
+      next.changedFiles !== _gitState.changedFiles ||
+      next.staged !== _gitState.staged ||
+      next.unstaged !== _gitState.unstaged ||
+      next.untracked !== _gitState.untracked ||
+      next.status !== _gitState.status;
+    _gitState = next;
+    if (changed || firstSnapshot) {
+      emitDashboardEvent({
+        kind: "git:snapshot",
+        level: "debug",
+        payload: {
+          branch: next.branch,
+          changedFiles: next.changedFiles,
+          staged: next.staged,
+          unstaged: next.unstaged,
+          untracked: next.untracked
+        }
+      });
+    }
   } catch (error) {
     _gitState = {
       changedFiles: 0,
@@ -202,8 +236,11 @@ export function buildDashboardSnapshot(
   const logs: LogEvent[] = _logEvents.slice(-100);
   const connections = _connectionInfos.filter((c) => !c.closed);
   const hooks = getHookStats();
+  const recentHooks = getRecentHookEvents(150);
   const agentJobs = listStoredAgentJobs(100);
   const agentTerminalSessions = listStoredAgentTerminalSessions(500);
+  const recentAll = getRecentDashboardEvents(1);
+  const latestEventId = recentAll[recentAll.length - 1]?.id ?? 0;
 
   return {
     server: {
@@ -219,6 +256,7 @@ export function buildDashboardSnapshot(
     tools,
     recentToolCalls,
     hooks,
+    recentHooks,
     git: _gitState,
     agents: {
       jobs: agentJobs,
@@ -229,5 +267,9 @@ export function buildDashboardSnapshot(
     logs,
     perf,
     gain,
+    stream: {
+      latestEventId,
+      eventCount: dashboardEventCount()
+    }
   };
 }

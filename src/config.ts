@@ -13,6 +13,31 @@ export type HttpProtocol = "mcp" | "openai";
 export type ConcurrencyMode = "off" | "lease";
 export type ShellBackend = "auto" | "cmd" | "powershell" | "bash" | "wsl";
 export type OutputMode = "raw" | "compact" | "compressed";
+export type CodexSessionsMode = "off" | "metadata" | "read";
+
+export interface HttpToolsConfig {
+  enabled: boolean;
+  allowedHosts: string[];
+  allowedPorts: number[];
+  allowExternal: boolean;
+  maxBodyBytes: number;
+  defaultTimeoutMs: number;
+  allowRedirects: boolean;
+}
+
+export interface DockerComposeToolsConfig {
+  enabled: boolean;
+  defaultComposeDir: string;
+  maxLogTail: number;
+  allowRestart: boolean;
+  allowUpDown: boolean;
+}
+
+export interface PackageScriptToolsConfig {
+  enabled: boolean;
+  allowedManagers: Array<"pnpm" | "npm" | "yarn">;
+  defaultTimeoutMs: number;
+}
 
 export interface LeastConfig {
   defaultRoot: string;
@@ -29,6 +54,16 @@ export interface LeastConfig {
   inheritEnv: boolean;
   maxReadBytes: number;
   maxWriteBytes: number;
+  /** Aggregate byte limit for write_many requests. Default 8 MB (below Express 20 MB body limit). */
+  maxWriteManyBytes: number;
+  /**
+   * Aggregate original/existing content retained for write_many rollback.
+   * Prevents multi-hundred-MB preflight memory when overwriting many large files.
+   * Default: 64 MB.
+   */
+  maxWriteManyOriginalBytes: number;
+  /** Maximum files per write_many call. */
+  maxWriteManyFiles: number;
   maxOutputBytes: number;
   maxSearchResults: number;
   maxHttpSessions: number;
@@ -55,6 +90,8 @@ export interface LeastConfig {
   settings: LoadedSettings | null;
   yoloMode: boolean;
   dashboardEnabled: boolean;
+  /** When true, append a compact git blame block to read_around output. Default: false. */
+  blameInline: boolean;
   dashboardHost: string;
   dashboardPort: number;
   dashboardOpen: boolean;
@@ -62,7 +99,14 @@ export interface LeastConfig {
   dashboardMaxEvents: number;
   dashboardSampleMs: number;
   dashboardDbPath: string;
+  httpTools: HttpToolsConfig;
+  dockerComposeTools: DockerComposeToolsConfig;
+  packageScriptTools: PackageScriptToolsConfig;
+  codexSessions: CodexSessionsMode;
+  codexDir: string;
 }
+
+export const DEFAULT_HTTP_ALLOWED_HOSTS = ["localhost", "127.0.0.1", "::1", "host.docker.internal"];
 
 const DEFAULT_BLOCKED_GLOBS = [
   ".git",
@@ -125,7 +169,7 @@ function parseArgs(argv: string[]): Record<string, string | string[] | boolean> 
       }
     }
 
-    if (key === "allow-root") {
+    if (key === "allow-root" || key === "http-allow-host") {
       const prev = out[key];
       if (Array.isArray(prev)) prev.push(String(value));
       else if (prev) out[key] = [String(prev), String(value)];
@@ -257,6 +301,11 @@ function boolFrom(value: string | undefined, fallback = false): boolean {
   return ["1", "true", "yes", "y", "on"].includes(value.toLowerCase());
 }
 
+function codexSessionsFrom(value: string | undefined): CodexSessionsMode {
+  if (value === "metadata" || value === "read") return value;
+  return "off";
+}
+
 function isLoopbackHost(host: string): boolean {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
@@ -316,6 +365,44 @@ export function loadConfig(argv = process.argv.slice(2)): LeastConfig {
   const yoloMode = (args.yolo === true || args["dangerously-allow-all"] === true ||
     process.env.LEAST_YOLO === "1" || process.env.LEAST_DANGEROUSLY_ALLOW_ALL === "1");
 
+  const settingsHttp = loadedSettings.effective.http;
+  const settingsDocker = loadedSettings.effective.dockerCompose;
+  const settingsPkg = loadedSettings.effective.packageScripts;
+
+  const httpAllowHostArgs = Array.isArray(args["http-allow-host"])
+    ? args["http-allow-host"]
+    : typeof args["http-allow-host"] === "string"
+      ? [args["http-allow-host"]]
+      : [];
+  const envHttpHosts = splitList(process.env.LEAST_HTTP_ALLOW_HOSTS, ",");
+  const settingsHosts = settingsHttp?.allowedHosts ?? [];
+  const mergedHttpHosts = [...new Set([
+    ...DEFAULT_HTTP_ALLOWED_HOSTS,
+    ...settingsHosts,
+    ...envHttpHosts,
+    ...httpAllowHostArgs.map(String)
+  ].map((h) => h.trim().toLowerCase()).filter(Boolean))];
+
+  const httpToolsEnabled =
+    args["http-tools"] === true ||
+    boolFrom(process.env.LEAST_HTTP_TOOLS, settingsHttp?.enabled ?? true);
+  const dockerComposeEnabled =
+    args["docker-compose-tools"] === true ||
+    boolFrom(process.env.LEAST_DOCKER_COMPOSE_TOOLS, settingsDocker?.enabled ?? true);
+  const packageScriptsEnabled = boolFrom(
+    process.env.LEAST_PACKAGE_SCRIPT_TOOLS,
+    settingsPkg?.enabled ?? true
+  );
+
+  const dockerDefaultDirArg =
+    typeof args["docker-compose-default-dir"] === "string"
+      ? args["docker-compose-default-dir"]
+      : undefined;
+
+  const allowedManagersRaw = settingsPkg?.allowedManagers ?? ["pnpm", "npm"];
+  const allowedManagers = allowedManagersRaw.filter(
+    (m): m is "pnpm" | "npm" | "yarn" => m === "pnpm" || m === "npm" || m === "yarn"
+  );
 
   return {
     defaultRoot,
@@ -332,6 +419,14 @@ export function loadConfig(argv = process.argv.slice(2)): LeastConfig {
     inheritEnv: process.env.LEAST_INHERIT_ENV === "1",
     maxReadBytes: numberFrom(process.env.LEAST_MAX_READ_BYTES, 180_000, 4_000, 2_000_000),
     maxWriteBytes: numberFrom(process.env.LEAST_MAX_WRITE_BYTES, 1_000_000, 1_000, 10_000_000),
+    maxWriteManyBytes: numberFrom(process.env.LEAST_MAX_WRITE_MANY_BYTES, 8_000_000, 100_000, 18_000_000),
+    maxWriteManyOriginalBytes: numberFrom(
+      process.env.LEAST_MAX_WRITE_MANY_ORIGINAL_BYTES,
+      64_000_000,
+      1_000_000,
+      512_000_000
+    ),
+    maxWriteManyFiles: numberFrom(process.env.LEAST_MAX_WRITE_MANY_FILES, 200, 1, 500),
     maxOutputBytes: numberFrom(process.env.LEAST_MAX_OUTPUT_BYTES, 120_000, 4_000, 2_000_000),
     maxSearchResults: numberFrom(process.env.LEAST_MAX_SEARCH_RESULTS, 200, 5, 2_000),
     maxHttpSessions: numberFrom(process.env.LEAST_MAX_HTTP_SESSIONS, 64, 1, 512),
@@ -351,7 +446,8 @@ export function loadConfig(argv = process.argv.slice(2)): LeastConfig {
     dashboardSampleMs: numberFrom(process.env.LEAST_DASHBOARD_SAMPLE_MS, 1_000, 100, 60_000),
     dashboardDbPath: dashboardDbPathArg ?? process.env.LEAST_DASHBOARD_DB_PATH ?? path.join(defaultRoot, ".least", "dashboard.db"),
     concurrencyMode: concurrencyModeFrom(concurrencyArg ?? process.env.LEAST_CONCURRENCY_MODE),
-    lockLeaseMs: numberFrom(lockLeaseMsArg ?? process.env.LEAST_LOCK_LEASE_MS, 120_000, 5_000, 3_600_000),
+    // Default 10 minutes: longer than typical model reasoning pauses so leases survive multi-step edit loops.
+    lockLeaseMs: numberFrom(lockLeaseMsArg ?? process.env.LEAST_LOCK_LEASE_MS, 600_000, 5_000, 3_600_000),
     shellBackend: shellBackendFrom(shellBackendArg ?? process.env.LEAST_SHELL_BACKEND),
     warmup: warmupFrom(process.env.LEAST_WARMUP),
     // raw: no compaction; compact: only per-kind enabled outputs; compressed: compact all eligible large outputs
@@ -367,5 +463,53 @@ export function loadConfig(argv = process.argv.slice(2)): LeastConfig {
     projectMemory: boolFrom(process.env.LEAST_PROJECT_MEMORY, false),
     settings: loadedSettings,
     yoloMode,
+    blameInline: boolFrom(process.env.LEAST_BLAME_INLINE, false),
+    httpTools: {
+      enabled: httpToolsEnabled,
+      allowedHosts: mergedHttpHosts,
+      allowedPorts: (settingsHttp?.allowedPorts ?? []).map((p) => Number(p)).filter((p) => Number.isFinite(p)),
+      allowExternal: boolFrom(process.env.LEAST_HTTP_ALLOW_EXTERNAL, settingsHttp?.allowExternal ?? false),
+      maxBodyBytes: numberFrom(
+        process.env.LEAST_HTTP_MAX_BODY_BYTES,
+        settingsHttp?.maxBodyBytes ?? 1_048_576,
+        1_000,
+        20_000_000
+      ),
+      defaultTimeoutMs: numberFrom(
+        process.env.LEAST_HTTP_TIMEOUT_MS,
+        settingsHttp?.defaultTimeoutMs ?? 30_000,
+        100,
+        600_000
+      ),
+      allowRedirects: boolFrom(process.env.LEAST_HTTP_ALLOW_REDIRECTS, settingsHttp?.allowRedirects ?? false)
+    },
+    dockerComposeTools: {
+      enabled: dockerComposeEnabled,
+      defaultComposeDir:
+        dockerDefaultDirArg ??
+        process.env.LEAST_DOCKER_COMPOSE_DEFAULT_DIR ??
+        settingsDocker?.defaultComposeDir ??
+        "docker",
+      maxLogTail: numberFrom(
+        process.env.LEAST_DOCKER_COMPOSE_MAX_LOG_TAIL,
+        settingsDocker?.maxLogTail ?? 5_000,
+        1,
+        50_000
+      ),
+      allowRestart: settingsDocker?.allowRestart ?? false,
+      allowUpDown: settingsDocker?.allowUpDown ?? false
+    },
+    packageScriptTools: {
+      enabled: packageScriptsEnabled,
+      allowedManagers: allowedManagers.length ? allowedManagers : ["pnpm", "npm"],
+      defaultTimeoutMs: numberFrom(
+        process.env.LEAST_PACKAGE_SCRIPT_TIMEOUT_MS,
+        settingsPkg?.defaultTimeoutMs ?? 180_000,
+        1_000,
+        3_600_000
+      )
+    },
+    codexSessions: codexSessionsFrom(process.env.LEAST_CODEX_SESSIONS),
+    codexDir: path.resolve(expandHome(process.env.LEAST_CODEX_DIR ?? path.join(os.homedir(), ".codex")))
   };
 }

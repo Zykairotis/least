@@ -43,6 +43,7 @@ export interface DashboardSnapshot {
     compactions: number;
     retrievals: number;
     backends: string[];
+    lastSeen?: string;
   }>;
   recentToolCalls: Array<{
     id: number;
@@ -51,6 +52,8 @@ export interface DashboardSnapshot {
     status: "running" | "ok" | "error";
     durationMs?: number;
     error?: string;
+    workspaceId?: string;
+    sessionId?: string;
   }>;
   hooks: {
     total: number;
@@ -61,6 +64,18 @@ export interface DashboardSnapshot {
     p95DurationMs: number;
     byEvent: Record<string, number>;
   };
+  recentHooks?: Array<{
+    id: number;
+    ts: string;
+    event: string;
+    toolName?: string;
+    command?: string;
+    trusted?: boolean;
+    decision: "allow" | "deny" | "error";
+    durationMs?: number;
+    timedOut?: boolean;
+    reason?: string;
+  }>;
   git: {
     branch?: string;
     status?: string;
@@ -88,6 +103,10 @@ export interface DashboardSnapshot {
   }>;
   perf: Record<string, unknown>;
   gain: Record<string, unknown>;
+  stream?: {
+    latestEventId: number;
+    eventCount: number;
+  };
 }
 
 export interface DashboardEvent {
@@ -147,21 +166,33 @@ export interface AgentTerminalSessionRow {
 }
 
 export async function fetchSnapshot(): Promise<DashboardSnapshot> {
-  const res = await fetch("/api/snapshot");
+  const res = await fetch("/api/snapshot", { cache: "no-store" });
+  if (!res.ok) {
+    throw new Error(`Snapshot failed: HTTP ${res.status}`);
+  }
   return res.json();
 }
 
-export function connectSSE(
-  onEvent: (event: DashboardEvent) => void,
-  onSnapshot: (snapshot: DashboardSnapshot) => void,
-  onError?: (err: Event) => void
-): EventSource {
-  const es = new EventSource("/api/events");
+export type SseHandlers = {
+  onEvent: (event: DashboardEvent) => void;
+  onSnapshot: (snapshot: DashboardSnapshot) => void;
+  onHeartbeat?: (payload: { ts: string; clients?: number }) => void;
+  onError?: (err: Event) => void;
+  onOpen?: () => void;
+};
+
+/**
+ * Open an SSE stream. Browser auto-reconnects with Last-Event-ID.
+ * Pass sinceId only for the initial URL if you track ids client-side.
+ */
+export function connectSSE(handlers: SseHandlers, sinceId?: number): EventSource {
+  const url = sinceId && sinceId > 0 ? `/api/events?since=${sinceId}` : "/api/events";
+  const es = new EventSource(url);
 
   es.addEventListener("snapshot", (msg: MessageEvent) => {
     try {
       const data = JSON.parse(msg.data);
-      onSnapshot(data);
+      handlers.onSnapshot(data);
     } catch {
       // ignore parse errors
     }
@@ -169,16 +200,43 @@ export function connectSSE(
 
   es.addEventListener("dashboard", (msg: MessageEvent) => {
     try {
-      const data = JSON.parse(msg.data);
-      onEvent(data);
+      const data = JSON.parse(msg.data) as DashboardEvent;
+      handlers.onEvent(data);
     } catch {
       // ignore parse errors
     }
   });
 
+  es.addEventListener("heartbeat", (msg: MessageEvent) => {
+    try {
+      const data = JSON.parse(msg.data) as { ts: string; clients?: number };
+      handlers.onHeartbeat?.(data);
+    } catch {
+      // ignore
+    }
+  });
+
+  es.onopen = () => {
+    handlers.onOpen?.();
+  };
+
   es.onerror = (err: Event) => {
-    onError?.(err);
+    handlers.onError?.(err);
   };
 
   return es;
+}
+
+/** Kinds that should force a snapshot refresh so metrics/git/hooks stay live. */
+export function eventNeedsSnapshotRefresh(kind: string): boolean {
+  return (
+    kind.startsWith("tool:") ||
+    kind.startsWith("hook:") ||
+    kind.startsWith("lock:") ||
+    kind.startsWith("connection:") ||
+    kind === "git:snapshot" ||
+    kind === "runtime:snapshot" ||
+    kind === "log" ||
+    kind === "server:started"
+  );
 }

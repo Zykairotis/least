@@ -146,6 +146,33 @@ export class WorkspaceLockManager {
     return existing;
   }
 
+  /**
+   * Ensure this session owns the workspace lock for mutation.
+   * Auto-acquires when unlocked/expired so callers avoid an extra acquire round trip.
+   * Throws when another session currently holds the lease.
+   */
+  ensureOwner(workspaceId: string, ownerSessionId: string, leaseToken?: string, ownerLabel?: string): WorkspaceLock {
+    this.prune();
+    const existing = this.locks.get(workspaceId);
+    if (existing && !this.isExpired(existing)) {
+      if (this.isOwner(existing, ownerSessionId, leaseToken)) {
+        emitDashboardEvent({
+          kind: "lock:renewed",
+          payload: { workspaceId, ownerSessionId: redactSessionId(ownerSessionId), auto: true }
+        });
+        return this.renewLock(existing);
+      }
+      throw new WorkspaceLockedError(workspaceId, existing);
+    }
+    const lock = this.createLock(workspaceId, ownerSessionId, ownerLabel);
+    this.locks.set(workspaceId, lock);
+    emitDashboardEvent({
+      kind: "lock:acquired",
+      payload: { workspaceId, ownerSessionId: redactSessionId(ownerSessionId), auto: true }
+    });
+    return lock;
+  }
+
   status(workspaceId: string): WorkspaceLockStatus {
     const lock = this.get(workspaceId);
     if (!lock) return { locked: false };
@@ -186,8 +213,8 @@ export class WorkspaceLockedError extends Error {
     const ownerLabel = lock?.ownerLabel;
     const seconds = lock ? lockSecondsRemaining(lock) : undefined;
     const message = ownerLabel
-      ? `Workspace is locked by another session (${ownerLabel}). Lease expires in ${seconds ?? 0}s. Call workspace_lock_status or wait for expiry, then acquire_workspace_lock.`
-      : `Workspace is locked by another session. Acquire the workspace lock with acquire_workspace_lock before mutating.`;
+      ? `Workspace is locked by another session (${ownerLabel}). Lease expires in ${seconds ?? 0}s. Call workspace_lock_status or wait for expiry, then acquire_workspace_lock / retry mutation.`
+      : `Workspace has no active lock you own. Mutating tools auto-acquire when unlocked; if this persists, call acquire_workspace_lock.`;
     super(message);
     this.name = "WorkspaceLockedError";
   }

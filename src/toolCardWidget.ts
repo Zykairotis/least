@@ -46,6 +46,7 @@ export const toolCardWidgetHtml = String.raw`
     --line: rgba(77, 109, 140, 0.2);
     --line-strong: rgba(77, 109, 140, 0.32);
     --shadow: rgba(0, 0, 0, 0.72);
+    --glow: rgba(122, 184, 182, 0.16);
     --mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Monaco, Consolas, monospace;
     --sans: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
   }
@@ -61,25 +62,48 @@ export const toolCardWidgetHtml = String.raw`
 
   .wrap {
     width: 100%;
-    background: var(--nord0);
+    padding: 1px;
+    background:
+      radial-gradient(circle at 16px 10px, rgba(122, 184, 182, 0.08), transparent 160px),
+      radial-gradient(circle at calc(100% - 16px) 0, rgba(77, 109, 140, 0.12), transparent 180px),
+      var(--nord0);
   }
 
   .card {
     position: relative;
     overflow: hidden;
     border: 1px solid var(--line);
-    border-radius: 10px;
-    background: var(--nord1);
-    box-shadow: 0 10px 28px var(--shadow);
+    border-radius: 14px;
+    background:
+      linear-gradient(145deg, rgba(21, 27, 36, 0.86), rgba(3, 4, 7, 0.96)),
+      var(--nord1);
+    box-shadow: 0 16px 40px var(--shadow), inset 0 1px 0 rgba(200, 208, 220, 0.04);
+    animation: least-card-in 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  .card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background:
+      linear-gradient(90deg, rgba(122, 184, 182, 0.07), transparent 22%, transparent 78%, rgba(77, 109, 140, 0.05)),
+      radial-gradient(circle at 78% -10%, var(--glow), transparent 160px);
+    opacity: 0.9;
   }
 
   .rail {
     position: absolute;
     inset: 0 auto 0 0;
-    width: 3px;
-    background: var(--nord11);
+    width: 4px;
+    background: linear-gradient(180deg, var(--nord8), var(--nord11));
+    box-shadow: 0 0 18px rgba(122, 184, 182, 0.34);
     opacity: 0.9;
   }
+
+  .card.state-good .rail { background: linear-gradient(180deg, var(--nord15), var(--nord8)); }
+  .card.state-warn .rail { background: linear-gradient(180deg, var(--nord14), var(--nord13)); }
+  .card.state-bad .rail { background: linear-gradient(180deg, var(--nord12), var(--nord13)); }
 
   .head {
     display: grid;
@@ -89,7 +113,7 @@ export const toolCardWidgetHtml = String.raw`
     min-height: 58px;
     padding: 12px 14px 11px 16px;
     border-bottom: 1px solid var(--line);
-    background: var(--nord2);
+    background: linear-gradient(180deg, rgba(15, 19, 26, 0.94), rgba(6, 8, 12, 0.86));
   }
 
   .glyph {
@@ -98,12 +122,13 @@ export const toolCardWidgetHtml = String.raw`
     width: 28px;
     height: 28px;
     border: 1px solid var(--line-strong);
-    border-radius: 8px;
-    background: var(--nord3);
+    border-radius: 9px;
+    background: linear-gradient(145deg, var(--nord3), var(--nord1));
     color: var(--nord8);
     font: 10px/1 var(--mono);
     font-weight: 800;
     letter-spacing: -0.02em;
+    box-shadow: inset 0 1px 0 rgba(200, 208, 220, 0.05), 0 0 0 3px rgba(122, 184, 182, 0.03);
   }
 
   .headline { min-width: 0; }
@@ -145,7 +170,7 @@ export const toolCardWidgetHtml = String.raw`
     padding: 2px 8px;
     border: 1px solid var(--line);
     border-radius: 999px;
-    background: var(--nord3);
+    background: linear-gradient(180deg, rgba(15, 19, 26, 0.95), rgba(6, 8, 12, 0.95));
     color: var(--nord5);
     font-size: 10px;
     font-weight: 700;
@@ -194,7 +219,20 @@ export const toolCardWidgetHtml = String.raw`
     max-height: 460px;
     overflow: auto;
     padding: 12px;
-    background: var(--nord1);
+    background:
+      linear-gradient(rgba(77, 109, 140, 0.035) 1px, transparent 1px),
+      var(--nord1);
+    background-size: 100% 28px;
+    scrollbar-color: rgba(122, 184, 182, 0.45) rgba(3, 4, 7, 0.25);
+    scrollbar-width: thin;
+  }
+
+  .body::-webkit-scrollbar { width: 9px; height: 9px; }
+  .body::-webkit-scrollbar-track { background: rgba(3, 4, 7, 0.35); }
+  .body::-webkit-scrollbar-thumb {
+    border: 2px solid rgba(3, 4, 7, 0.8);
+    border-radius: 999px;
+    background: linear-gradient(180deg, rgba(122, 184, 182, 0.72), rgba(77, 109, 140, 0.62));
   }
 
   .banner {
@@ -224,8 +262,17 @@ export const toolCardWidgetHtml = String.raw`
     min-width: 0;
     padding: 9px 10px;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    background: var(--nord2);
+    border-radius: 10px;
+    background: linear-gradient(180deg, rgba(10, 13, 18, 0.92), rgba(6, 8, 12, 0.9));
+    box-shadow: inset 0 1px 0 rgba(200, 208, 220, 0.035);
+    transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+  }
+
+  .metric:hover,
+  .summary-item:hover {
+    transform: translateY(-1px);
+    border-color: var(--line-strong);
+    background: rgba(15, 19, 26, 0.95);
   }
 
   .metric .label,
@@ -255,11 +302,15 @@ export const toolCardWidgetHtml = String.raw`
   .code {
     overflow: hidden;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    background: var(--nord0);
+    border-radius: 10px;
+    background: rgba(3, 4, 7, 0.92);
+    box-shadow: inset 0 1px 0 rgba(200, 208, 220, 0.025);
   }
 
   .codebar {
+    position: sticky;
+    top: 0;
+    z-index: 1;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -267,7 +318,7 @@ export const toolCardWidgetHtml = String.raw`
     min-height: 30px;
     padding: 6px 10px;
     border-bottom: 1px solid var(--line);
-    background: var(--nord2);
+    background: linear-gradient(180deg, rgba(15, 19, 26, 0.98), rgba(6, 8, 12, 0.96));
     color: var(--nord10);
     font-size: 10px;
     font-weight: 750;
@@ -288,8 +339,8 @@ export const toolCardWidgetHtml = String.raw`
   }
 
   .diff-line { display: block; min-height: 18px; padding: 0 4px; border-radius: 3px; }
-  .diff-add { color: var(--nord15); background: #0b100c; }
-  .diff-del { color: var(--nord12); background: #100b0c; }
+  .diff-add { color: #9fca8c; background: linear-gradient(90deg, rgba(127, 160, 112, 0.16), transparent 88%); }
+  .diff-del { color: #c9737d; background: linear-gradient(90deg, rgba(168, 91, 100, 0.16), transparent 88%); }
   .diff-hunk { color: var(--nord9); }
   .terminal pre { color: var(--nord7); }
   .prompt { color: var(--nord8); font-weight: 800; }
@@ -306,8 +357,9 @@ export const toolCardWidgetHtml = String.raw`
   .fold {
     margin-top: 8px;
     border: 1px solid var(--line);
-    border-radius: 8px;
+    border-radius: 10px;
     background: var(--nord0);
+    overflow: hidden;
   }
 
   .fold > summary {
@@ -324,6 +376,14 @@ export const toolCardWidgetHtml = String.raw`
   }
 
   .fold > summary::-webkit-details-marker { display: none; }
+
+  .fold > summary::after {
+    content: "+";
+    color: var(--nord8);
+    font: 12px/1 var(--mono);
+  }
+
+  .fold[open] > summary::after { content: "-"; }
 
   .fold-title {
     overflow: hidden;
@@ -348,8 +408,16 @@ export const toolCardWidgetHtml = String.raw`
     align-items: center;
     padding: 7px 9px;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    background: var(--nord2);
+    border-radius: 9px;
+    background: rgba(10, 13, 18, 0.86);
+    transition: transform 130ms ease, border-color 130ms ease, background 130ms ease;
+  }
+
+  .file-row:hover,
+  .hit:hover {
+    transform: translateX(2px);
+    border-color: var(--line-strong);
+    background: rgba(15, 19, 26, 0.96);
   }
 
   .file-code {
@@ -391,6 +459,8 @@ export const toolCardWidgetHtml = String.raw`
     gap: 8px;
     padding: 7px 8px;
     border-radius: 8px;
+    border: 1px solid transparent;
+    transition: transform 130ms ease, border-color 130ms ease, background 130ms ease;
   }
 
   .hit:nth-child(odd) { background: var(--nord2); }
@@ -476,6 +546,23 @@ export const toolCardWidgetHtml = String.raw`
     50% { opacity: 1; transform: translateX(2px); }
   }
 
+  @keyframes least-card-in {
+    from { opacity: 0; transform: translateY(6px) scale(0.992); filter: saturate(0.8); }
+    to { opacity: 1; transform: translateY(0) scale(1); filter: saturate(1); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .card,
+    .skeleton span,
+    .metric,
+    .summary-item,
+    .file-row,
+    .hit {
+      animation: none;
+      transition: none;
+    }
+  }
+
   @media (max-width: 720px) {
     .head { grid-template-columns: 30px minmax(0, 1fr); }
     .meta { grid-column: 1 / -1; justify-content: flex-start; }
@@ -554,6 +641,8 @@ export const toolCardWidgetHtml = String.raw`
       handoff_to_agent: "Agent handoff",
       handoff_to_codex: "Codex handoff",
       bash: "Terminal",
+      shell: "Terminal",
+      files: "Files",
       search: "Search",
       read: "Read file",
       context_pack: "Context pack",
@@ -576,6 +665,22 @@ export const toolCardWidgetHtml = String.raw`
       handoff_to_agent: "A",
       handoff_to_codex: "C",
       bash: "$",
+      shell: "$",
+      files: "F",
+      agent_list: "A",
+      agent_doctor: "A",
+      agent_terminal_doctor: "T",
+      agent_sessions: "S",
+      agent_attach_hint: "A",
+      agent_plan: "P",
+      agent_start: "A",
+      agent_status: "S",
+      agent_watchdog: "W",
+      agent_tail: "T",
+      agent_result: "R",
+      agent_cancel: "!",
+      agent_resume: "R",
+      agent_cleanup: "C",
       search: "S",
       read: "R",
       context_pack: "K"
@@ -600,6 +705,14 @@ export const toolCardWidgetHtml = String.raw`
     }
     if (data?.least_tool === "handoff_to_agent" || data?.least_tool === "handoff_to_codex") {
       return data?.agent_name || data?.agent || "Handoff written";
+    }
+    if (data?.least_tool === "files") {
+      const count = Number(data?.count ?? (Array.isArray(data?.files) ? data.files.length : 0));
+      return count + " files · " + (data?.path || data?.root || "workspace");
+    }
+    if (String(data?.least_tool || "").startsWith("agent_")) {
+      const state = data?.state || data?.ok || data?.conclusion || "agent";
+      return [state, data?.agent, data?.job_id || data?.task_id].filter(Boolean).join(" · ");
     }
     if (data?.path) return data.path;
     if (data?.plan_path) return data.plan_path;
@@ -850,7 +963,7 @@ export const toolCardWidgetHtml = String.raw`
       data.execution_log_path ? '<div class="file-row"><span class="file-code">log</span><span class="file-name">' + esc(data.execution_log_path) + '</span><span class="file-tag">jsonl</span></div>' : ""
     ].join("");
     const diff = data.diff ? codebox("plan diff", renderDiff(data.diff), "") : "";
-    return '<article class="card">' + header(data, pills) + '<div class="body">' +
+    return '<article class="card state-' + esc(stateClass) + '">' + header(data, pills) + '<div class="body">' +
       '<div class="summary">' +
       summaryItem("Agent", data.agent_name || data.agent || "-") +
       summaryItem("Model", data.model || "-") +
@@ -885,6 +998,82 @@ export const toolCardWidgetHtml = String.raw`
       '</div>' +
       codebox("command", command, "terminal") +
       outputBox +
+      '</div>' + footer(data) + '</article>';
+  }
+
+  function renderFiles(data) {
+    const files = Array.isArray(data.files) ? data.files : [];
+    const count = Number(data.count ?? files.length);
+    const extCounts = new Map();
+    for (const file of files) {
+      const base = String(file).split("/").pop() || String(file);
+      const dot = base.lastIndexOf(".");
+      const ext = dot > 0 ? base.slice(dot).toLowerCase() : "[no-ext]";
+      extCounts.set(ext, (extCounts.get(ext) || 0) + 1);
+    }
+    const topExts = Array.from(extCounts.entries())
+      .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+      .slice(0, 6)
+      .map(([ext, n]) => ext + " " + n)
+      .join(" · ");
+    const rows = files.slice(0, 60).map((file) => {
+      const text = String(file);
+      const slash = text.lastIndexOf("/");
+      const dir = slash >= 0 ? text.slice(0, slash) || "." : ".";
+      return '<div class="file-row"><span class="file-code">file</span><span class="file-name">' + esc(text) + '</span><span class="file-tag">' + esc(dir === "." ? "root" : basename(dir)) + '</span></div>';
+    }).join("");
+    const more = count > 60 ? '<div class="empty">+' + esc(count - 60) + ' more files omitted from the card.</div>' : "";
+    const body = rows ? '<div class="file-list">' + rows + '</div>' + more : '<div class="empty">No files matched.</div>';
+    const pills = [
+      pill(count + " files", "frost"),
+      pill(data.backend || data.used || "files", "muted"),
+      data.truncated ? pill("truncated", "warn") : "",
+      data.cacheHit ? pill("cache", "accent") : ""
+    ].join("");
+    return '<article class="card">' + header(data, pills) + '<div class="body">' +
+      '<div class="summary">' +
+      summaryItem("Files", count) +
+      summaryItem("Shown", files.length) +
+      summaryItem("Backend", data.backend || data.used || "-") +
+      summaryItem("Extensions", topExts || "-") +
+      '</div>' + body + '</div>' + footer(data) + '</article>';
+  }
+
+  function renderAgent(data) {
+    const state = data.state || data.conclusion || (data.ok === true ? "ok" : data.ok === false ? "not ok" : "ready");
+    const badStates = ["failed", "failed-to-launch", "cancelled", "orphaned", "not ok"];
+    const warnStates = ["accepted", "provisioning", "running", "recovery-required", "still-running"];
+    const stateClass = badStates.includes(String(state)) ? "bad" : warnStates.includes(String(state)) ? "warn" : "good";
+    const pills = [
+      pill(state, stateClass),
+      data.agent ? pill(data.agent, "accent") : "",
+      data.repository ? pill(data.repository, "muted") : "",
+      data.source ? pill(data.source, "frost") : ""
+    ].join("");
+    const rows = [
+      data.job_id ? '<div class="file-row"><span class="file-code">job</span><span class="file-name">' + esc(data.job_id) + '</span><span class="file-tag">id</span></div>' : "",
+      data.task_id ? '<div class="file-row"><span class="file-code">task</span><span class="file-name">' + esc(data.task_id) + '</span><span class="file-tag">id</span></div>' : "",
+      data.worktree_dir ? '<div class="file-row"><span class="file-code">tree</span><span class="file-name">' + esc(data.worktree_dir) + '</span><span class="file-tag">path</span></div>' : "",
+      data.session_name ? '<div class="file-row"><span class="file-code">term</span><span class="file-name">' + esc(data.session_name) + '</span><span class="file-tag">session</span></div>' : "",
+      data.result_path ? '<div class="file-row"><span class="file-code">out</span><span class="file-name">' + esc(data.result_path) + '</span><span class="file-tag">result</span></div>' : ""
+    ].join("");
+    const commands = [];
+    for (const key of ["attach_commands", "watch_commands", "tail_commands", "fallback_commands"]) {
+      if (Array.isArray(data[key])) commands.push(...data[key].map((item) => typeof item === "string" ? item : item?.command || JSON.stringify(item)));
+    }
+    const commandBox = commands.length ? codebox("attach / watch commands", esc(commands.slice(0, 8).join("\n")), "terminal") : "";
+    const tailText = data.tail && typeof data.tail === "object" ? (data.tail.text || data.tail.output || "") : (data.output || data.text || "");
+    const tailBox = tailText ? codebox("agent output preview", esc(previewLines(tailText, 24)), "terminal") : "";
+    const jsonBox = fold("Structured details", "json", codebox("structured output", esc(truncate(JSON.stringify(data || {}, null, 2), 9000)), ""), false);
+    return '<article class="card">' + header(data, pills) + '<div class="body">' +
+      '<div class="summary">' +
+      summaryItem("State", state) +
+      summaryItem("Agent", data.agent || "-") +
+      summaryItem("Job", data.job_id ? shortId(data.job_id) : "-") +
+      summaryItem("Task", data.task_id ? shortId(data.task_id) : "-") +
+      '</div>' +
+      (rows ? '<div class="section-label">Agent job</div><div class="file-list">' + rows + '</div>' : "") +
+      commandBox + tailBox + jsonBox +
       '</div>' + footer(data) + '</article>';
   }
 
@@ -953,8 +1142,12 @@ export const toolCardWidgetHtml = String.raw`
       root.innerHTML = renderHandoff(data);
     } else if (tool === "write" || tool === "edit" || tool === "git_diff" || tool === "export_pro_context" || tool === "read") {
       root.innerHTML = renderFile(data);
-    } else if (tool === "bash") {
+    } else if (tool === "files") {
+      root.innerHTML = renderFiles(data);
+    } else if (tool === "bash" || tool === "shell") {
       root.innerHTML = renderBash(data);
+    } else if (String(tool || "").startsWith("agent_")) {
+      root.innerHTML = renderAgent(data);
     } else if (tool === "search" || tool === "search_context") {
       root.innerHTML = renderSearch(data);
     } else {

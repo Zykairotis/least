@@ -4,6 +4,7 @@ import path from "node:path";
 import type { Workspace } from "./guard.js";
 import type { LeastConfig } from "./config.js";
 import { collectManifestRoots } from "./skillManifest.js";
+import { discoverAgentSupport, type AgentDiscoverySummary } from "./agentDiscovery.js";
 
 export interface SkillInventoryItem {
   name: string;
@@ -90,6 +91,17 @@ function displayPath(absPath: string, workspaceRoot: string): string {
     return `~/${path.relative(home, absPath).split(path.sep).join("/")}`;
   }
   return absPath;
+}
+
+function normalizeRequestedSkillPath(value: string | undefined, workspaceRoot: string): string | undefined {
+  const requested = value?.trim();
+  if (!requested) return undefined;
+  if (requested.startsWith("$WORKSPACE/")) return requested;
+  if (requested === "$WORKSPACE") return requested;
+  if (requested.startsWith("~/")) return displayPath(path.join(os.homedir(), requested.slice(2)), workspaceRoot);
+  const windowsAbs = /^[A-Za-z]:[\\/]/.test(requested);
+  const abs = path.isAbsolute(requested) || windowsAbs ? path.normalize(requested) : path.resolve(workspaceRoot, requested);
+  return displayPath(abs, workspaceRoot);
 }
 
 function skillSource(skillPath: string, workspaceRoot: string): SkillInventoryItem["source"] {
@@ -242,17 +254,18 @@ export async function loadSkill(
 ): Promise<LoadedSkill> {
   const name = options.name.trim();
   if (!name) throw new Error("Skill name is required.");
-  const requestedPath = options.path?.trim();
+  const requestedPath = normalizeRequestedSkillPath(options.path, workspace.root);
 
   const records = await discoverSkillRecords(workspace, config, {
     includeGlobal: options.includeGlobal !== false,
-    maxSkills: options.maxSkills
+    maxSkills: options.maxSkills ?? 500
   });
+  const requestedPaths = requestedPath ? [requestedPath, `${requestedPath.replace(/\/$/, "")}/SKILL.md`] : [];
   const matches = records.filter(
     (skill) =>
       skill.name === name &&
       (!options.source || skill.source === options.source) &&
-      (!requestedPath || skill.path === requestedPath)
+      (!requestedPath || requestedPaths.includes(skill.path))
   );
   if (!matches.length) {
     const near = records
@@ -336,6 +349,7 @@ export async function leastInventory(
   mode: string;
   skills: SkillInventoryItem[];
   mcpServers: McpServerInventoryItem[];
+  agentSupport: AgentDiscoverySummary;
   text: string;
 }> {
   const skills = await discoverSkillInventory(workspace, config, {
@@ -343,13 +357,17 @@ export async function leastInventory(
     maxSkills: options.maxSkills
   });
   const mcpServers = options.includeMcpServers !== false ? await discoverMcpServers(workspace) : [];
+  const agentSupport = await discoverAgentSupport(workspace);
   const skillList = skills.slice(0, 40).map((s) => `  - ${s.name}${s.description ? `: ${s.description}` : ""} [${s.source}]`).join("\n");
   const mcpList = mcpServers.slice(0, 20).map((s) => `  - ${s.name} [${s.source}]`).join("\n");
   const text = [
     `# Least Inventory\n\nSkills (${skills.length}):`,
     skillList || "  (none)",
     mcpServers.length ? `\nMCP Servers (${mcpServers.length}):\n${mcpList}` : "\nMCP Servers: (none)",
+    agentSupport.available
+      ? `\nLocal Agents (${agentSupport.enabledProfiles.length}):\n  - enabled: ${agentSupport.enabledProfiles.join(", ")}\n  - direct tools: ${agentSupport.directTools.join(", ")}\n  - use direct agent_* tools first when visible\n  - fallback doctor: ${agentSupport.cliBridgeDoctor}\n  - fallback start: ${agentSupport.cliBridgeStartExample}`
+      : "\nLocal Agents: (none enabled)",
     "\nUse load_skill to inspect a skill body."
   ].join("\n");
-  return { mode: "active", skills, mcpServers, text };
+  return { mode: "active", skills, mcpServers, agentSupport, text };
 }

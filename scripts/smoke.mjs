@@ -131,12 +131,41 @@ await client.request('initialize', {
 client.notify('notifications/initialized');
 const tools = await client.request('tools/list', {});
 const toolNames = tools.tools.map((tool) => tool.name);
-for (const expected of ['server_config', 'least_inventory', 'least_perf', 'least_gain', 'least_discover', 'retrieve_output', 'context_pack', 'review_minimality', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'files', 'tree', 'search', 'search_context', 'read', 'read_many', 'json_query', 'load_skill', 'write', 'edit', 'bash', 'shell', 'show_changes', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
-  if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
+const structuredToolNames = [
+  "local_http_request",
+  "local_http_json",
+  "api_smoke_suite",
+  "docker_compose_services",
+  "docker_compose_ps",
+  "docker_compose_logs",
+  "docker_compose_health",
+  "run_package_script",
+  "run_vitest"
+];
+for (const expected of ["server_config", "least_inventory", "least_perf", "least_gain", "least_discover", "workflow", "retrieve_output", "context_pack", "review_minimality", "list_workspaces", "open_current_workspace", "open_workspace", "files", "tree", "search", "search_context", "read", "read_many", "json_query", "load_skill", "write", "write_many", "edit", "bash", "shell", "show_changes", "codex_context", "handoff_to_agent", "handoff_to_codex", "export_pro_context", ...structuredToolNames]) {
+  if (!toolNames.includes(expected)) throw new Error("tools/list missing direct callable tool: " + expected);
 }
 const toolCardUri = 'ui://widget/least-tool-card-v8.html';
 const toolCardAliasUri = 'ui://widget/least-tool-card-v9.html';
 const toolsByName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+
+const readOnlyStructuredTools = structuredToolNames.filter((name) => name !== "run_package_script" && name !== "run_vitest");
+for (const name of readOnlyStructuredTools) {
+  const annotations = toolsByName.get(name)?.annotations ?? {};
+  if (annotations.readOnlyHint !== true || annotations.destructiveHint === true) {
+    throw new Error(name + " should be exposed as read-only: " + JSON.stringify(annotations));
+  }
+}
+for (const name of ["run_package_script", "run_vitest"]) {
+  const annotations = toolsByName.get(name)?.annotations ?? {};
+  if (annotations.readOnlyHint !== false || annotations.destructiveHint !== true) {
+    throw new Error(name + " should be exposed as command/mutation tool: " + JSON.stringify(annotations));
+  }
+  const properties = toolsByName.get(name)?.inputSchema?.properties ?? {};
+  if (!Object.prototype.hasOwnProperty.call(properties, "lease_token")) {
+    throw new Error(name + " schema missing lease_token");
+  }
+}
 function expectSchemaProperty(toolName, propertyName) {
   const properties = toolsByName.get(toolName)?.inputSchema?.properties ?? {};
   if (!Object.prototype.hasOwnProperty.call(properties, propertyName)) {
@@ -160,10 +189,10 @@ async function expectToolError(name, args, pattern) {
     throw new Error(`${name} error did not match ${pattern}: ${text}`);
   }
 }
-for (const visualTool of ['open_current_workspace', 'open_workspace', 'write', 'edit', 'show_changes', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex']) {
+for (const visualTool of ['open_current_workspace', 'open_workspace', 'files', 'write', 'edit', 'bash', 'shell', 'run_package_script', 'run_vitest', 'show_changes', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex', 'agent_list', 'agent_doctor', 'agent_plan', 'agent_start', 'agent_status', 'agent_tail', 'agent_result', 'agent_attach_hint']) {
   if (!hasWidgetMeta(visualTool)) throw new Error(`${visualTool} should render the Least widget`);
 }
-for (const quietTool of ['server_config', 'least_inventory', 'list_workspaces', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'read', 'bash', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
+for (const quietTool of ['server_config', 'least_inventory', 'list_workspaces', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'read', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
   if (hasWidgetMeta(quietTool)) throw new Error(`${quietTool} should stay data-only without widget metadata`);
 }
 const resources = await client.request('resources/list', {});
@@ -185,16 +214,25 @@ if (widgetMeta.ui?.domain !== 'https://widgets.least.test' || widgetMeta['openai
   throw new Error('tool-card widget resource did not expose standard and ChatGPT widget domain metadata');
 }
 const serverConfig = await client.request('tools/call', { name: 'server_config', arguments: {} });
-for (const expected of ['files', 'search_context', 'read_many', 'json_query']) {
+for (const expected of ["files", "search_context", "read_many", "json_query", ...structuredToolNames]) {
   if (!serverConfig.structuredContent.registeredTools?.includes?.(expected)) {
-    throw new Error(`server_config did not report registered tool ${expected}`);
+    throw new Error("server_config did not report registered tool " + expected);
   }
+}
+if (!serverConfig.structuredContent.registeredTools?.includes?.('workflow')) {
+  throw new Error('server_config did not report registered workflow tool');
 }
 const current = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false, include_skills: true } });
 const realTmp = await fs.realpath(tmp);
 if (current.structuredContent.root !== realTmp) throw new Error(`open_current_workspace opened ${current.structuredContent.root}, expected ${realTmp}`);
 if (current.structuredContent.least_tool !== 'open_current_workspace') throw new Error('tool result was not tagged for widget rendering');
 if (current.structuredContent.tool_mode !== 'full') throw new Error(`open_current_workspace did not expose tool_mode: ${current.structuredContent.tool_mode}`);
+if (!current.structuredContent.agent_tools?.includes?.('agent_start')) {
+  throw new Error(`open_current_workspace did not expose agent discovery tools: ${JSON.stringify(current.structuredContent.agent_tools)}`);
+}
+if (!current.content?.[0]?.text?.includes('Fallback CLI doctor bridge:')) {
+  throw new Error('open_current_workspace did not include agent CLI bridge guidance');
+}
 if (!current.structuredContent.skill_inventory?.some?.((skill) => skill.name === 'smoke-skill')) {
   throw new Error('open_current_workspace did not discover workspace skill inventory');
 }
@@ -213,8 +251,17 @@ if (loadedSkill.structuredContent.skill?.name !== 'smoke-skill' || !loadedSkill.
 await expectToolError('load_skill', { name: 'missing-skill' }, /Skill not found/);
 const inventory = await client.request('tools/call', { name: 'least_inventory', arguments: { include_global_skills: false, include_mcp_servers: false } });
 if (inventory.structuredContent.least_tool !== 'least_inventory') throw new Error('inventory result was not tagged for widget rendering');
+if (!inventory.structuredContent.agent_tools?.includes?.('agent_start')) {
+  throw new Error(`least_inventory did not expose agent tools: ${JSON.stringify(inventory.structuredContent.agent_tools)}`);
+}
+if (!inventory.content?.[0]?.text?.includes('fallback doctor:')) {
+  throw new Error('least_inventory did not include fallback doctor guidance');
+}
 const opened = await client.request('tools/call', { name: 'open_workspace', arguments: { root: tmp, include_tree: true } });
 const ws = opened.structuredContent.workspace_id;
+if (!opened.structuredContent.agent_cli_bridge?.doctor) {
+  throw new Error('open_workspace did not expose agent_cli_bridge.doctor');
+}
 const openedByPath = await client.request('tools/call', { name: 'open_workspace', arguments: { path: tmp, include_tree: false } });
 if (openedByPath.structuredContent.workspace_id !== ws) {
   throw new Error(`open_workspace path alias returned ${openedByPath.structuredContent.workspace_id}, expected ${ws}`);
@@ -412,8 +459,8 @@ async function assertToolMode(mode, expected, hidden) {
   modeClient.close();
 }
 
-await assertToolMode('', ['server_config', 'open_current_workspace', 'open_workspace', 'files', 'tree', 'search', 'search_context', 'read_many', 'json_query', 'load_skill', 'read', 'write', 'edit', 'bash', 'shell', 'show_changes', 'read_handoff', 'export_pro_context', 'handoff_to_agent'], ['least_inventory', 'workspace_snapshot', 'git_status', 'git_diff', 'codex_context', 'handoff_to_codex']);
-await assertToolMode('minimal', ['server_config', 'open_current_workspace', 'open_workspace', 'read', 'write', 'edit', 'bash', 'shell', 'show_changes'], ['tree', 'search', 'load_skill', 'read_handoff', 'export_pro_context', 'handoff_to_agent', 'codex_context']);
+await assertToolMode('', ['server_config', 'open_current_workspace', 'open_workspace', 'files', 'tree', 'search', 'search_context', 'read_many', 'json_query', 'load_skill', 'read', 'write', 'write_many', 'edit', 'bash', 'shell', 'show_changes', 'read_handoff', 'export_pro_context', 'handoff_to_agent', 'agent_list', 'agent_doctor', 'agent_plan', 'agent_start', 'agent_status', 'agent_tail', 'agent_result', 'agent_attach_hint'], ['least_inventory', 'workspace_snapshot', 'git_status', 'git_diff', 'codex_context', 'handoff_to_codex']);
+await assertToolMode('minimal', ['server_config', 'open_current_workspace', 'open_workspace', 'read', 'write', 'write_many', 'edit', 'bash', 'shell', 'run_package_script', 'run_vitest', 'show_changes', 'agent_list', 'agent_doctor', 'agent_plan', 'agent_status', 'agent_attach_hint'], ['tree', 'search', 'load_skill', 'read_handoff', 'export_pro_context', 'handoff_to_agent', 'codex_context', 'agent_start', 'agent_tail', 'agent_result']);
 
 const lowerAgentsRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'least-lower-agents-'));
 await fs.writeFile(path.join(lowerAgentsRoot, 'agents.md'), '# Lowercase agents\n\n- Lowercase instruction file loaded.\n', 'utf8');

@@ -4,6 +4,7 @@ import type { Workspace } from "./guard.js";
 import { LeastError, PathGuard } from "./guard.js";
 import { listFiles } from "./fsOps.js";
 import { redactSensitiveText } from "./redact.js";
+import { readTextWithSnapshot } from "./fileSnapshotCache.js";
 
 export interface JsonQueryOptions {
   path?: string;
@@ -115,7 +116,7 @@ export async function queryJsonFiles(
     try {
       const stat = await fsp.stat(resolved.absPath);
       if (stat.size > config.maxReadBytes) continue;
-      const raw = await fsp.readFile(resolved.absPath, "utf8");
+      const raw = (await readTextWithSnapshot(resolved.absPath, { maxBytes: config.maxReadBytes })).text;
       const parsed = JSON.parse(stripJsonComments(raw)) as unknown;
       const value = resolveJsonPointer(parsed, pointer);
       if (value === undefined && pointer !== "/") continue;

@@ -28,7 +28,7 @@ if (!empty.includes('No saved settings')) {
 }
 
 // Save a simple profile with tunnel=none to avoid hostname requirement
-const saved = run(['settings', 'set', '--root', root, '--tunnel', 'none', '--tool-mode', 'full'], env);
+const saved = run(['settings', 'set', '--root', root, '--tunnel', 'none', '--tool-mode', 'full', '--toolset', 'edit'], env);
 if (!saved.includes('Saved workspace settings')) {
   throw new Error(`expected settings set output, got:\n${saved}`);
 }
@@ -38,7 +38,7 @@ const profile = await (async () => {
   const id = createHash('sha256').update(realRoot).digest('hex').slice(0, 24);
   return JSON.parse(await fs.readFile(path.join(home, 'profiles', `${id}.json`), 'utf8'));
 })();
-if (profile.toolMode !== 'full') {
+if (profile.toolMode !== 'full' || profile.toolset !== 'edit') {
   throw new Error(`settings profile did not persist tool options: ${JSON.stringify(profile)}`);
 }
 

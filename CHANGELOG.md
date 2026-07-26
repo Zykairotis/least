@@ -1,6 +1,11 @@
 # Changelog
 
+## Unreleased
 
+### Mutation performance
+
+- Changed `edit`, `multi_edit`, and `apply_patch` to default to `response_mode=summary`, matching `write` / `write_many`. Diff generation roughly doubles mutation cost and most implementation loops never read the inline diff; pass `response_mode=compact_diff` or `full_diff` when the diff is needed, or use `show_changes` after a batch.
+- Collapsed duplicate `stat` calls on the `write` / `edit` / `multi_edit` paths: the path-guard stat is now reused by the file snapshot cache instead of stat-ing the file twice before every mutation.
 
 ## 0.31.0
 

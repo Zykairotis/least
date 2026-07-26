@@ -194,18 +194,18 @@ try {
 
   const queryTools = await listTools(`${baseUrl}/mcp?least_token=${encodeURIComponent(token)}`);
   const queryToolNames = toolNames(queryTools);
-  for (const expected of ['server_config', 'least_inventory', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'load_skill', 'show_changes', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
+  for (const expected of ['server_config', 'least_inventory', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'load_skill', 'show_changes', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context', 'agent_list', 'agent_doctor', 'agent_plan', 'agent_start', 'agent_status', 'agent_tail', 'agent_result', 'agent_attach_hint']) {
     if (!queryToolNames.includes(expected)) {
       throw new Error(`URL-token MCP tools/list missing ${expected}; got ${queryToolNames.join(', ')}`);
     }
   }
   const toolCardUri = 'ui://widget/least-tool-card-v8.html';
-  for (const visualTool of ['open_current_workspace', 'open_workspace', 'write', 'edit', 'show_changes', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex']) {
+  for (const visualTool of ['open_current_workspace', 'open_workspace', 'files', 'write', 'edit', 'bash', 'shell', 'show_changes', 'export_pro_context', 'handoff_to_agent', 'handoff_to_codex', 'agent_list', 'agent_doctor', 'agent_plan', 'agent_start', 'agent_status', 'agent_tail', 'agent_result', 'agent_attach_hint']) {
     if (!hasWidgetMeta(queryTools, visualTool, toolCardUri)) {
       throw new Error(`${visualTool} should render the Least widget`);
     }
   }
-  for (const quietTool of ['server_config', 'least_inventory', 'list_workspaces', 'workspace_snapshot', 'files', 'tree', 'search', 'search_context', 'read', 'read_many', 'json_query', 'load_skill', 'bash', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
+  for (const quietTool of ['server_config', 'least_inventory', 'list_workspaces', 'workspace_snapshot', 'tree', 'search', 'search_context', 'read', 'read_many', 'json_query', 'load_skill', 'git_status', 'git_diff', 'read_handoff', 'codex_context']) {
     if (hasWidgetMeta(queryTools, quietTool, toolCardUri)) {
       throw new Error(`${quietTool} should stay data-only without widget metadata`);
     }
@@ -215,6 +215,11 @@ try {
   const headerToolNames = toolNames(headerTools);
   if (!headerToolNames.includes('server_config')) {
     throw new Error(`bearer MCP tools/list missing server_config; got ${headerToolNames.join(', ')}`);
+  }
+  for (const expected of ['agent_start', 'agent_status', 'agent_result']) {
+    if (!headerToolNames.includes(expected)) {
+      throw new Error(`bearer MCP tools/list missing ${expected}; got ${headerToolNames.join(', ')}`);
+    }
   }
 
   const mcpUrl = `${baseUrl}/mcp?least_token=${encodeURIComponent(token)}`;

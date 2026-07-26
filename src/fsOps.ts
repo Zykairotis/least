@@ -8,10 +8,38 @@ import { minimatch } from "minimatch";
 import type { LeastConfig } from "./config.js";
 import type { Workspace } from "./guard.js";
 import { LeastError, displayPath, normalizeRelPath, PathGuard } from "./guard.js";
-import { recordFsTiming, recordGuardTiming, recordPartial } from "./perf.js";
+import {
+  COMPACT_DIFF_MAX_CHARS,
+  FULL_DIFF_MAX_CHARS,
+  STORAGE_DIFF_MAX_CHARS,
+  type DiffComputeMode,
+  type PreparedTextContent,
+  emptyDiffMeta,
+  type MutationDiffMeta
+} from "./mutationTypes.js";
+import { recordCacheOutcome, recordFsTiming, recordGuardTiming, recordPartial } from "./perf.js";
 import { hasSecretValue, redactSensitiveText } from "./redact.js";
 import { ToolTimeoutError, throwIfAborted } from "./timeout.js";
 import { offloadedUnifiedDiff, shouldOffloadUnifiedDiff } from "./workerOps.js";
+import {
+  getCachedFileSnapshot,
+  invalidateFileSnapshot,
+  readTextWithSnapshot,
+  setCachedFileSnapshot
+} from "./fileSnapshotCache.js";
+
+export type { DiffComputeMode, PreparedTextContent, MutationDiffMeta } from "./mutationTypes.js";
+
+/** Encode once, hash once. Reuse buffer + digest across write/cache/response. */
+export function prepareTextContent(text: string): PreparedTextContent {
+  const buffer = Buffer.from(text, "utf8");
+  return {
+    text,
+    buffer,
+    bytes: buffer.length,
+    sha256: createHash("sha256").update(buffer).digest("hex")
+  };
+}
 
 export interface TreeOptions {
   path?: string;
@@ -64,6 +92,14 @@ export interface DiffResult {
   additions: number;
   deletions: number;
   changed: boolean;
+  /** Complete (or storage-capped) diff for retrieval storage. */
+  storageDiff?: string;
+  /** Visible preview text (may equal diff). */
+  preview?: string;
+  /** False when storageDiff hit the storage cap. */
+  complete?: boolean;
+  /** Whether line stats were computed (false in summary mode). */
+  statsComputed?: boolean;
 }
 
 export function sha256(text: string): string {
@@ -133,6 +169,58 @@ export async function makeUnifiedDiffMaybeOffloaded(oldText: string, newText: st
   }
   const diff = await offloadedUnifiedDiff(oldText, newText, relPath, maxChars);
   return { ...diff, diff: redactSensitiveText(diff.diff) };
+}
+
+/**
+ * Compute a mutation diff according to response policy.
+ *
+ * - summary: no unified diff; additions/deletions are null (stats omitted).
+ * - compact/full: generate a storage-bound complete diff, then a separate visible preview.
+ *   Callers should store `storageDiff` under a retrieval key and put only `preview` in
+ *   structured content (never both text and structured).
+ */
+export async function computeMutationDiff(
+  oldText: string,
+  newText: string,
+  relPath: string,
+  mode: DiffComputeMode,
+  maxChars?: number,
+  options: { storageMaxChars?: number } = {}
+): Promise<MutationDiffMeta> {
+  if (mode === "none") {
+    return emptyDiffMeta();
+  }
+  const previewLimit =
+    maxChars ?? (mode === "compact" ? COMPACT_DIFF_MAX_CHARS : FULL_DIFF_MAX_CHARS);
+  const storageLimit = Math.max(
+    previewLimit,
+    options.storageMaxChars ?? STORAGE_DIFF_MAX_CHARS
+  );
+
+  // Complete (or storage-capped) diff first — this is what retrieval keys should hold.
+  const complete = await makeUnifiedDiffMaybeOffloaded(oldText, newText, relPath, storageLimit);
+  const storageTruncated = complete.diff.includes("[diff truncated");
+
+  let preview = complete.diff;
+  let previewTruncated = false;
+  if (preview.length > previewLimit) {
+    preview = preview.slice(0, previewLimit) + `\n...[diff truncated to ${previewLimit} chars]`;
+    previewTruncated = true;
+  }
+
+  return {
+    additions: complete.additions,
+    deletions: complete.deletions,
+    changed: complete.changed,
+    statsComputed: true,
+    storageDiff: complete.diff,
+    storageTruncated,
+    complete: !storageTruncated,
+    preview,
+    // legacy alias used by older write/edit return shapes
+    diff: preview,
+    truncated: previewTruncated || storageTruncated
+  };
 }
 
 function isHiddenName(name: string): boolean {
@@ -361,9 +449,12 @@ export async function fileContentSha256(
   if (!fs.existsSync(resolved.absPath)) {
     return { exists: false };
   }
-  await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
-  const text = await fsp.readFile(resolved.absPath, "utf8");
-  return { exists: true, sha256: sha256(text) };
+  const maxBytes = Math.max(config.maxWriteBytes, config.maxReadBytes);
+  const stat = await guard.assertTextFile(resolved.absPath, maxBytes);
+  const snapshot = await readTextWithSnapshot(resolved.absPath, { maxBytes, knownStat: stat });
+  if (snapshot.cacheHit) recordCacheOutcome(true);
+  else recordCacheOutcome(false);
+  return { exists: true, sha256: snapshot.sha256 };
 }
 
 export async function readManyTextFiles(
@@ -382,33 +473,56 @@ export async function readManyTextFiles(
 ): Promise<ReadManyResult> {
   if (!items.length) throw new LeastError("items must include at least one file.");
   const maxTotalBytes = Math.min(options.maxTotalBytes ?? config.maxReadBytes * 3, config.maxReadBytes * 10);
-  const deduped = new Map<string, Promise<ReadFileResult>>();
   const concurrency = Math.max(1, Math.min(options.concurrency ?? 8, 16));
 
-  const resolved = await mapWithConcurrency(items, concurrency, async (item) => {
+  // Deduplicate request list before parallel execution to avoid race-duplicate reads.
+  const uniqueItems: ReadManyItem[] = [];
+  const seenKeys = new Set<string>();
+  for (const item of items) {
     const key = `${item.path}\u0000${item.startLine ?? ""}\u0000${item.endLine ?? ""}\u0000${options.includeSha256 ? "sha" : "no-sha"}\u0000${options.includeLineNumbers === false ? "plain" : "numbered"}\u0000${options.includeTotalLines ? "totals" : "fast"}`;
-    const existing = deduped.get(key);
-    if (existing) return existing;
-    const promise = readTextFile(config, guard, workspace, item.path, {
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    uniqueItems.push(item);
+  }
+
+  // Shared atomic-ish budget: stop scheduling new work once exhausted (best-effort across workers).
+  let budgetRemaining = maxTotalBytes;
+  let budgetExhausted = false;
+
+  const resolved = await mapWithConcurrency(uniqueItems, concurrency, async (item) => {
+    if (options.signal?.aborted || budgetExhausted || budgetRemaining <= 0) {
+      return undefined;
+    }
+    const result = await readTextFile(config, guard, workspace, item.path, {
       startLine: item.startLine,
       endLine: item.endLine,
-      maxBytes: config.maxReadBytes,
+      maxBytes: Math.min(config.maxReadBytes, Math.max(1, budgetRemaining)),
       includeSha256: options.includeSha256,
       includeLineNumbers: options.includeLineNumbers,
       includeTotalLines: options.includeTotalLines,
       signal: options.signal
     });
-    deduped.set(key, promise);
-    return promise;
+    const returnedBytes = result.returnedBytes ?? result.bytes;
+    if (returnedBytes > budgetRemaining) {
+      budgetExhausted = true;
+      return undefined;
+    }
+    budgetRemaining -= returnedBytes;
+    if (budgetRemaining <= 0) budgetExhausted = true;
+    return result;
   });
 
   const files: ReadFileResult[] = [];
   let totalBytes = 0;
-  let truncated = false;
+  let truncated = budgetExhausted;
   let partial = false;
   let timedOut = false;
 
   for (const result of resolved) {
+    if (!result) {
+      truncated = true;
+      continue;
+    }
     if (options.signal?.aborted) {
       partial = true;
       timedOut = options.signal.reason instanceof ToolTimeoutError;
@@ -475,6 +589,32 @@ export async function readTextFile(
 
   const canUseStreamFastPath = rangeRequested && !includeSha256 && requestedEndLine !== undefined && options.includeTotalLines !== true;
   if (canUseStreamFastPath) {
+    // Prefer cached full text for range slices when available (avoids re-streaming cold scans).
+    const cached = getCachedFileSnapshot(resolved.absPath, stat);
+    if (cached) {
+      recordCacheOutcome(true);
+      const allLines = splitLines(cached.text);
+      const endLine = Math.min(allLines.length, requestedEndLine as number);
+      const selected = allLines.slice(startLine - 1, endLine);
+      const text = includeLineNumbers ? withLineNumbers(selected, startLine) : selected.join("\n");
+      const returnedBytes = Buffer.byteLength(text, "utf8");
+      const truncatedByBudget = returnedBytes > maxBytes;
+      const finalText = truncatedByBudget ? text.slice(0, maxBytes) : text;
+      return {
+        path: resolved.relPath,
+        text: finalText,
+        startLine,
+        endLine: Math.max(startLine, endLine),
+        totalLines: undefined,
+        bytes: Buffer.byteLength(finalText, "utf8"),
+        fileBytes: stat.size,
+        returnedBytes: Buffer.byteLength(finalText, "utf8"),
+        sha256: undefined,
+        truncated: truncatedByBudget || endLine < (requestedEndLine as number),
+        partial: truncatedByBudget
+      };
+    }
+    recordCacheOutcome(false);
     const streamed = await measureFs(() =>
       readRangeFromStream(resolved.absPath, startLine, requestedEndLine as number, false, {
         signal: options.signal,
@@ -502,9 +642,12 @@ export async function readTextFile(
     };
   }
 
-  const buffer = await measureFs(() => fsp.readFile(resolved.absPath));
+  // Full-file path: reuse snapshot cache when size/mtime match.
+  const snapshot = await measureFs(() => readTextWithSnapshot(resolved.absPath, { maxBytes: Math.max(maxBytes, config.maxReadBytes) }));
   throwIfAborted(options.signal);
-  const text = buffer.toString("utf8");
+  if (snapshot.cacheHit) recordCacheOutcome(true);
+  else recordCacheOutcome(false);
+  const text = snapshot.text;
   const allLines = splitLines(text);
   const totalLines = allLines.length;
   const endLine = Math.min(totalLines, requestedEndLine ?? totalLines);
@@ -519,11 +662,24 @@ export async function readTextFile(
     endLine,
     totalLines: shouldReturnTotalLines ? totalLines : undefined,
     bytes: returnedBytes,
-    fileBytes: buffer.byteLength,
+    fileBytes: snapshot.size,
     returnedBytes,
-    sha256: includeSha256 ? sha256(text) : undefined,
+    sha256: includeSha256 ? snapshot.sha256 : undefined,
     truncated
   };
+}
+
+export interface WriteTextFileOptions {
+  createDirs?: boolean;
+  overwrite?: boolean;
+  /** Control unified-diff generation. Default: full (backward compatible). */
+  diffMode?: DiffComputeMode;
+  maxDiffChars?: number;
+  /** Precomputed content (encode/hash once). */
+  prepared?: PreparedTextContent;
+  /** When provided, skip re-reading the original for diff/existence. */
+  beforeText?: string;
+  existed?: boolean;
 }
 
 export async function writeTextFile(
@@ -532,38 +688,107 @@ export async function writeTextFile(
   workspace: Workspace,
   filePath: string,
   content: string,
-  options: { createDirs?: boolean; overwrite?: boolean } = {}
+  options: WriteTextFileOptions = {}
 ): Promise<{ path: string; bytes: number; sha256: string; existed: boolean; diff: DiffResult }> {
   const resolved = guard.resolve(workspace, filePath, { forWrite: true });
-  const contentBytes = Buffer.byteLength(content, "utf8");
-  if (contentBytes > config.maxWriteBytes) {
-    throw new LeastError(`Write content is too large (${contentBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
+  const prepared = options.prepared ?? prepareTextContent(content);
+  if (prepared.bytes > config.maxWriteBytes) {
+    throw new LeastError(`Write content is too large (${prepared.bytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
   }
-  if (hasSecretValue(content)) {
+  if (hasSecretValue(prepared.text)) {
     throw new LeastError("Secret-looking content is blocked from write. Use placeholders such as [REDACTED_SECRET] in handoff files.");
   }
 
-  let oldText = "";
-  let existed = false;
-  try {
-    await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
-    oldText = await fsp.readFile(resolved.absPath, "utf8");
-    existed = true;
-  } catch (error) {
-    if (error instanceof LeastError && error.message.startsWith("Not a file")) throw error;
-    if (fs.existsSync(resolved.absPath)) throw error;
+  const diffMode = options.diffMode ?? "full";
+  let oldText = options.beforeText ?? "";
+  let existed = options.existed ?? false;
+  if (options.beforeText === undefined && options.existed === undefined) {
+    // Summary mode without a pre-supplied beforeText only needs existence for overwrite checks.
+    // Full content is required when a unified diff will be computed.
+    const needsOldContent = diffMode !== "none";
+    try {
+      if (needsOldContent) {
+        const stat = await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
+        const snapshot = await readTextWithSnapshot(resolved.absPath, {
+          maxBytes: Math.max(config.maxWriteBytes, config.maxReadBytes),
+          knownStat: stat
+        });
+        if (snapshot.cacheHit) recordCacheOutcome(true);
+        else recordCacheOutcome(false);
+        oldText = snapshot.text;
+        existed = true;
+      } else {
+        // Existence, type, size, and binary validation in one stat/sample pass.
+        await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
+        existed = true;
+        oldText = "";
+      }
+    } catch (error) {
+      if (error instanceof LeastError && error.message.startsWith("Not a file")) throw error;
+      if (error instanceof LeastError && error.message.startsWith("File is too large")) throw error;
+      if (error instanceof LeastError && error.message.includes("binary")) throw error;
+      if (error instanceof LeastError && error.message.startsWith("Refusing")) throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" || !fs.existsSync(resolved.absPath)) {
+        existed = false;
+        oldText = "";
+      } else {
+        throw error;
+      }
+    }
   }
 
   if (existed && options.overwrite === false) {
     throw new LeastError(`File already exists and overwrite=false: ${resolved.relPath}`);
   }
-  if (options.createDirs) {
+  if (options.createDirs !== false) {
     await fsp.mkdir(path.dirname(resolved.absPath), { recursive: true });
+  } else {
+    const parent = path.dirname(resolved.absPath);
+    try {
+      const parentStat = await fsp.stat(parent);
+      if (!parentStat.isDirectory()) {
+        throw new LeastError(`Parent path is not a directory (create_dirs=false): ${path.dirname(resolved.relPath)}`);
+      }
+    } catch (error) {
+      if (error instanceof LeastError) throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new LeastError(`Parent directory does not exist (create_dirs=false): ${path.dirname(resolved.relPath)}`);
+      }
+      throw error;
+    }
   }
 
-  const diff = await makeUnifiedDiffMaybeOffloaded(oldText, content, resolved.relPath);
-  await fsp.writeFile(resolved.absPath, content, "utf8");
-  return { path: resolved.relPath, bytes: contentBytes, sha256: sha256(content), existed, diff };
+  const diffMeta = await computeMutationDiff(oldText, prepared.text, resolved.relPath, diffMode, options.maxDiffChars, {
+    storageMaxChars: config.outputStoreMaxItemBytes
+  });
+  const preview = diffMeta.preview ?? diffMeta.diff ?? `No changes in ${resolved.relPath}.`;
+  const diff: DiffResult = {
+    diff: preview,
+    preview,
+    additions: diffMeta.additions ?? 0,
+    deletions: diffMeta.deletions ?? 0,
+    changed: diffMeta.changed,
+    storageDiff: diffMeta.storageDiff,
+    complete: diffMeta.complete,
+    statsComputed: diffMeta.statsComputed
+  };
+  await fsp.writeFile(resolved.absPath, prepared.buffer);
+  invalidateFileSnapshot(resolved.absPath);
+  try {
+    const nextStat = await fsp.stat(resolved.absPath);
+    setCachedFileSnapshot(resolved.absPath, nextStat, prepared.text, prepared.sha256);
+  } catch {
+    // Best-effort cache warm after write.
+  }
+  return { path: resolved.relPath, bytes: prepared.bytes, sha256: prepared.sha256, existed, diff };
+}
+
+export interface EditTextFileOptions {
+  replaceAll?: boolean;
+  expectedReplacements?: number;
+  /** Control unified-diff generation. Default: full (backward compatible). */
+  diffMode?: DiffComputeMode;
+  maxDiffChars?: number;
 }
 
 export async function editTextFile(
@@ -573,13 +798,17 @@ export async function editTextFile(
   filePath: string,
   oldText: string,
   newText: string,
-  options: { replaceAll?: boolean; expectedReplacements?: number } = {}
+  options: EditTextFileOptions = {}
 ): Promise<{ path: string; replacements: number; bytes: number; sha256: string; diff: DiffResult }> {
   if (!oldText) throw new LeastError("old_text must not be empty.");
   const resolved = guard.resolve(workspace, filePath, { forWrite: true });
-  await guard.assertTextFile(resolved.absPath, Math.max(config.maxWriteBytes, config.maxReadBytes));
-  const before = await fsp.readFile(resolved.absPath, "utf8");
-  const occurrences = before.split(oldText).length - 1;
+  const maxBytes = Math.max(config.maxWriteBytes, config.maxReadBytes);
+  const stat = await guard.assertTextFile(resolved.absPath, maxBytes);
+  const snapshot = await readTextWithSnapshot(resolved.absPath, { maxBytes, knownStat: stat });
+  if (snapshot.cacheHit) recordCacheOutcome(true);
+  else recordCacheOutcome(false);
+  const before = snapshot.text;
+  const occurrences = countOccurrences(before, oldText);
   if (occurrences === 0) {
     throw new LeastError(`old_text was not found in ${resolved.relPath}. Read the file and retry with an exact snippet.`);
   }
@@ -587,7 +816,7 @@ export async function editTextFile(
   let replacements: number;
   let after: string;
   if (options.replaceAll) {
-    after = before.split(oldText).join(newText);
+    after = replaceAllOccurrences(before, oldText, newText);
     replacements = occurrences;
   } else {
     if (occurrences !== 1) {
@@ -601,17 +830,93 @@ export async function editTextFile(
     throw new LeastError(`Expected ${options.expectedReplacements} replacements but would perform ${replacements}.`);
   }
 
-  const afterBytes = Buffer.byteLength(after, "utf8");
-  if (afterBytes > config.maxWriteBytes) {
-    throw new LeastError(`Edited file would be too large (${afterBytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
+  const prepared = prepareTextContent(after);
+  if (prepared.bytes > config.maxWriteBytes) {
+    throw new LeastError(`Edited file would be too large (${prepared.bytes} bytes). Limit: ${config.maxWriteBytes} bytes.`);
   }
-  if (hasSecretValue(after)) {
+  if (hasSecretValue(prepared.text)) {
     throw new LeastError("Secret-looking content is blocked from edit. Use placeholders such as [REDACTED_SECRET] in handoff files.");
   }
 
-  const diff = await makeUnifiedDiffMaybeOffloaded(before, after, resolved.relPath);
-  await fsp.writeFile(resolved.absPath, after, "utf8");
-  return { path: resolved.relPath, replacements, bytes: afterBytes, sha256: sha256(after), diff };
+  const diffMode = options.diffMode ?? "full";
+  const diffMeta = await computeMutationDiff(before, prepared.text, resolved.relPath, diffMode, options.maxDiffChars, {
+    storageMaxChars: config.outputStoreMaxItemBytes
+  });
+  const preview = diffMeta.preview ?? diffMeta.diff ?? `No changes in ${resolved.relPath}.`;
+  const diff: DiffResult = {
+    diff: preview,
+    preview,
+    additions: diffMeta.additions ?? 0,
+    deletions: diffMeta.deletions ?? 0,
+    changed: diffMeta.changed,
+    storageDiff: diffMeta.storageDiff,
+    complete: diffMeta.complete,
+    statsComputed: diffMeta.statsComputed
+  };
+  await fsp.writeFile(resolved.absPath, prepared.buffer);
+  invalidateFileSnapshot(resolved.absPath);
+  try {
+    const nextStat = await fsp.stat(resolved.absPath);
+    setCachedFileSnapshot(resolved.absPath, nextStat, prepared.text, prepared.sha256);
+  } catch {
+    // Best-effort cache warm after edit.
+  }
+  return { path: resolved.relPath, replacements, bytes: prepared.bytes, sha256: prepared.sha256, diff };
+}
+
+/** Count non-overlapping occurrences of needle in haystack without allocating split arrays. */
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while (index <= haystack.length - needle.length) {
+    const found = haystack.indexOf(needle, index);
+    if (found === -1) break;
+    count += 1;
+    index = found + needle.length;
+  }
+  return count;
+}
+
+function replaceAllOccurrences(haystack: string, needle: string, replacement: string): string {
+  if (!needle) return haystack;
+  // Avoid split/join double scan for large files.
+  if (!haystack.includes(needle)) return haystack;
+  return haystack.split(needle).join(replacement);
+}
+
+/**
+ * Plan an exact edit against in-memory file text without writing.
+ * Used by multi_edit transactional preflight.
+ */
+export function planTextEdit(
+  before: string,
+  oldText: string,
+  newText: string,
+  options: { replaceAll?: boolean; expectedReplacements?: number; relPath?: string } = {}
+): { after: string; replacements: number } {
+  if (!oldText) throw new LeastError("old_text must not be empty.");
+  const label = options.relPath ?? "file";
+  const occurrences = countOccurrences(before, oldText);
+  if (occurrences === 0) {
+    throw new LeastError(`old_text was not found in ${label}. Read the file and retry with an exact snippet.`);
+  }
+  let replacements: number;
+  let after: string;
+  if (options.replaceAll) {
+    after = replaceAllOccurrences(before, oldText, newText);
+    replacements = occurrences;
+  } else {
+    if (occurrences !== 1) {
+      throw new LeastError(`old_text matched ${occurrences} times. Provide a more specific old_text or set replace_all=true.`);
+    }
+    after = before.replace(oldText, newText);
+    replacements = 1;
+  }
+  if (typeof options.expectedReplacements === "number" && replacements !== options.expectedReplacements) {
+    throw new LeastError(`Expected ${options.expectedReplacements} replacements but would perform ${replacements}.`);
+  }
+  return { after, replacements };
 }
 
 export async function ensureAiBridge(config: LeastConfig, guard: PathGuard, workspace: Workspace): Promise<string[]> {

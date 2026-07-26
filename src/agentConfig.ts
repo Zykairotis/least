@@ -5,6 +5,7 @@ import type { Workspace } from "./guard.js";
 export type LocalAgentProvider = "claude" | "codex" | "pi" | "grok" | "custom";
 export type PromptTransport = "stdin" | "positional" | "prompt-file" | "native-background" | "interactive" | "unknown";
 export type WritePolicy = "read-only" | "worktree" | "full-access-forbidden";
+export type AgentSessionManagerKind = "groundcrew" | "agent-deck";
 
 export interface LocalAgentProfile {
   provider?: LocalAgentProvider;
@@ -21,9 +22,23 @@ export interface LocalAgentProfile {
   requiredExecutables?: string[];
   smokeArgs?: string[];
   dangerousFlags?: string[];
+  allowDangerousFlags?: boolean;
+}
+
+export interface AgentSessionManagerConfig {
+  kind?: AgentSessionManagerKind;
+  executable?: string;
+  profile?: string;
+  group?: string;
+  worktree?: boolean;
+  newBranch?: boolean;
+  noParent?: boolean;
+  titleLock?: boolean;
+  launchTimeoutMs?: number;
 }
 
 export interface LocalAgentConfig {
+  sessionManager?: AgentSessionManagerConfig;
   groundcrew?: {
     configPath?: string;
     workspaceKind?: "tmux" | "cmux" | "zellij" | "auto";
@@ -50,8 +65,8 @@ export interface LocalAgentConfigLoadResult {
 }
 
 const CANDIDATE_CONFIG_PATHS = [
-  path.join(".least", "agents.local.jsonc"),
-  "agents.local.jsonc"
+  "agents.local.jsonc",
+  path.join(".least", "agents.local.jsonc")
 ];
 
 export const BUILTIN_LOCAL_AGENT_PROFILES: Record<string, LocalAgentProfile> = {
@@ -179,7 +194,7 @@ function commandValue(profile: LocalAgentProfile): string | string[] | undefined
   return profile.command ?? profile.cmd;
 }
 
-function commandText(profile: LocalAgentProfile): string {
+export function commandTextForLocalAgent(profile: LocalAgentProfile): string {
   const command = commandValue(profile);
   return Array.isArray(command) ? command.join(" ") : command ?? "";
 }
@@ -200,8 +215,12 @@ function hasUnsafeShellSyntax(command: string | string[] | undefined): boolean {
 }
 
 function hasDangerousFlag(profile: LocalAgentProfile): string | undefined {
-  const haystack = commandText(profile);
+  const haystack = commandTextForLocalAgent(profile);
   return profile.dangerousFlags?.find((flag) => haystack.includes(flag));
+}
+
+export function usesAgentDeck(config: LocalAgentConfig): boolean {
+  return config.sessionManager?.kind === "agent-deck";
 }
 
 export function localAgentConfigCandidates(workspace: Pick<Workspace, "root">): string[] {
@@ -298,8 +317,8 @@ export function validateLocalAgentConfig(config: LocalAgentConfig): string[] {
       warnings.push(`Agent ${name} command contains shell control syntax. Prefer a wrapper script and an argv-style command array.`);
     }
     const dangerousFlag = hasDangerousFlag(profile);
-    if (profile.enabled !== false && dangerousFlag) {
-      warnings.push(`Agent ${name} command contains high-risk flag ${dangerousFlag}; do not use it as a default profile.`);
+    if (profile.enabled !== false && dangerousFlag && profile.allowDangerousFlags !== true) {
+      warnings.push(`Agent ${name} command contains high-risk flag ${dangerousFlag}; set allowDangerousFlags=true only when the surrounding worktree/session isolation is intentional.`);
     }
   }
   return [...new Set(warnings)];
@@ -330,8 +349,8 @@ export function validateLocalAgentLaunch(config: LocalAgentConfig, agentName: st
     warnings.push(`Local agent profile ${agentName} command uses shell control syntax; prefer a wrapper script.`);
   }
   const dangerousFlag = hasDangerousFlag(profile);
-  if (dangerousFlag) {
-    warnings.push(`Local agent profile ${agentName} command includes high-risk flag ${dangerousFlag}.`);
+  if (dangerousFlag && profile.allowDangerousFlags !== true) {
+    warnings.push(`Local agent profile ${agentName} command includes high-risk flag ${dangerousFlag} without allowDangerousFlags=true.`);
   }
   return warnings;
 }

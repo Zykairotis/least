@@ -12,6 +12,8 @@ import {
 } from "./agentJobStore.js";
 import { loadGroundcrewRuntime, refreshJobFromGroundcrew } from "./agentGroundcrewAdapter.js";
 import { attachHintForJob, inferTerminalMetadata } from "./agentTerminalBackend.js";
+import { loadEffectiveLocalAgentConfig } from "./agentConfig.js";
+import { restartAgentDeckSession } from "./agentDeck.js";
 
 const ACTIVE_AGENT_STATES = new Set<AgentLifecycleState>(["accepted", "provisioning", "running", "resumed"]);
 
@@ -67,6 +69,7 @@ function jobStructured(job: AgentJobRecord): Record<string, unknown> {
     idle_deadline_at: job.watchdog?.idleDeadlineAt,
     last_activity_at: job.watchdog?.lastActivityAt,
     terminal: job.terminal,
+    agent_deck: job.agentDeck,
     groundcrew_state: job.groundcrew?.runState
   };
 }
@@ -185,15 +188,21 @@ export async function agentResume(workspace: Workspace, input: AgentResumeInput)
   if (isActiveAgentJobState(job.state)) {
     throw new LeastError(`Refusing resume for active job ${job.jobId} (state=${job.state}). Cancel or wait for completion first.`);
   }
-  const runtime = await loadGroundcrewRuntime();
-  assertResumeAvailable(runtime);
-  const config = await runtime.loadConfig();
-  await runtime.resumeWorkspace!(config, {
-    task: job.taskId,
-    ...(input.fresh === true ? { fresh: true } : {})
-  });
-  let refreshed = await refreshJobFromGroundcrew({ workspace, runtime, config, job });
-  refreshed = await refreshTerminalMetadataBestEffort(workspace, refreshed);
+  let refreshed: AgentJobRecord;
+  if (job.agentDeck?.sessionId) {
+    const local = await loadEffectiveLocalAgentConfig(workspace);
+    refreshed = await restartAgentDeckSession(workspace, job, local.config.sessionManager);
+  } else {
+    const runtime = await loadGroundcrewRuntime();
+    assertResumeAvailable(runtime);
+    const config = await runtime.loadConfig();
+    await runtime.resumeWorkspace!(config, {
+      task: job.taskId,
+      ...(input.fresh === true ? { fresh: true } : {})
+    });
+    refreshed = await refreshJobFromGroundcrew({ workspace, runtime, config, job });
+    refreshed = await refreshTerminalMetadataBestEffort(workspace, refreshed);
+  }
   const attach = await attachHintForJob(workspace, refreshed);
   const structured = {
     ...jobStructured(refreshed),

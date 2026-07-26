@@ -164,9 +164,16 @@ export interface DashboardState {
   tools: ToolLiveStats[];
   recentToolCalls: ToolCallEvent[];
   hooks: HookStats;
+  /** Recent individual hook executions for the Hooks panel. */
+  recentHooks: HookEventRecord[];
   git: GitDashboardState;
   agents: AgentDashboardState;
   logs: LogEvent[];
   perf: Record<string, unknown>;
   gain: Record<string, unknown>;
+  /** Event stream meta for clients. */
+  stream?: {
+    latestEventId: number;
+    eventCount: number;
+  };
 }

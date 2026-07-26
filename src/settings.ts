@@ -178,6 +178,10 @@ function resolveSettingPaths(settings: LeastSettings, workspaceRoot: string | un
     s.hooks = hk;
   }
 
+  if (s.workflows?.stateDir) {
+    s.workflows = { ...s.workflows, stateDir: resolve(s.workflows.stateDir) };
+  }
+
   return s;
 }
 

@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
@@ -41,6 +41,40 @@ process.exit(2);
   return binPath;
 }
 
+function waitForListening(child) {
+  return new Promise((resolve, reject) => {
+    let stderr = '';
+    const timer = setTimeout(() => reject(new Error(`timeout waiting for HTTP server\n${stderr}`)), 15000);
+    timer.unref();
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+      if (stderr.includes('HTTP MCP listening')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`HTTP server exited before listening: ${code}\n${stderr}`));
+    });
+  });
+}
+
+function stopChild(child, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error('timeout waiting for child exit'));
+    }, timeoutMs);
+    timer.unref();
+    child.on('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill('SIGTERM');
+  });
+}
+
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'least-doctor-smoke-'));
 const home = await fs.mkdtemp(path.join(os.tmpdir(), 'least-doctor-home-'));
 const port = await getFreePort();
@@ -64,10 +98,71 @@ if (result.status !== 0) {
 }
 
 const output = `${result.stdout}\n${result.stderr}`;
-for (const expected of ['Least doctor', 'Node', 'Build artifacts', 'Local port', 'Ready']) {
+for (const expected of ['Least doctor', 'Node', 'Build artifacts', 'Local port', 'Agent surface', 'Ready']) {
   if (!output.includes(expected)) {
     throw new Error(`doctor output missing ${expected}\n${output}`);
   }
+}
+
+const liveRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'least-doctor-live-'));
+const livePort = await getFreePort();
+const liveToken = 'least-doctor-smoke-token';
+const liveServer = spawn(process.execPath, ['dist/http.js'], {
+  cwd: path.resolve('.'),
+  env: {
+    ...process.env,
+    LEAST_ROOT: liveRoot,
+    LEAST_ALLOWED_ROOTS: liveRoot,
+    LEAST_HOST: '127.0.0.1',
+    LEAST_PORT: String(livePort),
+    LEAST_HTTP_TOKEN: liveToken,
+    LEAST_BASH_MODE: 'safe',
+    LEAST_WRITE_MODE: 'handoff',
+    LEAST_TOOL_MODE: 'full',
+    LEAST_AGENT_DEFAULT: 'oh-my-pi'
+  },
+  stdio: ['ignore', 'pipe', 'pipe']
+});
+
+try {
+  await waitForListening(liveServer);
+  const liveDoctor = spawnSync(process.execPath, [
+    'scripts/least.mjs',
+    'doctor',
+    '--root',
+    liveRoot,
+    '--host',
+    '127.0.0.1',
+    '--port',
+    String(livePort),
+    '--token',
+    liveToken,
+    '--tunnel',
+    'none'
+  ], {
+    cwd: path.resolve('.'),
+    env: { ...process.env, LEAST_HOME: home },
+    encoding: 'utf8'
+  });
+
+  if (liveDoctor.status !== 0) {
+    throw new Error(`live doctor failed\nstdout:\n${liveDoctor.stdout}\nstderr:\n${liveDoctor.stderr}`);
+  }
+
+  const liveOutput = `${liveDoctor.stdout}\n${liveDoctor.stderr}`;
+  for (const expected of [
+    'Agent surface',
+    'agent_start, agent_status, agent_tail, agent_result',
+    'Chat refresh',
+    'Xacho.agent_*',
+    'CLI bridge'
+  ]) {
+    if (!liveOutput.includes(expected)) {
+      throw new Error(`live doctor output missing ${expected}\n${liveOutput}`);
+    }
+  }
+} finally {
+  await stopChild(liveServer);
 }
 
 const fakeTailscale = await writeFakeTailscale(home);

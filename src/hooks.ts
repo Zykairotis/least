@@ -220,13 +220,16 @@ export async function runHooks(
 ): Promise<HookResult[]> {
   const { event, toolName, toolInput, workspace, context, failClosed = true, yoloMode = false } = options;
 
-  emitDashboardEvent({ kind: "hook:start", toolName, payload: { event } });
-
   const specs = getHooksForEvent(event, settings, workspaceRoot, toolName);
-  if (specs.length === 0) {
-    emitDashboardEvent({ kind: "hook:end", toolName, payload: { event, reason: "no specs" } });
-    return [];
-  }
+  if (specs.length === 0) return [];
+
+  const batchStarted = Date.now();
+  emitDashboardEvent({
+    kind: "hook:start",
+    toolName,
+    level: "info",
+    payload: { event, hookCount: specs.length }
+  });
 
   const payload: HookPayload = {
     event,
@@ -237,41 +240,83 @@ export async function runHooks(
     context
   };
 
-  const results: HookResult[] = [];
-
+  const trusted: HookSpec[] = [];
   for (const spec of specs) {
     const trust = isHookCommandTrusted(spec, settings, workspaceRoot);
     if (!trust.trusted) {
+      recordHookEvent({
+        ts: new Date().toISOString(),
+        event,
+        toolName,
+        trusted: false,
+        decision: failClosed && !yoloMode ? "deny" : "allow",
+        reason: trust.reason ?? "Hook not trusted."
+      });
       if (failClosed && !yoloMode) {
-        emitDashboardEvent({ kind: "hook:end", toolName, payload: { event, decisions: ["deny"] } });
+        emitDashboardEvent({
+          kind: "hook:end",
+          toolName,
+          level: "warn",
+          durationMs: Date.now() - batchStarted,
+          payload: { event, decisions: ["deny"], reason: trust.reason ?? "Hook not trusted.", untrusted: true }
+        });
         return [{ decision: "deny", reason: trust.reason ?? "Hook not trusted." }];
       }
       continue;
     }
+    trusted.push(spec);
+  }
 
+  const executed = await Promise.all(trusted.map(async (spec) => {
     const timeoutMs = spec.timeoutMs ?? 3_000;
     const hookStartTime = Date.now();
     const execResult = await executeHook(spec, payload, workspaceRoot, timeoutMs);
     const execDurationMs = Date.now() - hookStartTime;
+    recordHookEvent({
+      ts: new Date().toISOString(),
+      event,
+      toolName,
+      trusted: true,
+      decision: execResult.result.decision,
+      durationMs: execDurationMs,
+      timedOut: execResult.result.decision === "error" && /timeout/i.test(execResult.result.reason ?? ""),
+      reason: execResult.result.reason
+    });
+    return execResult.result;
+  }));
 
-    recordHookEvent({ id: 0, ts: new Date().toISOString(), event, toolName, decision: execResult.result.decision, durationMs: execDurationMs });
-
-    if (execResult.result.decision === "deny" || execResult.result.decision === "error") {
-      if (failClosed && !yoloMode) {
-        emitDashboardEvent({ kind: "hook:end", toolName, payload: { event, decisions: ["deny"] } });
-        return [execResult.result];
-      }
-      // In yolo mode, hook denials become non-blocking warnings — skip original result
-      results.push({
-        decision: "allow",
-        context: `[yolo bypass] ${execResult.result.reason ?? "Hook returned " + execResult.result.decision}`
-      });
-      continue;
-    }
-    results.push(execResult.result);
+  const denied = executed.find((result) => result.decision === "deny" || result.decision === "error");
+  if (denied && failClosed && !yoloMode) {
+    emitDashboardEvent({
+      kind: "hook:end",
+      toolName,
+      level: denied.decision === "error" ? "error" : "warn",
+      durationMs: Date.now() - batchStarted,
+      payload: { event, decisions: [denied.decision], reason: denied.reason }
+    });
+    return [denied];
   }
+  const results = executed.map((result) =>
+    result.decision === "deny" || result.decision === "error"
+      ? {
+        decision: "allow",
+        context: `[yolo bypass] ${result.reason ?? "Hook returned " + result.decision}`
+      } as HookResult
+      : result
+  );
 
-  emitDashboardEvent({ kind: "hook:end", toolName, durationMs: 0, payload: { event, decisions: results.map(r => r.decision) } });
+  emitDashboardEvent({
+    kind: "hook:end",
+    toolName,
+    level: "info",
+    durationMs: Date.now() - batchStarted,
+    payload: {
+      event,
+      decisions: results.map((r) => r.decision),
+      executed: executed.length,
+      trusted: trusted.length
+    }
+  });
   return results;
 }
 

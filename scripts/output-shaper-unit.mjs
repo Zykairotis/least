@@ -211,7 +211,11 @@ assert.ok(scriptMatch?.[1], "tool-card widget should include inline script");
 for (const toolOutput of [
   { least_tool: "open_current_workspace", root: process.cwd(), workspace_id: "ws-widget", git_status: "## main\n M src/toolCardWidget.ts", tool_mode: "full", toolset: "full", bash_mode: "safe", write_mode: "workspace" },
   { least_tool: "show_changes", changed: true, changed_files: ["M src/toolCardWidget.ts"], additions: 1, deletions: 1, status: "## main\n M src/toolCardWidget.ts" },
-  { least_tool: "handoff_to_agent", agent: "codex", plan_path: ".ai-bridge/current-plan.md", additions: 1, deletions: 0 }
+  { least_tool: "handoff_to_agent", agent: "codex", plan_path: ".ai-bridge/current-plan.md", additions: 1, deletions: 0 },
+  { least_tool: "files", files: ["src/server.ts", "src/toolCardWidget.ts", "package.json"], count: 3, backend: "ripgrep" },
+  { least_tool: "bash", command: "npm run build", exitCode: 0, stdout: "build ok\n", stderr: "", durationMs: 123 },
+  { least_tool: "agent_status", job_id: "agent_demo_1234567890", task_id: "demo-task", agent: "oh-my-pi", state: "running" },
+  { least_tool: "agent_attach_hint", job_id: "agent_demo_1234567890", attach_commands: [{ command: "zellij attach demo" }] }
 ]) {
   const root = { innerHTML: "" };
   const windowMock = { openai: { toolOutput }, parent: undefined, addEventListener() {} };

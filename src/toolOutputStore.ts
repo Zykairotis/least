@@ -74,9 +74,51 @@ export async function storeToolOutput(
     visibleBytes: Math.max(0, visibleBytes),
     ttlMs: config.outputStoreTtlMs
   };
-  await fsp.writeFile(txtPath, redacted, "utf8");
-  await fsp.writeFile(metaPath(root, key), JSON.stringify(meta), "utf8");
+  const metadataPath = metaPath(root, key);
+  const exists = await Promise.all([fsp.access(txtPath).then(() => true, () => false), fsp.access(metadataPath).then(() => true, () => false)]);
+  if (!exists[0] || !exists[1]) {
+    await Promise.all([
+      exists[0] ? Promise.resolve() : fsp.writeFile(txtPath, redacted, "utf8"),
+      exists[1] ? Promise.resolve() : fsp.writeFile(metadataPath, JSON.stringify(meta), "utf8")
+    ]);
+  }
   return key;
+}
+
+export interface StoreMutationDiffOptions {
+  toolName: string;
+  changedPaths?: string[];
+  visibleBytes?: number;
+}
+
+/**
+ * Store a full mutation diff for later retrieval.
+ * Redacts secrets, skips when store disabled or content looks secret.
+ * Avoids duplicate writes when the same content already exists.
+ */
+export async function storeMutationDiff(
+  config: LeastConfig,
+  workspaceRoot: string,
+  workspaceId: string,
+  diffText: string,
+  options: StoreMutationDiffOptions
+): Promise<string | undefined> {
+  if (!diffText || !diffText.trim()) return undefined;
+  // Reject before redaction so secret-looking diffs are not stored at all.
+  if (hasSecretValue(diffText)) return undefined;
+  const header =
+    options.changedPaths && options.changedPaths.length
+      ? `# Mutation Diff (${options.toolName})\nPaths: ${options.changedPaths.join(", ")}\n\n`
+      : `# Mutation Diff (${options.toolName})\n\n`;
+  return storeToolOutput(
+    config,
+    workspaceRoot,
+    workspaceId,
+    options.toolName,
+    "git_diff",
+    header + diffText,
+    options.visibleBytes ?? 0
+  );
 }
 
 async function loadMeta(root: string, key: string): Promise<StoredOutputMeta | undefined> {

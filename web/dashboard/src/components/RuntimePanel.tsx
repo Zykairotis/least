@@ -25,7 +25,12 @@ export function RuntimePanel({ runtime, snapshot }: RuntimePanelProps) {
 
   return (
     <div>
-      <h2 className="section-title">Runtime</h2>
+      <div className="page-header">
+        <div>
+          <div className="page-title">Runtime</div>
+          <div className="page-subtitle">Process health, memory, and server configuration</div>
+        </div>
+      </div>
 
       <div className="metric-grid">
         <MetricCard title="Node Version" value={runtime.node} />

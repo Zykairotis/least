@@ -12,19 +12,26 @@ const PRESETS = [
   { label: "5s", value: 5000 },
   { label: "10s", value: 10_000 },
   { label: "30s", value: 30_000 },
-  { label: "Pause", value: 0 },
+  { label: "SSE only", value: 0 },
 ];
 
 export function SettingsPanel({ snapshot, refreshIntervalMs, onRefreshIntervalChange }: SettingsPanelProps) {
   return (
     <div>
-      <h2 className="section-title">Settings</h2>
+      <div className="page-header">
+        <div>
+          <div className="page-title">Settings</div>
+          <div className="page-subtitle">
+            Live updates primarily use SSE. Polling is a backup for runtime/git when nothing is firing.
+          </div>
+        </div>
+      </div>
 
       <div className="chart-container">
-        <div className="chart-title">Auto-Refresh</div>
+        <div className="chart-title">Backup poll interval</div>
         <div style={{ marginBottom: 12 }}>
           <div style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 8 }}>
-            Poll interval: {refreshIntervalMs === 0 ? "Paused" : `${refreshIntervalMs / 1000}s`}
+            Poll: {refreshIntervalMs === 0 ? "SSE only (no backup poll)" : `${refreshIntervalMs / 1000}s`}
           </div>
           <div className="filter-bar">
             {PRESETS.map((p) => (

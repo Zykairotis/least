@@ -67,6 +67,9 @@ async function run() {
   assert.ok(state.agents, "snapshot should have agents section");
   assert.ok(Array.isArray(state.agents.jobs), "agents.jobs should be an array");
   assert.ok(Array.isArray(state.agents.terminalSessions), "agents.terminalSessions should be an array");
+  assert.ok(Array.isArray(state.recentHooks), "snapshot should include recentHooks");
+  assert.ok(state.hooks, "snapshot should have hooks stats");
+  assert.ok(state.stream, "snapshot should include stream meta");
   console.log("✓ snapshot returns expected sections");
 
   console.log("\n✓ All dashboard unit tests passed");

@@ -7,9 +7,10 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { createInterface } from 'node:readline/promises';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const CORE_AGENT_SURFACE_TOOLS = ['agent_start', 'agent_status', 'agent_tail', 'agent_result'];
 
 function usage() {
   console.log(`Least easy launcher
@@ -61,6 +62,9 @@ Options:
                              Tool surface exposed to ChatGPT. Default: standard.
                              minimal = open/read/write/edit/bash/show_changes only.
                              full = expose every compatibility and advanced tool.
+  --toolset <standard|explore|edit|review|handoff|full>
+                             Tool bundle profile layered on top of --tool-mode. Default: full.
+                             Use this only when you intentionally want a narrower workflow-specific surface.
   --http-protocols <mcp|openai|both>
                              HTTP surfaces on the local server. Default: both (mcp + openai).
                              mcp = ChatGPT /mcp only. openai = /v1 tool API only.
@@ -106,7 +110,7 @@ Options:
                              Disable Least internal permission prompts, allow/deny rules, and bash gating.
                              WARNING: bypasses Least safety — trusted local dev only.
                              Does not bypass ChatGPT, OS, or MCP host approvals.
-  --lock-lease-ms <ms>      Workspace lock lease duration when concurrency=lease. Default: 120000.
+  --lock-lease-ms <ms>      Workspace lock lease duration when concurrency=lease. Default: 600000.
   --help                    Show this message.
   --dashboard                Enable the built-in web dashboard.
   --dashboard-port <port>   Dashboard HTTP port. Default: 8922.
@@ -260,7 +264,8 @@ function profileOneLine(profile, index = 0) {
   const tunnel = profile.tunnel ?? 'cloudflare';
   const host = profile.hostname ? ` -> ${profile.hostname}` : '';
   const port = profile.port ? ` :${profile.port}` : '';
-  return `${prefix}${profile.root}  ${tunnel}${host}${port}`;
+  const tools = profile.toolMode || profile.toolset ? `  tools=${profile.toolMode ?? 'standard'}/${profile.toolset ?? 'full'}` : '';
+  return `${prefix}${profile.root}  ${tunnel}${host}${port}${tools}`;
 }
 
 function printSavedProfileHint(profile) {
@@ -774,7 +779,7 @@ async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForHealth(url, token, timeoutMs = 15000) {
+async function waitForHealth(url, token, timeoutMs = 60000) {
   const started = Date.now();
   let lastError = '';
   while (Date.now() - started < timeoutMs) {
@@ -1636,7 +1641,7 @@ function printConnectorBlock(endpoint, token, options = {}) {
   console.log('');
   console.log(paint('bold', 'Least ready'));
   if (options.root) console.log(`  Workspace  ${options.root}`);
-  console.log(`  Mode       ${modeTitle}  tools=${options.toolMode ?? 'standard'}  write=${options.write ?? 'workspace'}  bash=${options.bash ?? 'safe'}  shell=${options.shellBackend ?? 'auto'}`);
+  console.log(`  Mode       ${modeTitle}  tool-mode=${options.toolMode ?? 'standard'}  toolset=${options.toolset ?? 'full'}  write=${options.write ?? 'workspace'}  bash=${options.bash ?? 'safe'}  shell=${options.shellBackend ?? 'auto'}`);
   console.log(`  Connector  ${publicHttps ? 'public HTTPS' : 'local HTTP'}`);
   if (options.dualClient) {
     console.log(`  ChatGPT    ${serverUrl}`);
@@ -1666,9 +1671,9 @@ function printConnectorBlock(endpoint, token, options = {}) {
     printGrokConnectorFields(details);
   }
   console.log(options.dualClient || options.grokOAuth
-    ? 'Keys: Enter open | c copy | g grok fields | o status | h help | q quit'
-    : 'Keys: Enter open | c copy | o status | h help | q quit');
-  return { ...details, copied, opened, mode, toolMode: options.toolMode ?? 'standard' };
+    ? 'Keys: Enter open | c copy | g grok fields | o status | h help | q quit (Ctrl+C ignored)'
+    : 'Keys: Enter open | c copy | o status | h help | q quit (Ctrl+C ignored)');
+  return { ...details, copied, opened, mode, toolMode: options.toolMode ?? 'standard', toolset: options.toolset ?? 'full' };
 }
 
 function printControlHelp() {
@@ -1683,6 +1688,7 @@ function printControlHelp() {
   console.log('  m      print mode help');
   console.log('  h      show controls');
   console.log('  q      stop Least');
+  console.log('  Ctrl+C  ignored once (voice tools inject it to copy context); twice quickly still quits');
   console.log('');
 }
 
@@ -1753,6 +1759,112 @@ function doctorLine(status, label, detail = '') {
   console.log(`${marker} ${label.padEnd(18)} ${detail}`);
 }
 
+function summarizeList(items, maxItems = 8) {
+  if (!items?.length) return '(none)';
+  if (items.length <= maxItems) return items.join(', ');
+  return `${items.slice(0, maxItems).join(', ')} +${items.length - maxItems} more`;
+}
+
+async function loadAgentSupport(root) {
+  const modulePath = path.join(projectRoot, 'dist', 'agentDiscovery.js');
+  if (!fs.existsSync(modulePath)) return null;
+  try {
+    const mod = await import(`${pathToFileURL(modulePath).href}?t=${Date.now()}`);
+    if (typeof mod.discoverAgentSupport !== 'function') return null;
+    return await mod.discoverAgentSupport({ root });
+  } catch {
+    return null;
+  }
+}
+
+async function listLiveMcpTools(baseUrl, token = '') {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const mcpUrl = new URL('/mcp', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+  if (token) mcpUrl.searchParams.set('least_token', token);
+  const client = new Client({ name: 'least-launcher-agent-surface', version: '0.0.0' });
+  const transport = new StreamableHTTPClientTransport(mcpUrl);
+  try {
+    await client.connect(transport);
+    const result = await client.listTools();
+    return result.tools.map((tool) => tool.name).sort((a, b) => a.localeCompare(b));
+  } finally {
+    await client.close();
+  }
+}
+
+async function inspectAgentSurface(root, baseUrl, token = '') {
+  const agentSupport = await loadAgentSupport(root);
+  const liveToolNames = await listLiveMcpTools(baseUrl, token);
+  const expectedTools = Array.isArray(agentSupport?.directTools) ? agentSupport.directTools : [];
+  const enabledProfiles = Array.isArray(agentSupport?.enabledProfiles) ? agentSupport.enabledProfiles : [];
+  const missingCore = CORE_AGENT_SURFACE_TOOLS.filter((name) => !liveToolNames.includes(name));
+  const missingExpected = expectedTools.filter((name) => !liveToolNames.includes(name));
+  return {
+    enabledProfiles,
+    expectedTools,
+    liveToolNames,
+    missingCore,
+    missingExpected,
+    cliBridgeDoctor: agentSupport?.cliBridgeDoctor,
+    cliBridgeStartExample: agentSupport?.cliBridgeStartExample,
+    note: agentSupport?.note
+  };
+}
+
+function printAgentSurfaceStatus(report, emitLine, options = {}) {
+  const {
+    noServerMessage = 'No running local Least server detected. Start Least, then verify live MCP tools/list and reconnect ChatGPT if needed.'
+  } = options;
+  if (report?.enabledProfiles?.length) {
+    emitLine('ok', 'Agent profiles', summarizeList(report.enabledProfiles));
+  } else {
+    emitLine('warn', 'Agent profiles', 'none enabled or agent config could not be loaded');
+  }
+  if (report?.error) {
+    emitLine(report.error === '__no_server__' ? 'warn' : 'warn', 'Agent surface', report.error === '__no_server__' ? noServerMessage : report.error);
+    return;
+  }
+  if (!report) {
+    emitLine('warn', 'Agent surface', 'verification unavailable');
+    return;
+  }
+  if (report.missingCore.length === 0) {
+    emitLine('ok', 'Agent surface', `live MCP tools/list includes ${CORE_AGENT_SURFACE_TOOLS.join(', ')}`);
+    emitLine('warn', 'Chat refresh', 'Live MCP tools are correct; if ChatGPT does not show Xacho.agent_*, reconnect the connector and open a new chat.');
+  } else {
+    emitLine('warn', 'Agent surface', `live MCP tools/list missing ${report.missingCore.join(', ')}`);
+  }
+  if (report.expectedTools.length) {
+    emitLine(
+      report.missingExpected.length === 0 ? 'ok' : 'warn',
+      'Agent toolset',
+      report.missingExpected.length === 0
+        ? `all expected agent tools visible (${report.expectedTools.length})`
+        : `missing ${report.missingExpected.join(', ')}`
+    );
+  }
+  if (report.cliBridgeDoctor) {
+    emitLine('ok', 'CLI bridge', report.cliBridgeDoctor);
+  }
+}
+
+function emitDoctorLine(checks, status, label, detail) {
+  checks.push(status);
+  doctorLine(status, label, detail);
+}
+
+function windowsShellBackendWarning(shellBackend) {
+  if (process.platform !== 'win32') return '';
+  if (shellBackend === 'bash') {
+    return 'Windows host with shell-backend=bash: Least will run through whichever bash is on PATH, which may behave like WSL/Linux instead of native Windows.';
+  }
+  if (shellBackend === 'wsl') {
+    return 'Windows host with shell-backend=wsl: Least shell commands run inside WSL/Linux semantics.';
+  }
+  return '';
+}
+
 async function runDoctor(argv) {
   const args = parseArgs(argv);
   if (args.help) {
@@ -1770,6 +1882,9 @@ async function runDoctor(argv) {
   const bash = optionValue(args, profile, 'bash', ['LEAST_BASH_MODE'], 'safe');
   const write = optionValue(args, profile, 'write', ['LEAST_WRITE_MODE'], mode === 'agent' ? 'workspace' : 'handoff');
   const toolMode = optionValue(args, profile, 'toolMode', ['LEAST_TOOL_MODE'], 'standard');
+  const toolset = optionValue(args, profile, 'toolset', ['LEAST_TOOLSET'], 'full');
+  const shellBackend = optionValue(args, profile, 'shellBackend', ['LEAST_SHELL_BACKEND'], 'auto');
+  const token = String(optionValue(args, profile, 'token', ['LEAST_HTTP_TOKEN', 'LEAST_HTTP_TOKEN'], ''));
   const stableHostname = args.hostname
     ?? args.url
     ?? process.env.LEAST_PUBLIC_HOSTNAME
@@ -1796,11 +1911,15 @@ async function runDoctor(argv) {
   console.log('');
   printBox('Least doctor', [
     labelValue('Workspace', root),
-    labelValue('Mode', `${mode}  tools=${toolMode}  write=${write}  bash=${bash}  shell=${optionValue(args, profile, 'shellBackend', ['LEAST_SHELL_BACKEND'], 'auto')}`),
+    labelValue('Mode', `${mode}  tool-mode=${toolMode}  toolset=${toolset}  write=${write}  bash=${bash}  shell=${shellBackend}`),
     labelValue('Tunnel', tunnel),
     ...(stableHostname ? [labelValue('Hostname', stableHostname)] : []),
     ...(profile.profilePath ? [labelValue('Profile', profile.profilePath)] : [])
   ]);
+  const shellWarning = windowsShellBackendWarning(shellBackend);
+  if (shellWarning) {
+    doctorLine('warn', 'Shell semantics', shellWarning);
+  }
 
   record(compareMajorVersion(process.versions.node, 20) ? 'ok' : 'fail', 'Node', `v${process.versions.node} (requires >=20)`);
   record(fs.existsSync(httpPath) && fs.existsSync(serverPath) ? 'ok' : 'fail', 'Build artifacts', fs.existsSync(httpPath) ? 'dist ready' : 'missing dist/http.js; run npm install && npm run build');
@@ -1809,11 +1928,13 @@ async function runDoctor(argv) {
   record(clipboard ? 'ok' : 'warn', 'Clipboard', clipboard || 'not found; URL will be printed for manual copy');
   record(browser ? 'ok' : 'warn', 'Browser open', browser || 'not found; open ChatGPT manually');
 
+  let localPortAvailable = false;
+  let localPortDetail = `${host}:${port} available`;
   try {
     await assertPortAvailable(host, port);
-    record('ok', 'Local port', `${host}:${port} available`);
+    localPortAvailable = true;
   } catch (error) {
-    record('fail', 'Local port', error instanceof Error ? error.message.split('\n')[0] : String(error));
+    localPortDetail = error instanceof Error ? error.message.split('\n')[0] : String(error);
   }
 
   if (tunnel === 'none') {
@@ -1864,16 +1985,46 @@ async function runDoctor(argv) {
   }
 
   const concurrency = optionValue(args, profile, 'concurrency', ['LEAST_CONCURRENCY_MODE'], 'off');
-  const lockLeaseMs = optionValue(args, profile, 'lockLeaseMs', ['LEAST_LOCK_LEASE_MS'], '120000');
+  const lockLeaseMs = optionValue(args, profile, 'lockLeaseMs', ['LEAST_LOCK_LEASE_MS'], '600000');
   if (concurrency === 'lease') {
     record(
       dualClient || tunnel !== 'none' ? 'ok' : 'warn',
       'Concurrency',
-      `lease mode (${lockLeaseMs}ms); acquire_workspace_lock before mutations`
+      `lease mode (${lockLeaseMs}ms); mutations auto-acquire when unlocked`
     );
   } else if (concurrency !== 'off') {
     record('fail', 'Concurrency', `unknown mode: ${concurrency}; use off or lease`);
   }
+
+  const agentSupport = await loadAgentSupport(root);
+  if (agentSupport?.enabledProfiles?.length) {
+    record('ok', 'Agent profiles', summarizeList(agentSupport.enabledProfiles));
+  }
+  let agentSurfaceReport;
+  try {
+    if (localPortAvailable) {
+      agentSurfaceReport = { enabledProfiles: agentSupport?.enabledProfiles ?? [], error: '__no_server__' };
+    } else {
+      agentSurfaceReport = await inspectAgentSurface(root, `http://${host}:${port}`, token);
+    }
+  } catch (error) {
+    agentSurfaceReport = {
+      enabledProfiles: agentSupport?.enabledProfiles ?? [],
+      error: error instanceof Error ? error.message.split('\n')[0] : String(error)
+    };
+  }
+
+  if (localPortAvailable) {
+    record('ok', 'Local port', localPortDetail);
+  } else if (!agentSurfaceReport?.error) {
+    record('ok', 'Local port', `${host}:${port} already serving a live Least MCP server`);
+  } else {
+    record('fail', 'Local port', localPortDetail);
+  }
+  printAgentSurfaceStatus(agentSurfaceReport, (status, label, detail) => {
+    if (label === 'Agent profiles' && agentSupport?.enabledProfiles?.length) return;
+    emitDoctorLine(checks, status, label, detail);
+  });
 
   const failures = checks.filter((status) => status === 'fail').length;
   const warnings = checks.filter((status) => status === 'warn').length;
@@ -1982,6 +2133,7 @@ function profileFromPreference(root, args, profile, preference) {
   const shellBackend = optionValue(args, profile, 'shellBackend', ['LEAST_SHELL_BACKEND'], '');
   const write = optionValue(args, profile, 'write', ['LEAST_WRITE_MODE'], '');
   const toolMode = optionValue(args, profile, 'toolMode', ['LEAST_TOOL_MODE'], '');
+  const toolset = optionValue(args, profile, 'toolset', ['LEAST_TOOLSET'], '');
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['LEAST_WIDGET_DOMAIN'], '');
   const existingToken = optionValue(args, profile, 'token', ['LEAST_HTTP_TOKEN', 'LEAST_HTTP_TOKEN'], '');
   const token = preference.tunnel === 'none' ? existingToken : stableToken(existingToken);
@@ -2000,6 +2152,7 @@ function profileFromPreference(root, args, profile, preference) {
     ...(shellBackend ? { shellBackend } : {}),
     ...(write ? { write } : {}),
     ...(toolMode ? { toolMode } : {}),
+    ...(toolset ? { toolset } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...(args.noInstallCloudflared ? { noInstallCloudflared: true } : {}),
     root
@@ -2123,11 +2276,13 @@ async function runSetupWizard(argv) {
     const shellBackend = optionValue(defaults, profile, 'shellBackend', ['LEAST_SHELL_BACKEND'], '');
     const write = optionValue(defaults, profile, 'write', ['LEAST_WRITE_MODE'], '');
     const toolMode = optionValue(defaults, profile, 'toolMode', ['LEAST_TOOL_MODE'], '');
+    const toolset = optionValue(defaults, profile, 'toolset', ['LEAST_TOOLSET'], '');
     const widgetDomain = optionValue(defaults, profile, 'widgetDomain', ['LEAST_WIDGET_DOMAIN'], '');
     if (bash) args.push('--bash', bash);
     if (shellBackend) args.push('--shell-backend', shellBackend);
     if (write) args.push('--write', write);
     if (toolMode) args.push('--tool-mode', toolMode);
+    if (toolset) args.push('--toolset', toolset);
     if (widgetDomain) args.push('--widget-domain', widgetDomain);
     if (defaults.noInstallCloudflared) args.push('--no-install-cloudflared');
     if (defaults.openChatgpt) args.push('--open-chatgpt');
@@ -2249,11 +2404,12 @@ function printProfile(root, profile) {
     ...(safe.mode ? [labelValue('Mode', safe.mode)] : []),
     ...(safe.bash ? [labelValue('Bash', safe.bash)] : []),
     ...(safe.shellBackend ? [labelValue('Shell', safe.shellBackend)] : []),
-    ...(safe.toolMode ? [labelValue('Tools', safe.toolMode)] : []),
+    ...(safe.toolMode ? [labelValue('Tool mode', safe.toolMode)] : []),
+    ...(safe.toolset ? [labelValue('Toolset', safe.toolset)] : []),
     ...(safe.token ? [labelValue('Token', safe.token)] : []),
     ...(safe.dualClient ? [labelValue('Dual client', 'enabled (/mcp + /mcp-grok)')] : []),
     ...(safe.grokOAuth && !safe.dualClient ? [labelValue('Grok OAuth', 'enabled (/mcp)')] : []),
-    ...(safe.concurrency && safe.concurrency !== 'off' ? [labelValue('Concurrency', `${safe.concurrency} (${safe.lockLeaseMs ?? 120000}ms lease)`)] : [])
+    ...(safe.concurrency && safe.concurrency !== 'off' ? [labelValue('Concurrency', `${safe.concurrency} (${safe.lockLeaseMs ?? 600000}ms lease)`)] : [])
   ]);
 }
 
@@ -2287,6 +2443,7 @@ function saveSettingsFromArgs(root, args, profile) {
     throw new Error('--shell-backend must be auto, cmd, powershell, bash, or wsl');
   }
   const toolMode = optionValue(args, profile, 'toolMode', ['LEAST_TOOL_MODE'], profile.toolMode ?? '');
+  const toolset = optionValue(args, profile, 'toolset', ['LEAST_TOOLSET'], profile.toolset ?? '');
   const widgetDomain = optionValue(args, profile, 'widgetDomain', ['LEAST_WIDGET_DOMAIN'], profile.widgetDomain ?? '');
   const port = String(optionValue(args, profile, 'port', ['LEAST_PORT'], profile.port ?? '8787'));
   const token = tunnel === 'none'
@@ -2307,6 +2464,7 @@ function saveSettingsFromArgs(root, args, profile) {
     ...(shellBackend ? { shellBackend } : {}),
     ...(args.write ?? profile.write ? { write: args.write ?? profile.write } : {}),
     ...(toolMode ? { toolMode } : {}),
+    ...(toolset ? { toolset } : {}),
     ...(widgetDomain ? { widgetDomain } : {}),
     ...(args.noInstallCloudflared ?? profile.noInstallCloudflared ? { noInstallCloudflared: true } : {}),
     ...(args.dualClient || profile.dualClient ? { dualClient: true } : {}),
@@ -2477,13 +2635,32 @@ function runControlPanel(details) {
   if (typeof process.stdin.setRawMode === 'function') process.stdin.setRawMode(true);
   process.stdin.resume();
 
+  // Wispr Flow Command Mode (and similar tools) inject Ctrl+C to copy the
+  // focused selection for context, then paste a result. That must not kill Least.
+  let lastCtrlCAt = 0;
+  const CTRL_C_DOUBLE_MS = 1500;
+
   return new Promise(() => {
     process.stdin.on('data', (key) => {
       if (key === '\u0003') {
-        console.log('\nStopping Least...');
-        cleanupChildren();
-        process.exit(130);
+        const now = Date.now();
+        if (now - lastCtrlCAt < CTRL_C_DOUBLE_MS) {
+          console.log('\nStopping Least...');
+          cleanupChildren();
+          process.exit(130);
+        }
+        lastCtrlCAt = now;
+        console.log('\nCtrl+C ignored (often injected by voice Command Mode to copy context). Press q to quit, or Ctrl+C twice.');
+        writeControlPrompt();
+        return;
       }
+
+      // Ignore multi-character bursts (clipboard paste / injected dictation text)
+      // so a stray "q" inside pasted content cannot stop Least.
+      if (typeof key === 'string' && key.length > 1) {
+        return;
+      }
+
       const normalized = key.toLowerCase();
       if (key === '\r' || key === '\n') {
         const opened = openUrl(details.chatgptSettingsUrl);
@@ -2664,6 +2841,7 @@ async function main() {
   const shellBackend = optionValue(args, profile, 'shellBackend', ['LEAST_SHELL_BACKEND'], 'auto');
   const write = optionValue(args, profile, 'write', ['LEAST_WRITE_MODE'], mode === 'agent' ? 'workspace' : 'handoff');
   const toolMode = optionValue(args, profile, 'toolMode', ['LEAST_TOOL_MODE'], 'standard');
+  const toolset = optionValue(args, profile, 'toolset', ['LEAST_TOOLSET'], 'full');
   const httpProtocolsRaw = args.httpProtocols ?? process.env.LEAST_HTTP_PROTOCOLS ?? 'both';
   const httpProtocols = normalizeHttpProtocols(httpProtocolsRaw);
   if (dualClient && !httpProtocols.includes('mcp')) {
@@ -2676,8 +2854,11 @@ async function main() {
   }
   if (!['off', 'handoff', 'workspace'].includes(write)) throw new Error('--write must be off, handoff, or workspace');
   if (!['minimal', 'standard', 'full'].includes(toolMode)) throw new Error('--tool-mode must be minimal, standard, or full');
+  if (!['standard', 'explore', 'edit', 'review', 'handoff', 'full'].includes(toolset)) {
+    throw new Error('--toolset must be standard, explore, edit, review, handoff, or full');
+  }
   const concurrency = optionValue(args, profile, 'concurrency', ['LEAST_CONCURRENCY_MODE'], 'off');
-  const lockLeaseMs = optionValue(args, profile, 'lockLeaseMs', ['LEAST_LOCK_LEASE_MS'], '120000');
+  const lockLeaseMs = optionValue(args, profile, 'lockLeaseMs', ['LEAST_LOCK_LEASE_MS'], '600000');
   if (!['off', 'lease'].includes(concurrency)) throw new Error('--concurrency must be off or lease');
 
   let token = args.noAuth ? '' : optionValue(args, profile, 'token', ['LEAST_HTTP_TOKEN', 'LEAST_HTTP_TOKEN'], '');
@@ -2693,6 +2874,7 @@ async function main() {
     LEAST_SHELL_BACKEND: shellBackend,
     LEAST_WRITE_MODE: write,
     LEAST_TOOL_MODE: toolMode,
+    LEAST_TOOLSET: toolset,
     LEAST_HTTP_PROTOCOLS: httpProtocols,
     LEAST_WIDGET_DOMAIN: widgetDomain,
     LEAST_MODE: mode,
@@ -2705,6 +2887,7 @@ async function main() {
     LEAST_YOLO: args.yolo ? '1' : '0',
   };
   const isYolo = args.yolo === true || process.env.LEAST_YOLO === '1';
+  const shellWarning = windowsShellBackendWarning(shellBackend);
 
   if (args.logRequests || process.env.LEAST_LOG_REQUESTS === '1') serverEnv.LEAST_LOG_REQUESTS = '1';
   if (args.printTools || process.env.LEAST_PRINT_TOOLS === '1') serverEnv.LEAST_PRINT_TOOLS = '1';
@@ -2738,7 +2921,7 @@ async function main() {
   }
   printBox('Least start', [
     labelValue('Workspace', root),
-    labelValue('Mode', `${mode}  tools=${toolMode}  write=${write}  bash=${bash}  shell=${shellBackend}${isYolo ? '  YOLO' : ''}`),
+    labelValue('Mode', `${mode}  tool-mode=${toolMode}  toolset=${toolset}  write=${write}  bash=${bash}  shell=${shellBackend}${isYolo ? '  YOLO' : ''}`),
     labelValue('Local URL', dualClient ? `http://${host}:${port}/mcp + /mcp-grok` : `http://${host}:${port}/mcp`),
     labelValue(
       'Tunnel',
@@ -2751,8 +2934,11 @@ async function main() {
             : tunnel === 'tailscale-funnel'
               ? 'Tailscale Funnel stable ts.net hostname'
               : 'none'
-    )
+      )
   ]);
+  if (shellWarning) {
+    statusLine('warn', shellWarning);
+  }
 
   const verboseLogs = Boolean(args.logRequests || process.env.LEAST_LOG_REQUESTS === '1');
   statusLine('wait', 'Starting local MCP server');
@@ -2763,8 +2949,38 @@ async function main() {
   process.on('SIGTERM', () => { cleanup(); process.exit(143); });
 
   const localBase = `http://${host}:${port}`;
-  await waitForHealth(`${localBase}/healthz`, token);
+  // Cold start on Windows (especially linked/dev installs) can exceed 15s while
+  // node loads dist/server.js; default wait is 60s, override with LEAST_HEALTH_TIMEOUT_MS.
+  const healthTimeoutMs = numberOption(
+    process.env.LEAST_HEALTH_TIMEOUT_MS,
+    60_000,
+    5_000,
+    10 * 60_000
+  );
+  try {
+    await waitForHealth(`${localBase}/healthz`, token, healthTimeoutMs);
+  } catch (error) {
+    const tail = typeof server.leastLogTail === 'function' ? server.leastLogTail() : '';
+    const baseMessage = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      tail
+        ? `${baseMessage}\n--- least server log ---\n${tail}`
+        : `${baseMessage}\n(Server produced no log output before the health timeout. Cold module load can take 20–40s on first start.)`
+    );
+  }
   statusLine('ok', `Local MCP ready at ${localBase}/mcp`);
+  let agentSurfaceReport;
+  try {
+    agentSurfaceReport = await inspectAgentSurface(root, localBase, token);
+  } catch (error) {
+    agentSurfaceReport = {
+      enabledProfiles: [],
+      error: error instanceof Error ? error.message.split('\n')[0] : String(error)
+    };
+  }
+  printAgentSurfaceStatus(agentSurfaceReport, (status, label, detail) => {
+    statusLine(status, `${label}: ${detail}`);
+  });
 
   if (tunnel === 'none') {
     if (effectiveArgs.installCloudflared) {
@@ -2777,6 +2993,7 @@ async function main() {
       openChatgpt: Boolean(args.openChatgpt),
       mode,
       toolMode,
+      toolset,
       root,
       write,
       bash,
@@ -2818,6 +3035,7 @@ async function main() {
       openChatgpt: Boolean(args.openChatgpt),
       mode,
       toolMode,
+      toolset,
       root,
       write,
       bash,
@@ -2860,6 +3078,7 @@ async function main() {
       openChatgpt: Boolean(args.openChatgpt),
       mode,
       toolMode,
+      toolset,
       root,
       write,
       bash,
@@ -2882,6 +3101,7 @@ async function main() {
       openChatgpt: Boolean(args.openChatgpt),
       mode,
       toolMode,
+      toolset,
       root,
       write,
       bash,
@@ -2903,6 +3123,7 @@ async function main() {
       openChatgpt: Boolean(args.openChatgpt),
       mode,
       toolMode,
+      toolset,
       root,
       write,
       bash,
@@ -2969,6 +3190,7 @@ async function main() {
     openChatgpt: Boolean(args.openChatgpt),
     mode,
     toolMode,
+    toolset,
     root,
     write,
     bash,

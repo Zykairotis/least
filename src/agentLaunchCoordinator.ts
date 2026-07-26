@@ -2,13 +2,17 @@ import { readFile } from "node:fs/promises";
 import type { AgentJobRecord, AgentLaunchPhase, AgentStartInput } from "./agentTypes.js";
 import type { Workspace } from "./guard.js";
 import { LeastError } from "./guard.js";
-import { findLocalAgentProfile, loadEffectiveLocalAgentConfig, validateLocalAgentLaunch } from "./agentConfig.js";
+import { findLocalAgentProfile, loadEffectiveLocalAgentConfig, usesAgentDeck, validateLocalAgentLaunch } from "./agentConfig.js";
+import { refreshAgentDeckJob, startAgentDeckLaunch } from "./agentDeck.js";
 import {
   defaultAgentFromGroundcrewConfig,
   loadGroundcrewRuntime,
   refreshJobFromGroundcrew
 } from "./agentGroundcrewAdapter.js";
+import { refreshDirectAgentJobFromArtifacts, startDirectAgentLaunch } from "./agentDirectLaunch.js";
 import { readAgentJob, writeAgentJob } from "./agentJobStore.js";
+import { listAgentJobs } from "./agentJobStore.js";
+import { dependenciesSatisfied } from "./agentDag.js";
 import { waitForAgentArtifacts } from "./agentTerminalLogs.js";
 import { inferTerminalMetadata } from "./agentTerminalBackend.js";
 import { refreshGroundcrewPathForLaunch } from "./agentTerminalExec.js";
@@ -64,6 +68,15 @@ function isPendingLaunchPhase(phase: AgentLaunchPhase | undefined): boolean {
 
 function missingArtifactDetailMessage(root: string, checked: readonly string[], elapsedMs: number): string {
   return `Completed terminal exited successfully, but no result artifacts appeared in ${elapsedMs}ms at ${root}. Expected one of: ${checked.join(", ")}.`;
+}
+
+function knownRepositoriesFromConfig(config: Record<string, unknown>): string[] {
+  const workspaceConfig = config.workspace;
+  if (!workspaceConfig || typeof workspaceConfig !== "object" || Array.isArray(workspaceConfig)) return [];
+  const knownRepositories = (workspaceConfig as Record<string, unknown>).knownRepositories;
+  return Array.isArray(knownRepositories)
+    ? knownRepositories.filter((item): item is string => typeof item === "string")
+    : [];
 }
 
 async function readPromptText(job: AgentJobRecord): Promise<string> {
@@ -150,6 +163,14 @@ async function refreshTerminalMetadataBestEffort(workspace: Workspace, job: Agen
 async function runAgentLaunch(workspace: Workspace, seedJob: AgentJobRecord, input: AgentStartInput): Promise<void> {
   let job = await readAgentJob(workspace, seedJob.jobId).catch(() => seedJob);
   try {
+    if (!dependenciesSatisfied(job, await listAgentJobs(workspace))) {
+      await writeLaunchUpdate(workspace, job, {
+        state: "planned",
+        detail: `Waiting for dependencies: ${(job.dependsOn ?? []).join(", ")}`,
+        launch: { phase: "accepted", error: undefined }
+      });
+      return;
+    }
     job = await writeLaunchUpdate(workspace, job, {
       state: job.state === "completed" ? job.state : "provisioning",
       detail: undefined,
@@ -176,6 +197,32 @@ async function runAgentLaunch(workspace: Workspace, seedJob: AgentJobRecord, inp
     const launchWarnings = validateLocalAgentLaunch(localConfig.config, resolvedAgent);
     if (launchWarnings.length) {
       throw new LeastError(`Local agent profile validation failed for ${resolvedAgent}: ${launchWarnings.join(" ")}`);
+    }
+    if (usesAgentDeck(localConfig.config)) {
+      if (!localProfile) {
+        throw new LeastError(`Agent Deck launch requires a local profile for agent "${resolvedAgent}".`);
+      }
+      await startAgentDeckLaunch({
+        workspace,
+        job,
+        profile: localProfile,
+        sessionManager: localConfig.config.sessionManager!,
+        startInput: {
+          ...input,
+          prompt: input.prompt || await readPromptText(job)
+        }
+      });
+      return;
+    }
+
+    const knownRepositories = knownRepositoriesFromConfig(config);
+    const useDirectFolderLaunch = !knownRepositories.includes(job.repository);
+    if (useDirectFolderLaunch) {
+      if (!localProfile) {
+        throw new LeastError(`Repository "${job.repository}" is not in Groundcrew knownRepositories and agent "${resolvedAgent}" has no local direct-launch profile.`);
+      }
+      await startDirectAgentLaunch({ workspace, job, profile: localProfile, startInput: input });
+      return;
     }
 
     job = await writeLaunchUpdate(workspace, job, {
@@ -265,6 +312,19 @@ export async function classifyAgentLaunchRecovery(workspace: Workspace, seedJob:
   if (inFlight) {
     return { job, inFlight, classification: undefined, recoverySafe: false, warnings };
   }
+  if (job.agentDeck?.sessionId) {
+    const localConfig = await loadEffectiveLocalAgentConfig(workspace);
+    job = await refreshAgentDeckJob(workspace, job, localConfig.config.sessionManager);
+    if (job.state === "running" || job.state === "resumed") {
+      return { job, inFlight, classification: "running", recoverySafe: false, warnings };
+    }
+    if (job.state === "completed") {
+      return { job, inFlight, classification: "completed", recoverySafe: false, warnings };
+    }
+    if (isFailureState(job.state) || job.state === "orphaned") {
+      return { job, inFlight, classification: "failed", recoverySafe: false, warnings };
+    }
+  }
   if (currentPhase === "recovery-required") {
     return { job, inFlight, classification: "recovery-required", recoverySafe: true, warnings };
   }
@@ -272,6 +332,13 @@ export async function classifyAgentLaunchRecovery(workspace: Workspace, seedJob:
     return { job, inFlight, classification: "orphaned", recoverySafe: false, warnings };
   }
   if (!isPendingLaunchPhase(currentPhase)) {
+    job = await refreshDirectAgentJobFromArtifacts(workspace, job);
+    if (job.state === "completed") {
+      return { job, inFlight, classification: "completed", recoverySafe: false, warnings };
+    }
+    if (isFailureState(job.state)) {
+      return { job, inFlight, classification: "failed", recoverySafe: false, warnings };
+    }
     return { job, inFlight, classification: undefined, recoverySafe: false, warnings };
   }
 

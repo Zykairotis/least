@@ -7,6 +7,8 @@ import type { DashboardEvent } from "./dashboardTypes.js";
 
 let db: DatabaseSync | undefined;
 let dbFile: string | undefined;
+let pendingEvents: DashboardEvent[] = [];
+let flushScheduled = false;
 
 export function initDashboardStore(filePath: string): void {
   if (db) return;
@@ -117,6 +119,29 @@ export function getDashboardStorePath(): string | undefined {
 
 export function persistDashboardEvent(event: DashboardEvent): void {
   if (!db) return;
+  pendingEvents.push(event);
+  if (!flushScheduled) {
+    flushScheduled = true;
+    setImmediate(flushDashboardEvents);
+  }
+}
+
+function flushDashboardEvents(): void {
+  flushScheduled = false;
+  const currentDb = db;
+  if (!currentDb || pendingEvents.length === 0) return;
+  const events = pendingEvents;
+  pendingEvents = [];
+  try {
+    currentDb.exec("BEGIN");
+    for (const event of events) persistDashboardEventNow(currentDb, event);
+    currentDb.exec("COMMIT");
+  } catch {
+    try { currentDb.exec("ROLLBACK"); } catch {}
+  }
+}
+
+function persistDashboardEventNow(store: DatabaseSync, event: DashboardEvent): void {
   try {
     const sessionId = event.sessionId || event.workspaceId || "default";
     const level = event.level || (event.kind.includes("error") ? "error" : "info");
@@ -127,7 +152,7 @@ export function persistDashboardEvent(event: DashboardEvent): void {
     const errorJson = jsonOrNull(event.payload?.error ?? (event.kind.includes("error") ? event.payload : undefined));
     const metadataJson = jsonOrNull({ workspaceId: event.workspaceId, surface: event.surface, toolName: event.toolName, payload: event.payload });
 
-    db.prepare("INSERT INTO log_sessions (id, title, source, user_id, started_at, ended_at, status, metadata_json) VALUES (?, ?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(id) DO UPDATE SET status=excluded.status, metadata_json=excluded.metadata_json").run(
+    store.prepare("INSERT INTO log_sessions (id, title, source, user_id, started_at, ended_at, status, metadata_json) VALUES (?, ?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(id) DO UPDATE SET status=excluded.status, metadata_json=excluded.metadata_json").run(
       sessionId,
       sessionId === "default" ? "Default session" : sessionId,
       event.surface || "dashboard",
@@ -137,7 +162,7 @@ export function persistDashboardEvent(event: DashboardEvent): void {
       jsonOrNull({ workspaceId: event.workspaceId, surface: event.surface })
     );
 
-    db.prepare("INSERT OR REPLACE INTO log_events (id, session_id, parent_event_id, event_type, level, message, started_at, ended_at, duration_ms, status, input_json, output_json, error_json, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+    store.prepare("INSERT OR REPLACE INTO log_events (id, session_id, parent_event_id, event_type, level, message, started_at, ended_at, duration_ms, status, input_json, output_json, error_json, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
       String(event.id),
       sessionId,
       typeof event.payload?.parentEventId === "string" ? event.payload.parentEventId : null,
@@ -196,16 +221,19 @@ export function persistAgentTerminalSessions(sessions: AgentTerminalSession[], j
 }
 
 export function listStoredSessions(limit = 100): unknown[] {
+  flushDashboardEvents();
   if (!db) return [];
   return db.prepare("SELECT s.*, (SELECT COUNT(*) FROM log_events e WHERE e.session_id = s.id) AS event_count, (SELECT COUNT(*) FROM tool_calls t WHERE t.session_id = s.id) AS tool_call_count, (SELECT COUNT(*) FROM log_events e WHERE e.session_id = s.id AND e.level = 'error') AS error_count FROM log_sessions s ORDER BY started_at DESC LIMIT ?").all(limit);
 }
 
 export function listStoredSessionEvents(sessionId: string, limit = 500): unknown[] {
+  flushDashboardEvents();
   if (!db) return [];
   return db.prepare("SELECT * FROM log_events WHERE session_id = ? ORDER BY started_at ASC LIMIT ?").all(sessionId, limit);
 }
 
 export function listStoredToolCalls(sessionId: string, limit = 500): unknown[] {
+  flushDashboardEvents();
   if (!db) return [];
   return db.prepare("SELECT * FROM tool_calls WHERE session_id = ? ORDER BY started_at ASC LIMIT ?").all(sessionId, limit);
 }

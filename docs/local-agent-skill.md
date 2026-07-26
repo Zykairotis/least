@@ -8,6 +8,10 @@ skills/local-agent-orchestrator/
 
 This skill teaches ChatGPT how to route, launch, monitor, and review local coding agents through Least/Xacho `agent_*` tools.
 
+Direct `agent_*` tools are the primary path. If a chat does not expose them yet, the supported fallback is to call `open_workspace` or `least_inventory`, then use the Windows-native PowerShell CLI bridge guidance those tools return.
+
+The CLI bridge must run from the Least install directory and pass the actual project with `--root`. Target folders do not need their own `package.json`; unregistered folders run as direct-folder jobs with logs/results under the target folder's `.ai-bridge/agent-runs`.
+
 ## Files
 
 ```text
@@ -41,6 +45,8 @@ agent_doctor -> agent_list -> agent_plan -> agent_start -> agent_status/agent_ta
 ```
 
 The skill explicitly tells ChatGPT not to run arbitrary local agent shell commands directly. It must use registered `agent_*` tools and named allowlisted profiles.
+
+When the live MCP server is healthy but a chat still does not show direct `Xacho.agent_*` tools, the expected operator recovery is: reconnect the connector/server, then open a brand-new chat.
 
 ## Packaging note
 

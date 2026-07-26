@@ -42,6 +42,12 @@ export interface AgentDoctorResult {
   };
   profiles: AgentDoctorProfileSummary[];
   terminal_backends: TerminalBackendDetection[];
+  session_manager?: {
+    kind: string;
+    executable?: string;
+    group?: string;
+    worktree?: boolean;
+  };
   groundcrew?: {
     available: boolean;
     default_agent?: string;
@@ -182,13 +188,16 @@ export async function runAgentDoctor(workspace: Workspace): Promise<{ text: stri
   errors.push(...groundcrew.errors);
 
   const profiles = profileSummaries(local.config.agents);
-  const missingProfiles = missingGroundcrewProfiles(profiles, groundcrew.groundcrew?.agents ?? []);
+  const agentDeckEnabled = local.config.sessionManager?.kind === "agent-deck";
+  const missingProfiles = agentDeckEnabled ? [] : missingGroundcrewProfiles(profiles, groundcrew.groundcrew?.agents ?? []);
   for (const missing of missingProfiles) {
     warnings.push(`Enabled local profile is not present in Groundcrew config: ${missing}.`);
   }
 
   const terminalBackends = await detectTerminalBackends(workspace);
-  const baseCommands = ["git", "tmux", "zellij"];
+  const baseCommands = ["git", "tmux"];
+  if (local.config.terminal?.preferredBackend === "zellij") baseCommands.push("zellij");
+  if (agentDeckEnabled) baseCommands.push(local.config.sessionManager?.executable?.trim() || "agent-deck");
   if (process.platform === "win32") baseCommands.push("wsl");
   const configuredCommands = localAgentExecutables(local.config.agents);
   const executableChecks = new Map<string, AgentDoctorCheck>();
@@ -225,6 +234,14 @@ export async function runAgentDoctor(workspace: Workspace): Promise<{ text: stri
     },
     profiles,
     terminal_backends: terminalBackends,
+    session_manager: local.config.sessionManager?.kind
+      ? {
+          kind: local.config.sessionManager.kind,
+          executable: local.config.sessionManager.executable,
+          group: local.config.sessionManager.group,
+          worktree: local.config.sessionManager.worktree
+        }
+      : undefined,
     groundcrew: groundcrew.groundcrew
   };
   const text = [
@@ -233,6 +250,7 @@ export async function runAgentDoctor(workspace: Workspace): Promise<{ text: stri
     `OK: ${result.ok}`,
     `Local config: ${local.found ? local.path : "not found; using built-in profiles"}`,
     `Groundcrew: ${result.groundcrew?.available ? "available" : "not available"}`,
+    `Session manager: ${result.session_manager?.kind ?? "groundcrew"}`,
     `Enabled local profiles: ${enabledNames.join(", ") || "(none)"}`,
     "",
     "## Terminal Backends",
