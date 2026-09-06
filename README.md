@@ -489,6 +489,7 @@ First-run tunnel choice:
 cloudflare  Cloudflare quick tunnel. Easiest demo path, new URL each restart.
 tailscale   Tailscale Funnel. Stable public https://<device>.<tailnet>.ts.net hostname.
 ngrok       ngrok free dev domain. Recommended stable URL for most users.
+workers     Cloudflare workers.dev relay. Stable URL, no bought domain (`least relay-deploy`).
 stable      Cloudflare named tunnel. Stable URL with your own Cloudflare domain.
 local       No public tunnel. Only for local MCP clients.
 ```

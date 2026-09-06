@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   fetchSnapshot,
+  fetchTimeline,
   connectSSE,
   eventNeedsSnapshotRefresh,
   type DashboardSnapshot,
@@ -17,9 +18,11 @@ interface LiveState {
   lastHeartbeatAt: string | null;
   error: string | null;
   eventRate: number;
+  historyDays: number;
 }
 
-const MAX_EVENTS = 1500;
+/** Match server SQLite hydrate cap — keep multi-day timeline across refresh. */
+const MAX_EVENTS = 8000;
 
 export function useLiveDashboard(pollIntervalMs = 5000) {
   const [state, setState] = useState<LiveState>({
@@ -32,6 +35,7 @@ export function useLiveDashboard(pollIntervalMs = 5000) {
     lastHeartbeatAt: null,
     error: null,
     eventRate: 0,
+    historyDays: 3,
   });
 
   const esRef = useRef<EventSource | null>(null);
@@ -42,27 +46,45 @@ export function useLiveDashboard(pollIntervalMs = 5000) {
   const recentEventTsRef = useRef<number[]>([]);
   const mountedRef = useRef(true);
 
-  const pushEvent = useCallback((event: DashboardEvent) => {
-    if (!event || typeof event.id !== "number") return;
-    if (seenIdsRef.current.has(event.id)) return;
-    seenIdsRef.current.add(event.id);
-    // Bound the seen-id set
-    if (seenIdsRef.current.size > MAX_EVENTS * 2) {
-      const keep = eventsRef.current.slice(-MAX_EVENTS).map((e) => e.id);
-      seenIdsRef.current = new Set(keep);
+  const mergeEvents = useCallback((incoming: DashboardEvent[], opts?: { quiet?: boolean }) => {
+    if (!incoming.length) return;
+    let changed = false;
+    let maxId = lastEventIdRef.current;
+    let lastTs: string | null = null;
+    for (const event of incoming) {
+      if (!event || typeof event.id !== "number") continue;
+      if (seenIdsRef.current.has(event.id)) continue;
+      seenIdsRef.current.add(event.id);
+      eventsRef.current.push(event);
+      changed = true;
+      maxId = Math.max(maxId, event.id);
+      lastTs = event.ts;
     }
-
-    eventsRef.current = [...eventsRef.current, event].slice(-MAX_EVENTS);
-    lastEventIdRef.current = Math.max(lastEventIdRef.current, event.id);
-
+    if (!changed) return;
+    eventsRef.current.sort((a, b) => a.id - b.id);
+    if (eventsRef.current.length > MAX_EVENTS) {
+      eventsRef.current = eventsRef.current.slice(-MAX_EVENTS);
+    }
+    if (seenIdsRef.current.size > MAX_EVENTS * 2) {
+      seenIdsRef.current = new Set(eventsRef.current.map((e) => e.id));
+    }
+    lastEventIdRef.current = maxId;
+    if (opts?.quiet) {
+      setState((prev) => ({
+        ...prev,
+        events: eventsRef.current,
+        lastEventId: maxId,
+        lastEventTime: lastTs ?? prev.lastEventTime,
+      }));
+      return;
+    }
     const now = Date.now();
     recentEventTsRef.current = [...recentEventTsRef.current.filter((t) => now - t < 60_000), now];
-
     setState((prev) => ({
       ...prev,
       events: eventsRef.current,
-      lastEventTime: event.ts,
-      lastEventId: lastEventIdRef.current,
+      lastEventTime: lastTs ?? prev.lastEventTime,
+      lastEventId: maxId,
       connected: true,
       streaming: true,
       error: null,
@@ -70,20 +92,38 @@ export function useLiveDashboard(pollIntervalMs = 5000) {
     }));
   }, []);
 
-  const handleSnapshot = useCallback((snapshot: DashboardSnapshot) => {
-    if (!mountedRef.current) return;
-    setState((prev) => ({
-      ...prev,
-      snapshot,
-      connected: true,
-      streaming: true,
-      error: null,
-      lastEventId: Math.max(prev.lastEventId, snapshot.stream?.latestEventId ?? 0),
-    }));
-    if (snapshot.stream?.latestEventId) {
-      lastEventIdRef.current = Math.max(lastEventIdRef.current, snapshot.stream.latestEventId);
-    }
-  }, []);
+  const pushEvent = useCallback(
+    (event: DashboardEvent) => {
+      mergeEvents([event]);
+    },
+    [mergeEvents]
+  );
+
+  const handleSnapshot = useCallback(
+    (snapshot: DashboardSnapshot) => {
+      if (!mountedRef.current) return;
+      if (Array.isArray(snapshot.recentEvents) && snapshot.recentEvents.length > 0) {
+        mergeEvents(snapshot.recentEvents, { quiet: true });
+      }
+      setState((prev) => ({
+        ...prev,
+        snapshot,
+        connected: true,
+        streaming: true,
+        error: null,
+        lastEventId: Math.max(
+          prev.lastEventId,
+          snapshot.stream?.latestEventId ?? 0,
+          lastEventIdRef.current
+        ),
+        historyDays: snapshot.history?.maxAgeDays ?? prev.historyDays,
+      }));
+      if (snapshot.stream?.latestEventId) {
+        lastEventIdRef.current = Math.max(lastEventIdRef.current, snapshot.stream.latestEventId);
+      }
+    },
+    [mergeEvents]
+  );
 
   const scheduleSnapshotRefresh = useCallback(() => {
     if (refreshTimerRef.current) return;
@@ -161,7 +201,7 @@ export function useLiveDashboard(pollIntervalMs = 5000) {
 
     connect();
 
-    // Seed with HTTP snapshot immediately (works even if SSE is delayed).
+    // Seed with HTTP snapshot + explicit timeline DB history (survives refresh).
     fetchSnapshot()
       .then((snap) => {
         if (mountedRef.current) handleSnapshot(snap);
@@ -173,6 +213,20 @@ export function useLiveDashboard(pollIntervalMs = 5000) {
             error: err instanceof Error ? err.message : "Failed to load snapshot",
           }));
         }
+      });
+
+    fetchTimeline(MAX_EVENTS)
+      .then((payload) => {
+        if (!mountedRef.current) return;
+        if (Array.isArray(payload.events)) {
+          mergeEvents(payload.events, { quiet: true });
+        }
+        if (payload.history?.maxAgeDays) {
+          setState((prev) => ({ ...prev, historyDays: payload.history!.maxAgeDays }));
+        }
+      })
+      .catch(() => {
+        /* timeline endpoint optional if older server */
       });
 
     // Backup poll — slower when streaming; still updates runtime/git if no tools fire.
@@ -200,16 +254,18 @@ export function useLiveDashboard(pollIntervalMs = 5000) {
         esRef.current = null;
       }
     };
-  }, [handleEvent, handleSnapshot, handleHeartbeat, handleError, handleOpen, pollIntervalMs]);
+  }, [handleEvent, handleSnapshot, handleHeartbeat, handleError, handleOpen, mergeEvents, pollIntervalMs]);
 
   const refreshSnapshot = useCallback(async () => {
     try {
       const snap = await fetchSnapshot();
       handleSnapshot(snap);
+      const timeline = await fetchTimeline(MAX_EVENTS);
+      if (Array.isArray(timeline.events)) mergeEvents(timeline.events, { quiet: true });
     } catch {
       // ignore
     }
-  }, [handleSnapshot]);
+  }, [handleSnapshot, mergeEvents]);
 
   return {
     snapshot: state.snapshot,
@@ -221,6 +277,7 @@ export function useLiveDashboard(pollIntervalMs = 5000) {
     lastHeartbeatAt: state.lastHeartbeatAt,
     error: state.error,
     eventRate: state.eventRate,
+    historyDays: state.historyDays,
     refreshSnapshot,
   };
 }

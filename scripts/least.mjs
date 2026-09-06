@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
+import dns from 'node:dns';
 import fs from 'node:fs';
+import https from 'node:https';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -27,6 +29,8 @@ Usage:
   least --root /path/to/repo
   least ngrok --hostname your-domain.ngrok-free.dev
   least tailscale
+  least workers-relay
+  least relay-deploy
   least stable --hostname least.example.com --tunnel-name least
   least pro-bundle --root /path/to/repo --copy
   least pro-apply --root /path/to/repo --file plan.md
@@ -73,14 +77,16 @@ Options:
   --dual-client            Serve ChatGPT on /mcp and Grok on /mcp-grok from one public host.
   --widget-domain <origin>   Dedicated HTTPS origin for ChatGPT widget iframes.
                              Required for app submission. Default: https://Zykairotis.github.io
-  --tunnel <none|cloudflare|cloudflare-named|ngrok|tailscale-funnel>
+  --tunnel <none|cloudflare|cloudflare-named|ngrok|tailscale-funnel|workers-relay>
                              Expose local MCP. Default: cloudflare.
                              cloudflare = quick tunnel with a new URL each restart.
                              cloudflare-named = stable hostname using a named tunnel.
                              ngrok = stable ngrok dev-domain endpoint using --hostname/--url.
                              tailscale-funnel = stable public https://<device>.<tailnet>.ts.net hostname via Tailscale Funnel.
+                             workers-relay = stable *.workers.dev hostname via Cloudflare Worker + local agent.
   --stable                  Shortcut for --tunnel cloudflare-named.
-  --hostname <host>          Stable public hostname for cloudflare-named or ngrok.
+  --hostname <host>          Stable public hostname for cloudflare-named, ngrok, or workers-relay.
+  --relay-token <token>      Agent token for --tunnel workers-relay (from least relay-deploy).
   --url <url>                Alias for --hostname in ngrok/stable URL modes.
   --tunnel-name <name>       Existing Cloudflare named tunnel to run.
   --cloudflare-token <token> Cloudflare Tunnel token for a remotely managed tunnel.
@@ -163,6 +169,9 @@ Ngrok stable URL mode:
   least ngrok --root /path/to/repo --hostname your-domain.ngrok-free.dev
 Tailscale stable URL mode:
   least tailscale --root /path/to/repo
+Cloudflare workers.dev relay (stable, no bought domain):
+  least relay-deploy
+  least workers-relay
 
 
 Planning-only handoff mode:
@@ -253,6 +262,7 @@ function profileSummary(profile) {
   if (!profile?.tunnel) return '';
   if (profile.tunnel === 'ngrok' && profile.hostname) return `Saved ngrok URL: ${profile.hostname}`;
   if (profile.tunnel === 'cloudflare-named' && profile.hostname) return `Saved Cloudflare URL: ${profile.hostname}`;
+  if (profile.tunnel === 'workers-relay' && profile.hostname) return `Saved workers.dev relay: ${profile.hostname}`;
   if (profile.tunnel === 'tailscale-funnel') return 'Saved Tailscale Funnel setup';
   if (profile.tunnel === 'cloudflare') return 'Saved Cloudflare quick-tunnel setup';
   if (profile.tunnel === 'none') return 'Saved local-only setup';
@@ -779,14 +789,125 @@ async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Resolve a hostname for public health probes.
+ * Prefer public resolvers (Funnel ingress A/AAAA). Fall back to MagicDNS
+ * (100.100.100.100), which returns the node's 100.x address. Both paths
+ * terminate TLS correctly with SNI when Funnel/serve is on.
+ *
+ * Needed because some Linux setups use nsswitch
+ * `resolve [!UNAVAIL=return]` + systemd-resolved without Tailscale DNS on a
+ * link, so getaddrinfo/fetch fail with ENOTFOUND even while Funnel works.
+ */
+async function resolveHostAddressesAsync(hostname) {
+  // Query public resolvers one-at-a-time. Funnel DNS often propagates unevenly
+  // (e.g. 8.8.8.8 has A/AAAA while 1.1.1.1 still NXDOMAIN). Node's Resolver
+  // stops on the first NXDOMAIN when multiple servers are set together.
+  // Prefer public Funnel ingress IPs; fall back to MagicDNS 100.x last.
+  const servers = ['8.8.8.8', '1.1.1.1', '9.9.9.9', '100.100.100.100'];
+  const out = [];
+  const seen = new Set();
+  for (const server of servers) {
+    const before = out.length;
+    const resolver = new dns.promises.Resolver();
+    try {
+      resolver.setServers([server]);
+    } catch {
+      continue;
+    }
+    for (const method of ['resolve4', 'resolve6']) {
+      try {
+        const addrs = await resolver[method](hostname);
+        for (const addr of addrs || []) {
+          if (!seen.has(addr)) {
+            seen.add(addr);
+            out.push(addr);
+          }
+        }
+      } catch {
+        // NXDOMAIN / empty on this family or resolver
+      }
+    }
+    // First public resolver with answers wins (skip further public/magic lookups).
+    if (out.length > before && server !== '100.100.100.100') break;
+  }
+  return out;
+}
+
+function httpsGetJson(url, { token, address, timeoutMs = 10000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const headers = {
+      Host: parsed.hostname,
+      Accept: 'application/json, text/plain, */*'
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const requestOptions = {
+      host: address || parsed.hostname,
+      servername: parsed.hostname,
+      port: parsed.port || 443,
+      path: `${parsed.pathname}${parsed.search}`,
+      method: 'GET',
+      headers,
+      timeout: timeoutMs
+    };
+    const req = https.request(requestOptions, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            resolve(JSON.parse(body));
+          } catch {
+            resolve({ ok: true, raw: body });
+          }
+          return;
+        }
+        reject(new Error(`${res.statusCode || 0} ${body.slice(0, 200)}`));
+      });
+    });
+    req.on('timeout', () => {
+      req.destroy(new Error('request timeout'));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function probeHealthUrl(url, token) {
+  try {
+    const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (res.ok) return await res.json();
+    throw new Error(`${res.status} ${await res.text()}`);
+  } catch (fetchError) {
+    const hostname = new URL(url).hostname;
+    const addresses = await resolveHostAddressesAsync(hostname);
+    if (!addresses.length) throw fetchError;
+    let lastError = fetchError;
+    for (const address of addresses) {
+      try {
+        return await httpsGetJson(url, { token, address });
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+}
+
 async function waitForHealth(url, token, timeoutMs = 60000) {
   const started = Date.now();
   let lastError = '';
   while (Date.now() - started < timeoutMs) {
     try {
-      const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
-      if (res.ok) return await res.json();
-      lastError = `${res.status} ${await res.text()}`;
+      return await probeHealthUrl(url, token);
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }
@@ -1957,6 +2078,17 @@ async function runDoctor(argv) {
   } else if (tunnel === 'ngrok') {
     record(stableHostname ? 'ok' : 'fail', 'Hostname', stableHostname || 'required for ngrok mode');
     record(ngrokPath ? 'ok' : 'fail', 'ngrok', ngrokPath || 'not found on PATH; install ngrok and run ngrok config add-authtoken <token>');
+  } else if (tunnel === 'workers-relay') {
+    let relayState = {};
+    try {
+      const { loadWorkersRelayState } = await import('./workersRelay.mjs');
+      relayState = loadWorkersRelayState();
+    } catch {
+      relayState = {};
+    }
+    const relayHost = stableHostname || relayState.hostname || '';
+    record(relayHost ? 'ok' : 'fail', 'workers.dev hostname', relayHost || 'run least relay-deploy first');
+    record(relayState.relayToken ? 'ok' : 'fail', 'Relay token', relayState.relayToken ? 'saved in ~/.least/workers-relay.json' : 'missing; run least relay-deploy');
   } else if (tunnel === 'tailscale-funnel') {
     try {
       const tailscalePath = resolveTailscale(effectiveArgs);
@@ -2054,6 +2186,7 @@ async function ask(rl, question, fallback = '') {
 function tunnelChoiceFromProfile(profile, fallback = 'cloudflare') {
   if (profile?.tunnel === 'ngrok') return 'ngrok';
   if (profile?.tunnel === 'cloudflare-named') return 'stable';
+  if (profile?.tunnel === 'workers-relay') return 'workers';
   if (profile?.tunnel === 'tailscale-funnel') return 'tailscale';
   if (profile?.tunnel === 'none') return 'local';
   if (profile?.tunnel === 'cloudflare') return 'cloudflare';
@@ -2063,6 +2196,7 @@ function tunnelChoiceFromProfile(profile, fallback = 'cloudflare') {
 function tunnelModeFromChoice(choice) {
   if (choice === 'quick' || choice === 'cloudflare') return 'cloudflare';
   if (choice === 'stable') return 'cloudflare-named';
+  if (choice === 'workers' || choice === 'workers-relay' || choice === 'relay') return 'workers-relay';
   if (choice === 'tailscale') return 'tailscale-funnel';
   if (choice === 'local') return 'none';
   return choice;
@@ -2078,8 +2212,8 @@ function hasExplicitTunnelInput(args) {
 
 async function collectTunnelPreference(rl, defaults, profile, options = {}) {
   const defaultTunnel = options.defaultTunnel ?? tunnelChoiceFromProfile(profile, 'cloudflare');
-  const tunnelAnswer = await ask(rl, 'Tunnel: cloudflare, tailscale, ngrok, stable, or local?', defaultTunnel);
-  const tunnelChoice = normalizeSetupChoice(tunnelAnswer, ['cloudflare', 'quick', 'tailscale', 'ngrok', 'stable', 'local'], defaultTunnel);
+  const tunnelAnswer = await ask(rl, 'Tunnel: cloudflare, tailscale, ngrok, workers, stable, or local?', defaultTunnel);
+  const tunnelChoice = normalizeSetupChoice(tunnelAnswer, ['cloudflare', 'quick', 'tailscale', 'ngrok', 'workers', 'workers-relay', 'relay', 'stable', 'local'], defaultTunnel);
   const tunnel = tunnelModeFromChoice(tunnelChoice);
   let hostname = '';
   let tunnelName = '';
@@ -2095,6 +2229,12 @@ async function collectTunnelPreference(rl, defaults, profile, options = {}) {
     );
     if (!hostname) throw new Error('Ngrok setup needs your reserved domain, for example name.ngrok-free.dev.');
     ngrokConfig = optionValue(defaults, profile, 'ngrokConfig', ['NGROK_CONFIG', 'LEAST_NGROK_CONFIG'], '');
+  } else if (tunnel === 'workers-relay') {
+    hostname = await ask(
+      rl,
+      'workers.dev hostname from least relay-deploy, without /mcp',
+      optionValue(defaults, profile, 'hostname', ['LEAST_PUBLIC_HOSTNAME', 'LEAST_HOSTNAME'], '')
+    );
   } else if (tunnel === 'cloudflare-named') {
     hostname = await ask(
       rl,
@@ -2249,6 +2389,8 @@ async function runSetupWizard(argv) {
         ? 'tailscale'
         : savedTunnel === 'ngrok'
           ? 'ngrok'
+          : savedTunnel === 'workers-relay'
+            ? 'workers'
           : savedTunnel === 'none'
             ? 'local'
             : 'quick';
@@ -2266,11 +2408,12 @@ async function runSetupWizard(argv) {
       'tailscale = stable public ts.net hostname via Tailscale Funnel.',
       'stable    = use your own domain with a Cloudflare named tunnel so the ChatGPT app URL does not change.',
       'ngrok     = use your ngrok free dev domain, for example https://name.ngrok-free.dev.',
+      'workers   = stable *.workers.dev relay (least relay-deploy). No bought domain.',
       'local     = no tunnel, only useful for local MCP clients that can reach 127.0.0.1.'
     ]);
 
-    const tunnelAnswer = await ask(rl, 'Public access: quick, tailscale, stable, ngrok, or local?', defaultTunnel);
-    const tunnelChoice = normalizeSetupChoice(tunnelAnswer, ['quick', 'tailscale', 'stable', 'ngrok', 'local'], defaultTunnel);
+    const tunnelAnswer = await ask(rl, 'Public access: quick, tailscale, stable, ngrok, workers, or local?', defaultTunnel);
+    const tunnelChoice = normalizeSetupChoice(tunnelAnswer, ['quick', 'tailscale', 'stable', 'ngrok', 'workers', 'workers-relay', 'relay', 'local'], defaultTunnel);
     const args = ['start', '--root', root, '--port', port, '--mode', mode];
     const bash = optionValue(defaults, profile, 'bash', ['LEAST_BASH_MODE'], '');
     const shellBackend = optionValue(defaults, profile, 'shellBackend', ['LEAST_SHELL_BACKEND'], '');
@@ -2334,6 +2477,16 @@ async function runSetupWizard(argv) {
         profileNgrokConfig = ngrokConfig;
         args.push('--ngrok-config', ngrokConfig);
       }
+    } else if (tunnelChoice === 'workers' || tunnelChoice === 'workers-relay' || tunnelChoice === 'relay') {
+      profileTunnel = 'workers-relay';
+      const hostname = await ask(
+        rl,
+        'workers.dev hostname from least relay-deploy, or leave blank if already deployed',
+        optionValue(defaults, profile, 'hostname', ['LEAST_PUBLIC_HOSTNAME', 'LEAST_HOSTNAME'], '')
+      );
+      profileHostname = hostname;
+      args.push('--tunnel', 'workers-relay');
+      if (hostname) args.push('--hostname', hostname);
     } else {
       profileTunnel = 'cloudflare';
       args.push('--tunnel', 'cloudflare');
@@ -2409,6 +2562,10 @@ function printProfile(root, profile) {
     ...(safe.token ? [labelValue('Token', safe.token)] : []),
     ...(safe.dualClient ? [labelValue('Dual client', 'enabled (/mcp + /mcp-grok)')] : []),
     ...(safe.grokOAuth && !safe.dualClient ? [labelValue('Grok OAuth', 'enabled (/mcp)')] : []),
+    ...(safe.allowHome ? [labelValue('Allowed roots', 'home directory (LEAST_ALLOW_HOME)')] : []),
+    ...(Array.isArray(safe.allowRoots) && safe.allowRoots.length
+      ? [labelValue('Extra allowed roots', safe.allowRoots.join(', '))]
+      : []),
     ...(safe.concurrency && safe.concurrency !== 'off' ? [labelValue('Concurrency', `${safe.concurrency} (${safe.lockLeaseMs ?? 600000}ms lease)`)] : [])
   ]);
 }
@@ -2426,8 +2583,8 @@ function printProfileList(profiles = listWorkspaceProfiles()) {
 
 function saveSettingsFromArgs(root, args, profile) {
   const tunnel = optionValue(args, profile, 'tunnel', ['LEAST_TUNNEL'], profile.tunnel ?? 'cloudflare');
-  if (!['none', 'cloudflare', 'cloudflare-named', 'ngrok', 'tailscale-funnel'].includes(tunnel)) {
-    throw new Error('--tunnel must be none, cloudflare, cloudflare-named, ngrok, or tailscale-funnel');
+  if (!['none', 'cloudflare', 'cloudflare-named', 'ngrok', 'tailscale-funnel', 'workers-relay'].includes(tunnel)) {
+    throw new Error('--tunnel must be none, cloudflare, cloudflare-named, ngrok, tailscale-funnel, or workers-relay');
   }
   const hostname = args.hostname ?? args.url ?? profile.hostname ?? '';
   if ((tunnel === 'ngrok' || tunnel === 'cloudflare-named') && !hostname) {
@@ -2471,7 +2628,22 @@ function saveSettingsFromArgs(root, args, profile) {
     ...(args['grok-oauth'] || profile.grokOAuth ? { grokOAuth: true } : {}),
     ...(args['grok-oauth-client-id'] || profile.grokOAuthClientId ? { grokOAuthClientId: args['grok-oauth-client-id'] ?? profile.grokOAuthClientId } : {}),
     ...(args.concurrency ?? profile.concurrency ? { concurrency: args.concurrency ?? profile.concurrency } : {}),
-    ...(args.lockLeaseMs ?? profile.lockLeaseMs ? { lockLeaseMs: String(args.lockLeaseMs ?? profile.lockLeaseMs) } : {})
+    ...(args.lockLeaseMs ?? profile.lockLeaseMs ? { lockLeaseMs: String(args.lockLeaseMs ?? profile.lockLeaseMs) } : {}),
+    ...(args.allowHome || profile.allowHome ? { allowHome: true } : {}),
+    ...(() => {
+      const roots = [
+        ...(Array.isArray(profile.allowRoots) ? profile.allowRoots : []),
+        ...(Array.isArray(args.allowRoots) ? args.allowRoots : [])
+      ].map((item) => {
+        try {
+          return realDir(item);
+        } catch {
+          return String(item);
+        }
+      }).filter(Boolean);
+      const unique = [...new Set(roots)];
+      return unique.length ? { allowRoots: unique } : {};
+    })()
   });
   statusLine('ok', `Saved workspace settings: ${savedPath}`);
   printProfile(root, loadWorkspaceProfile(root));
@@ -2756,6 +2928,19 @@ async function main() {
     console.log(`cloudflared ready: ${installedCloudflared}`);
     return;
   }
+  if (subcommand === 'relay-deploy') {
+    const { deployWorkersRelay } = await import('./workersRelay.mjs');
+    const result = await deployWorkersRelay();
+    printBox('Least workers.dev relay', [
+      labelValue('Hostname', result.hostname),
+      'ChatGPT Server URL will be:',
+      `  https://${result.hostname}/mcp?least_token=<your Least token>`,
+      '',
+      'Start Least with:',
+      '  least start --tunnel workers-relay --yolo --dashboard --dual-client --allow-home'
+    ]);
+    return;
+  }
   if (subcommand === 'doctor') {
     await runDoctor(argv.slice(1));
     return;
@@ -2771,6 +2956,10 @@ async function main() {
   if (argv[0] === 'tailscale') {
     argv.shift();
     argv.unshift('--tunnel', 'tailscale-funnel');
+  }
+  if (argv[0] === 'workers-relay' || argv[0] === 'relay') {
+    argv.shift();
+    argv.unshift('--tunnel', 'workers-relay');
   }
   if (argv[0] === 'start' || argv[0] === 'connect') argv.shift();
   if (argv[0] === 'help') argv[0] = '--help';
@@ -2791,15 +2980,19 @@ async function main() {
   }
 
   const tunnel = optionValue(args, profile, 'tunnel', ['LEAST_TUNNEL'], 'cloudflare');
-  if (!['none', 'cloudflare', 'cloudflare-named', 'ngrok', 'tailscale-funnel'].includes(tunnel)) {
-    throw new Error('--tunnel must be none, cloudflare, cloudflare-named, ngrok, or tailscale-funnel');
+  if (!['none', 'cloudflare', 'cloudflare-named', 'ngrok', 'tailscale-funnel', 'workers-relay'].includes(tunnel)) {
+    throw new Error('--tunnel must be none, cloudflare, cloudflare-named, ngrok, tailscale-funnel, or workers-relay');
   }
+  const workersRelayState = tunnel === 'workers-relay'
+    ? (await import('./workersRelay.mjs')).loadWorkersRelayState()
+    : {};
   const stableHostname = args.hostname
     ?? args.url
     ?? process.env.LEAST_PUBLIC_HOSTNAME
     ?? process.env.LEAST_HOSTNAME
     ?? process.env.NGROK_DOMAIN
     ?? profile.hostname
+    ?? workersRelayState.hostname
     ?? '';
   if (tunnel === 'cloudflare-named' && !stableHostname) {
     printStableUrlHelp();
@@ -2818,23 +3011,39 @@ async function main() {
     ? args['grok-oauth-client-id']
     : (process.env.LEAST_GROK_OAUTH_CLIENT_ID || profile.grokOAuthClientId || 'least-grok');
   if (dualClient && tunnel === 'none') {
-    throw new Error('--dual-client requires a public HTTPS tunnel. Use cloudflare, cloudflare-named, ngrok, or tailscale-funnel.');
+    throw new Error('--dual-client requires a public HTTPS tunnel. Use cloudflare, cloudflare-named, ngrok, tailscale-funnel, or workers-relay.');
   }
-  if (dualClient && !['cloudflare', 'cloudflare-named', 'ngrok', 'tailscale-funnel'].includes(tunnel)) {
-    throw new Error('--dual-client requires --tunnel cloudflare, cloudflare-named, ngrok, or tailscale-funnel.');
+  if (dualClient && !['cloudflare', 'cloudflare-named', 'ngrok', 'tailscale-funnel', 'workers-relay'].includes(tunnel)) {
+    throw new Error('--dual-client requires --tunnel cloudflare, cloudflare-named, ngrok, tailscale-funnel, or workers-relay.');
   }
   if (grokOAuthLegacy && tunnel === 'none') {
-    throw new Error('--grok-oauth requires a public HTTPS tunnel. Use cloudflare, cloudflare-named, ngrok, or tailscale-funnel.');
+    throw new Error('--grok-oauth requires a public HTTPS tunnel. Use cloudflare, cloudflare-named, ngrok, tailscale-funnel, or workers-relay.');
   }
-  if (grokOAuthLegacy && !['cloudflare', 'cloudflare-named', 'ngrok', 'tailscale-funnel'].includes(tunnel)) {
-    throw new Error('--grok-oauth requires --tunnel cloudflare, cloudflare-named, ngrok, or tailscale-funnel.');
+  if (grokOAuthLegacy && !['cloudflare', 'cloudflare-named', 'ngrok', 'tailscale-funnel', 'workers-relay'].includes(tunnel)) {
+    throw new Error('--grok-oauth requires --tunnel cloudflare, cloudflare-named, ngrok, tailscale-funnel, or workers-relay.');
   }
   const mode = optionValue(args, profile, 'mode', ['LEAST_MODE'], 'agent');
   if (!['agent', 'handoff', 'pro'].includes(mode)) {
     throw new Error('--mode must be agent, handoff, or pro');
   }
 
-  const allowRoots = [root, ...(args.allowRoots ?? [])].map(realDir);
+  const profileAllowRoots = Array.isArray(profile.allowRoots) ? profile.allowRoots : [];
+  const envAllowRoots = String(process.env.LEAST_ALLOWED_ROOTS || '')
+    .split(path.delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const allowRoots = [...new Set(
+    [root, ...profileAllowRoots, ...(args.allowRoots ?? []), ...envAllowRoots].map((item) => {
+      try {
+        return realDir(item);
+      } catch {
+        return path.resolve(String(item));
+      }
+    })
+  )];
+  const allowHome = args.allowHome === true
+    || profile.allowHome === true
+    || process.env.LEAST_ALLOW_HOME === '1';
   const host = optionValue(args, profile, 'host', ['LEAST_HOST'], '127.0.0.1');
   const port = String(optionValue(args, profile, 'port', ['LEAST_PORT'], '8787'));
   const bash = optionValue(args, profile, 'bash', ['LEAST_BASH_MODE'], 'safe');
@@ -2891,7 +3100,8 @@ async function main() {
 
   if (args.logRequests || process.env.LEAST_LOG_REQUESTS === '1') serverEnv.LEAST_LOG_REQUESTS = '1';
   if (args.printTools || process.env.LEAST_PRINT_TOOLS === '1') serverEnv.LEAST_PRINT_TOOLS = '1';
-  if (args.allowHome) serverEnv.LEAST_ALLOW_HOME = '1';
+  if (allowHome) serverEnv.LEAST_ALLOW_HOME = '1';
+  else delete serverEnv.LEAST_ALLOW_HOME;
   if (token) serverEnv.LEAST_HTTP_TOKEN = token;
   else delete serverEnv.LEAST_HTTP_TOKEN;
   if (args.printEnv) {
@@ -2931,6 +3141,8 @@ async function main() {
           ? `Cloudflare named tunnel for ${stableHostname}`
           : tunnel === 'ngrok'
             ? `ngrok endpoint for ${stableHostname}`
+            : tunnel === 'workers-relay'
+              ? `workers.dev relay${stableHostname ? ` for ${stableHostname}` : ''}`
             : tunnel === 'tailscale-funnel'
               ? 'Tailscale Funnel stable ts.net hostname'
               : 'none'
@@ -2990,6 +3202,57 @@ async function main() {
     const details = printConnectorBlock(`${localBase}/mcp`, token, {
       localBase,
       copyUrl: args.copyUrl ? true : args.noCopyUrl ? false : undefined,
+      openChatgpt: Boolean(args.openChatgpt),
+      mode,
+      toolMode,
+      toolset,
+      root,
+      write,
+      bash,
+      grokOAuth,
+      grokOAuthClientId,
+      dualClient,
+    });
+    await runControlPanel(details);
+    return;
+  }
+
+  if (tunnel === 'workers-relay') {
+    const { startWorkersRelayAgent, loadWorkersRelayState, publicHostnameFromRelayUrl } = await import('./workersRelay.mjs');
+    const relayState = loadWorkersRelayState();
+    const hostname = publicHostnameFromRelayUrl(stableHostname || relayState.hostname || '');
+    const relayToken = args.relayToken || process.env.LEAST_RELAY_TOKEN || relayState.relayToken || '';
+    if (!hostname || !relayToken) {
+      throw new Error(
+        [
+          'workers-relay needs a one-time Cloudflare deploy first:',
+          '',
+          '  npx wrangler login',
+          '  least relay-deploy',
+          '  least start --tunnel workers-relay'
+        ].join('\n')
+      );
+    }
+    statusLine('wait', `Connecting workers.dev relay agent to ${hostname}`);
+    const agent = startWorkersRelayAgent({
+      hostname,
+      relayToken,
+      localBase,
+      log: (line) => console.error(line)
+    });
+    const agentHandle = { killed: false, kill() { agent.stop(); this.killed = true; } };
+    spawnedChildren.add(agentHandle);
+    const publicBase = `https://${hostname}`;
+    try {
+      await waitForPublicHealthOnly(publicBase, token);
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}\nIf wrangler deploy already succeeded, confirm Least is running and the relay agent stayed connected.`
+      );
+    }
+    const details = printConnectorBlock(`${publicBase}/mcp`, token, {
+      localBase,
+      copyUrl: args.noCopyUrl ? false : true,
       openChatgpt: Boolean(args.openChatgpt),
       mode,
       toolMode,

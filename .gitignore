@@ -12,3 +12,14 @@ LEAST_MCP_REPORT.md
 *.log
 SOCIAL_POSTS.md
 LAUNCH_COPY.md
+
+# Tailscale HTTPS material (never commit)
+*.ts.net.crt
+*.ts.net.key
+*.ts.net.crt.pem
+*.ts.net.key.pem
+
+# Local agent/worktree state
+.worktrees/
+.claude/worktrees/
+.agents/skill-packages/

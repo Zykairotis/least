@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Deck IV"
+  short_description: "Launch and control visible Agent Deck sessions"
+  default_prompt: "Use $agent-deck-iv to inspect Agent Deck, launch a verified IV tool, and manage the resulting session safely."

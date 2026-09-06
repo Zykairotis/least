@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### workers.dev relay
+
+- Added `--tunnel workers-relay` and `least relay-deploy` so ChatGPT can use a stable `*.workers.dev` URL without a bought domain or Tailscale Funnel DNS.
+- Least opens an outbound WebSocket to a Cloudflare Worker Durable Object; the Worker forwards `/mcp`, `/mcp-grok`, `/oauth/*`, and `/healthz` to the local server.
+- Deploy once with `npx wrangler login` then `least relay-deploy`. Daily start is `least start --tunnel workers-relay`.
+
 ### Mutation performance
 
 - Changed `edit`, `multi_edit`, and `apply_patch` to default to `response_mode=summary`, matching `write` / `write_many`. Diff generation roughly doubles mutation cost and most implementation loops never read the inline diff; pass `response_mode=compact_diff` or `full_diff` when the diff is needed, or use `show_changes` after a batch.

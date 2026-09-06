@@ -6,11 +6,12 @@ import { JsonDetailsDropdown } from "./JsonDetailsDropdown.tsx";
 interface TimelinePanelProps {
   events: DashboardEvent[];
   connected?: boolean;
+  historyDays?: number;
 }
 
 type KindFilter = "all" | "tools" | "hooks" | "locks" | "git" | "other";
 
-export function TimelinePanel({ events, connected }: TimelinePanelProps) {
+export function TimelinePanel({ events, connected, historyDays = 3 }: TimelinePanelProps) {
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [filter, setFilter] = useState<KindFilter>("all");
   const [autoScroll, setAutoScroll] = useState(true);
@@ -68,7 +69,8 @@ export function TimelinePanel({ events, connected }: TimelinePanelProps) {
         <div>
           <div className="page-title">Timeline</div>
           <div className="page-subtitle">
-            Live event stream{connected ? " · connected" : " · offline"} · {events.length} buffered
+            SQLite timeline (max {historyDays}d){connected ? " · live" : " · offline"} ·{" "}
+            {events.length} events · survives refresh
           </div>
         </div>
       </div>

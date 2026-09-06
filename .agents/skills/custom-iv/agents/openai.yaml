@@ -1,0 +1,4 @@
+interface:
+  display_name: "Custom IV"
+  short_description: "Discover unknown CLIs and generate verified IV skills"
+  default_prompt: "Use $custom-iv to inspect this external tool safely and create a minimal cross-platform IV skill for the requested workflow."

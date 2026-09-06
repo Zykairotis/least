@@ -68,6 +68,19 @@ export interface LeastConfig {
   maxSearchResults: number;
   maxHttpSessions: number;
   httpSessionTtlMs: number;
+  /** Rebuild unknown MCP session IDs instead of rejecting with 400 (default true; set LEAST_HTTP_SESSION_RESUME=0 to disable). */
+  httpSessionResume: boolean;
+  /**
+   * Prefer JSON HTTP responses for MCP POSTs instead of SSE streams.
+   * Much more reliable over Tailscale Funnel / flaky proxies (default true; LEAST_MCP_JSON_RESPONSE=0 to disable).
+   */
+  httpJsonResponse: boolean;
+  /**
+   * Persist session ids under ~/.least/mcp-sessions so restarts keep client sessions alive (default true).
+   */
+  httpSessionDurable: boolean;
+  /** How long durable session metadata survives without use (default 7 days). */
+  httpSessionMetaTtlMs: number;
   blockedGlobs: string[];
   httpProtocols: HttpProtocol[];
   grokOAuth: boolean;
@@ -429,12 +442,23 @@ export function loadConfig(argv = process.argv.slice(2)): LeastConfig {
     maxWriteManyFiles: numberFrom(process.env.LEAST_MAX_WRITE_MANY_FILES, 200, 1, 500),
     maxOutputBytes: numberFrom(process.env.LEAST_MAX_OUTPUT_BYTES, 120_000, 4_000, 2_000_000),
     maxSearchResults: numberFrom(process.env.LEAST_MAX_SEARCH_RESULTS, 200, 5, 2_000),
-    maxHttpSessions: numberFrom(process.env.LEAST_MAX_HTTP_SESSIONS, 64, 1, 512),
+    maxHttpSessions: numberFrom(process.env.LEAST_MAX_HTTP_SESSIONS, 128, 1, 512),
     httpProtocols: httpProtocolsFrom(process.env.LEAST_HTTP_PROTOCOLS, httpProtocolsArg),
     grokOAuth,
     grokOAuthClientId: grokOAuthClientIdArg ?? process.env.LEAST_GROK_OAUTH_CLIENT_ID ?? "least-grok",
     dualClient,
-    httpSessionTtlMs: numberFrom(process.env.LEAST_HTTP_SESSION_TTL_MS, 30 * 60_000, 60_000, 24 * 60 * 60_000),
+    // In-memory transport idle TTL (default 24h). Metadata can live longer via httpSessionMetaTtlMs.
+    httpSessionTtlMs: numberFrom(process.env.LEAST_HTTP_SESSION_TTL_MS, 24 * 60 * 60_000, 60_000, 7 * 24 * 60 * 60_000),
+    // When a client reuses an unknown Mcp-Session-Id (after restart/TTL/drop), rebuild that session instead of 400.
+    httpSessionResume: process.env.LEAST_HTTP_SESSION_RESUME !== "0",
+    httpJsonResponse: process.env.LEAST_MCP_JSON_RESPONSE !== "0",
+    httpSessionDurable: process.env.LEAST_HTTP_SESSION_DURABLE !== "0",
+    httpSessionMetaTtlMs: numberFrom(
+      process.env.LEAST_HTTP_SESSION_META_TTL_MS,
+      7 * 24 * 60 * 60_000,
+      60_000,
+      30 * 24 * 60 * 60_000
+    ),
     blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...extraBlockedGlobs],
     contextDir: process.env.LEAST_CONTEXT_DIR ?? ".ai-bridge",
     dashboardEnabled,

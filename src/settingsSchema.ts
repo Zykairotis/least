@@ -40,6 +40,11 @@ export const HookSettingsSchema = z.object({
   allowProjectHooks: z.boolean().optional(),
   trustedHookCommands: z.array(z.string()).optional(),
   failureMode: z.enum(["safe", "permissive"]).optional(),
+  /**
+   * When true (default), PreBash and bash-matching PreToolUse denials still apply under --yolo.
+   * Set false only if you intentionally want yolo to ignore safety hooks.
+   */
+  enforceInYolo: z.boolean().optional(),
   PreToolUse: z.array(HookSpecSchema).optional(),
   PostToolUse: z.array(HookSpecSchema).optional(),
   ToolError: z.array(HookSpecSchema).optional(),

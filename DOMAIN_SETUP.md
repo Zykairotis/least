@@ -188,6 +188,35 @@ Authentication: None / No Authentication
 
 Least starts the local MCP server, runs `ngrok http http://127.0.0.1:8787 --url https://your-domain.ngrok-free.dev`, waits for `/healthz`, copies the Server URL, and keeps both processes alive until you quit.
 
+## Cloudflare workers.dev Relay (No Bought Domain)
+
+Use this when ChatGPT cannot resolve a Tailscale Funnel `*.ts.net` name (Cloudflare public DNS often returns NXDOMAIN) and you do not want to buy a domain or keep rotating ngrok URLs.
+
+The public hostname is a stable `*.workers.dev` URL on your Cloudflare account. Least keeps an outbound WebSocket to that Worker. ChatGPT only talks to `workers.dev`, which Cloudflare DNS can resolve.
+
+One-time:
+
+```bash
+npx wrangler login
+least relay-deploy
+```
+
+Daily:
+
+```bash
+least start --tunnel workers-relay --yolo --dashboard --dual-client --allow-home
+```
+
+Then paste the printed Server URL into the ChatGPT app (No Auth) and open a new chat.
+
+```text
+Server URL: https://least-relay.<your-subdomain>.workers.dev/mcp?least_token=<token>
+```
+
+If Least is not running, the Worker returns 503 instead of a DNS failure. Restarting Least does not change the hostname.
+
+Limits come from the Cloudflare Workers free plan (typically 100,000 Worker requests per day, Durable Objects on the free SQLite backend). That is usually enough for daily ChatGPT use and is not the ngrok 20k/1GB monthly cap.
+
 ## Tailscale Funnel Stable URL
 
 Tailscale Funnel is the simplest stable URL when you already use Tailscale and do not want to buy or manage a custom domain. Least publishes your local MCP server on your device's MagicDNS name:

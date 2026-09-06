@@ -10,6 +10,7 @@ import { createHttpAuthMiddleware } from "./httpAuth.js";
 import { mountOpenAiRoutes } from "./openaiRoutes.js";
 import { mountGrokOAuthRoutes } from "./oauthRoutes.js";
 import { startDashboardServer } from "./dashboardServer.js";
+import { McpSessionStore } from "./mcpSessionStore.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -346,17 +347,42 @@ async function main(): Promise<void> {
   }
 
   function mountMcpSurface(surfaceConfig: McpSurfaceMount): void {
-    const transports = new Map<string, TransportRecord>();
+    type LiveRecord = TransportRecord & {
+      lockOwnerId: string;
+      failCount: number;
+    };
+
+    const transports = new Map<string, LiveRecord>();
+    const durable = config.httpSessionDurable ? new McpSessionStore(surfaceConfig.path) : null;
     let lastPrunedAt = 0;
     let recentSessionId: string | undefined;
     let recentTransport: StreamableHTTPServerTransport | undefined;
 
-    function closeTransport(record: TransportRecord): void {
-      void record.transport.close?.();
+    function logSession(message: string): void {
+      if (
+        process.env.LEAST_LOG_REQUESTS === "1" ||
+        process.env.LEAST_LOG_SESSION_RESUME === "1" ||
+        process.env.LEAST_LOG_SESSION === "1"
+      ) {
+        console.error(`[Least] ${message}`);
+      }
     }
 
-    function oldestTransportEntry(): [string, TransportRecord] | undefined {
-      let oldest: [string, TransportRecord] | undefined;
+    function closeTransport(record: TransportRecord): void {
+      void record.transport.close?.().catch?.(() => undefined);
+    }
+
+    function forgetLive(sessionId: string | undefined): void {
+      if (!sessionId) return;
+      transports.delete(sessionId);
+      if (recentSessionId === sessionId) {
+        recentSessionId = undefined;
+        recentTransport = undefined;
+      }
+    }
+
+    function oldestTransportEntry(): [string, LiveRecord] | undefined {
+      let oldest: [string, LiveRecord] | undefined;
       for (const entry of transports) {
         if (!oldest || entry[1].lastSeenAt < oldest[1].lastSeenAt) {
           oldest = entry;
@@ -367,52 +393,236 @@ async function main(): Promise<void> {
 
     function pruneTransports(force = false): void {
       const now = Date.now();
-      if (!force && now - lastPrunedAt < Math.min(5_000, Math.max(1_000, Math.floor(config.httpSessionTtlMs / 4))) && transports.size < config.maxHttpSessions) {
+      if (
+        !force &&
+        now - lastPrunedAt < Math.min(5_000, Math.max(1_000, Math.floor(config.httpSessionTtlMs / 4))) &&
+        transports.size < config.maxHttpSessions
+      ) {
         return;
       }
       lastPrunedAt = now;
+      // Drop idle in-memory transports only. Durable metadata stays so clients can resume.
       for (const [sessionId, record] of transports) {
         if (now - record.lastSeenAt > config.httpSessionTtlMs) {
-          transports.delete(sessionId);
-          if (recentSessionId === sessionId) {
-            recentSessionId = undefined;
-            recentTransport = undefined;
-          }
+          forgetLive(sessionId);
           closeTransport(record);
         }
       }
       while (transports.size > config.maxHttpSessions) {
         const oldest = oldestTransportEntry();
         if (!oldest) break;
-        transports.delete(oldest[0]);
-        if (recentSessionId === oldest[0]) {
-          recentSessionId = undefined;
-          recentTransport = undefined;
-        }
+        forgetLive(oldest[0]);
         closeTransport(oldest[1]);
       }
+      durable?.prune(config.httpSessionMetaTtlMs);
+      durable?.flush();
     }
 
-    function getTransport(sessionId: string | undefined): StreamableHTTPServerTransport | undefined {
+    function getLive(sessionId: string | undefined): LiveRecord | undefined {
       if (!sessionId || !sessionIdPattern.test(sessionId)) return undefined;
-      if (recentSessionId === sessionId && recentTransport) {
-        const recent = transports.get(sessionId);
-        if (recent) {
-          recent.lastSeenAt = Date.now();
-          return recentTransport;
-        }
-      }
       pruneTransports(false);
       const record = transports.get(sessionId);
       if (!record) return undefined;
       record.lastSeenAt = Date.now();
+      durable?.touch(sessionId);
       recentSessionId = sessionId;
       recentTransport = record.transport;
-      return record.transport;
+      return record;
+    }
+
+    /**
+     * Mark a freshly created Streamable HTTP transport as already initialized so
+     * tools/call and tools/list work after a silent session drop (restart, TTL, Funnel blip).
+     */
+    function markTransportInitialized(transport: StreamableHTTPServerTransport, sessionId: string): void {
+      const web = (
+        transport as unknown as {
+          _webStandardTransport?: { sessionId?: string; _initialized?: boolean; _streamMapping?: Map<string, unknown> };
+        }
+      )._webStandardTransport;
+      if (web) {
+        web.sessionId = sessionId;
+        web._initialized = true;
+        // Clear any half-open SSE stream maps so a new GET cannot 409 after Funnel drops.
+        web._streamMapping?.clear?.();
+      }
+    }
+
+    function defaultLockOwner(sessionId: string): string {
+      return [
+        "http",
+        surfaceConfig.path,
+        surfaceConfig.surface,
+        surfaceConfig.authMode,
+        "durable",
+        sessionId.slice(0, 8)
+      ].join(":");
+    }
+
+    async function createBoundTransport(options: {
+      sessionId: string;
+      lockOwnerId: string;
+      resumed: boolean;
+    }): Promise<LiveRecord> {
+      // Replace any poisoned live transport for this id.
+      const previous = transports.get(options.sessionId);
+      if (previous) {
+        forgetLive(options.sessionId);
+        closeTransport(previous);
+      }
+
+      const sessionRef: { current: SessionContext } = {
+        current: {
+          sessionId: options.sessionId,
+          lockOwnerId: options.lockOwnerId,
+          surface: surfaceConfig.surface
+        }
+      };
+
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionRef.current.sessionId,
+        // JSON responses avoid long-lived SSE for each tool call (Funnel-friendly).
+        enableJsonResponse: config.httpJsonResponse,
+        // Hint clients to retry SSE after brief Funnel blips.
+        retryInterval: 3_000,
+        onsessioninitialized: (newSessionId: string) => {
+          sessionRef.current = {
+            sessionId: newSessionId,
+            lockOwnerId: options.lockOwnerId,
+            surface: surfaceConfig.surface
+          };
+          const now = Date.now();
+          const record: LiveRecord = {
+            transport,
+            createdAt: now,
+            lastSeenAt: now,
+            lockOwnerId: options.lockOwnerId,
+            failCount: 0
+          };
+          pruneTransports(true);
+          transports.set(newSessionId, record);
+          recentSessionId = newSessionId;
+          recentTransport = transport;
+          durable?.upsert({
+            sessionId: newSessionId,
+            lockOwnerId: options.lockOwnerId,
+            surfacePath: surfaceConfig.path
+          });
+          durable?.flush();
+          pruneTransports(true);
+        }
+      } as any);
+
+      // Never delete the live map on stream close — only TTL prune or explicit DELETE.
+      (transport as any).onclose = () => {
+        /* keep session identity alive for multi-request reuse / resume */
+      };
+
+      const { server } = createLeastServer(config, {
+        surface: surfaceConfig.surface,
+        authMode: surfaceConfig.authMode,
+        sessionContext: { get: () => sessionRef.current }
+      });
+      await server.connect(transport);
+
+      const now = Date.now();
+      if (options.resumed) {
+        markTransportInitialized(transport, options.sessionId);
+      }
+
+      const record: LiveRecord = {
+        transport,
+        createdAt: now,
+        lastSeenAt: now,
+        lockOwnerId: options.lockOwnerId,
+        failCount: 0
+      };
+      // For initialize (resumed=false), onsessioninitialized will also set the map when the body is handled.
+      // Still register early so concurrent requests with the same id can attach.
+      transports.set(options.sessionId, record);
+      recentSessionId = options.sessionId;
+      recentTransport = transport;
+      durable?.upsert({
+        sessionId: options.sessionId,
+        lockOwnerId: options.lockOwnerId,
+        surfacePath: surfaceConfig.path
+      });
+      if (options.resumed) {
+        logSession(`Resumed MCP session ${options.sessionId} on ${surfaceConfig.path}`);
+      }
+      return record;
+    }
+
+    async function ensureSession(options: {
+      sessionId: string;
+      lockOwnerId?: string;
+      forceNew?: boolean;
+      reason: string;
+    }): Promise<LiveRecord> {
+      if (!options.forceNew) {
+        const live = getLive(options.sessionId);
+        if (live) return live;
+      }
+      const durableHit = durable?.get(options.sessionId);
+      const lockOwnerId =
+        options.lockOwnerId || durableHit?.lockOwnerId || defaultLockOwner(options.sessionId);
+      logSession(`Ensure session ${options.sessionId} (${options.reason}) on ${surfaceConfig.path}`);
+      return createBoundTransport({
+        sessionId: options.sessionId,
+        lockOwnerId,
+        resumed: true
+      });
+    }
+
+    async function handleWithHeal(
+      sessionId: string | undefined,
+      res: express.Response,
+      run: (transport: StreamableHTTPServerTransport) => Promise<void>
+    ): Promise<void> {
+      const firstId = sessionId && sessionIdPattern.test(sessionId) ? sessionId : undefined;
+      let record =
+        (firstId ? getLive(firstId) : undefined) ||
+        (firstId && config.httpSessionResume
+          ? await ensureSession({ sessionId: firstId, reason: "missing-live" })
+          : undefined);
+      if (!record) {
+        throw new Error("missing transport");
+      }
+      try {
+        await run(record.transport);
+        record.failCount = 0;
+        record.lastSeenAt = Date.now();
+        durable?.touch(record.transport.sessionId || firstId || "");
+      } catch (error) {
+        // Transport often goes bad after Funnel/SSE drops — rebuild once and retry.
+        if (!firstId || !config.httpSessionResume || record.failCount >= 1 || res.headersSent) {
+          throw error;
+        }
+        record.failCount += 1;
+        logSession(
+          `Healing MCP session ${firstId} after transport error: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+        record = await ensureSession({
+          sessionId: firstId,
+          lockOwnerId: record.lockOwnerId,
+          forceNew: true,
+          reason: "heal-retry"
+        });
+        await run(record.transport);
+        record.failCount = 0;
+      }
     }
 
     const pruneTimer = setInterval(pruneTransports, Math.min(config.httpSessionTtlMs, 60_000));
     pruneTimer.unref();
+    // Periodic durable flush / meta prune
+    const durableTimer = setInterval(() => {
+      durable?.prune(config.httpSessionMetaTtlMs);
+      durable?.flush();
+    }, 60_000);
+    durableTimer.unref();
 
     const routeAuth = createHttpAuthMiddleware(config, {
       surface: surfaceConfig.surface,
@@ -421,60 +631,58 @@ async function main(): Promise<void> {
 
     app.post(surfaceConfig.path, routeAuth, async (req, res) => {
       try {
-        const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        let transport: StreamableHTTPServerTransport;
+        const sessionIdHeader = req.headers["mcp-session-id"];
+        const sessionId = typeof sessionIdHeader === "string" ? sessionIdHeader : undefined;
 
-        const existingTransport = getTransport(sessionId);
-        if (existingTransport) {
-          transport = existingTransport;
-        } else if (!sessionId && isInitializeRequest(req.body)) {
+        if (isInitializeRequest(req.body)) {
           const lockOwnerId = lockOwnerIdFromInitialize(req.body, surfaceConfig);
-          const sessionRef: { current: SessionContext } = {
-            current: { sessionId: randomUUID(), lockOwnerId, surface: surfaceConfig.surface }
-          };
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => sessionRef.current.sessionId,
-            onsessioninitialized: (newSessionId: string) => {
-              sessionRef.current = { sessionId: newSessionId, lockOwnerId, surface: surfaceConfig.surface };
-              pruneTransports(true);
-              transports.set(newSessionId, {
-                transport,
-                createdAt: Date.now(),
-                lastSeenAt: Date.now()
-              });
-              recentSessionId = newSessionId;
-              recentTransport = transport;
-              pruneTransports(true);
-            }
-          } as any);
-
-          (transport as any).onclose = () => {
-            const closedSessionId = (transport as any).sessionId;
-            if (closedSessionId) {
-              transports.delete(closedSessionId);
-              if (recentSessionId === closedSessionId) {
-                recentSessionId = undefined;
-                recentTransport = undefined;
-              }
-            }
-          };
-
-          const { server } = createLeastServer(config, {
-            surface: surfaceConfig.surface,
-            authMode: surfaceConfig.authMode,
-            sessionContext: { get: () => sessionRef.current }
+          const preferredId =
+            sessionId && sessionIdPattern.test(sessionId) ? sessionId : randomUUID();
+          // Always start initialize on a clean transport for this id.
+          const record = await createBoundTransport({
+            sessionId: preferredId,
+            lockOwnerId,
+            resumed: false
           });
-          await server.connect(transport);
-        } else {
+          await record.transport.handleRequest(req, res, req.body);
+          record.lastSeenAt = Date.now();
+          durable?.upsert({
+            sessionId: preferredId,
+            lockOwnerId,
+            surfacePath: surfaceConfig.path
+          });
+          durable?.flush();
+          return;
+        }
+
+        if (!sessionId || !sessionIdPattern.test(sessionId)) {
           res.status(400).json({
             jsonrpc: "2.0",
-            error: { code: -32000, message: "Bad Request: missing or invalid MCP session id" },
+            error: {
+              code: -32000,
+              message:
+                "Bad Request: missing or invalid MCP session id. Open a new chat or re-initialize the connector."
+            },
             id: null
           });
           return;
         }
 
-        await transport.handleRequest(req, res, req.body);
+        if (!config.httpSessionResume && !getLive(sessionId) && !durable?.get(sessionId)) {
+          res.status(400).json({
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message: "Bad Request: MCP session not found and resume is disabled."
+            },
+            id: null
+          });
+          return;
+        }
+
+        await handleWithHeal(sessionId, res, async (transport) => {
+          await transport.handleRequest(req, res, req.body);
+        });
       } catch (error) {
         console.error(error);
         if (!res.headersSent) {
@@ -488,13 +696,70 @@ async function main(): Promise<void> {
     });
 
     const handleSessionRequest = async (req: express.Request, res: express.Response) => {
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
-      const transport = getTransport(sessionId);
-      if (!transport) {
+      const sessionIdHeader = req.headers["mcp-session-id"];
+      const sessionId = typeof sessionIdHeader === "string" ? sessionIdHeader : undefined;
+
+      if (!sessionId || !sessionIdPattern.test(sessionId)) {
         res.status(400).send("Invalid or missing MCP session id");
         return;
       }
-      await transport.handleRequest(req, res);
+
+      if (req.method === "DELETE") {
+        const live = getLive(sessionId);
+        if (live) {
+          try {
+            await live.transport.handleRequest(req, res);
+          } catch {
+            if (!res.headersSent) res.status(200).end();
+          }
+          forgetLive(sessionId);
+          closeTransport(live);
+        } else if (!res.headersSent) {
+          res.status(200).end();
+        }
+        // Keep durable metadata by default so a flaky client DELETE cannot brick the chat.
+        // Hard delete only when explicitly requested.
+        if (process.env.LEAST_HTTP_SESSION_HARD_DELETE === "1") {
+          durable?.delete(sessionId);
+          durable?.flush();
+        }
+        return;
+      }
+
+      // GET SSE: always prefer a healthy transport; force new if previous stream was poisoned.
+      try {
+        let record = getLive(sessionId);
+        if (!record && config.httpSessionResume) {
+          record = await ensureSession({ sessionId, reason: "get-resume" });
+        }
+        if (!record) {
+          res.status(400).send("Invalid or missing MCP session id");
+          return;
+        }
+        try {
+          await record.transport.handleRequest(req, res);
+          record.lastSeenAt = Date.now();
+          durable?.touch(sessionId);
+        } catch (error) {
+          logSession(
+            `Recreating SSE transport for ${sessionId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+          record = await ensureSession({
+            sessionId,
+            lockOwnerId: record.lockOwnerId,
+            forceNew: true,
+            reason: "get-heal"
+          });
+          await record.transport.handleRequest(req, res);
+        }
+      } catch (error) {
+        console.error(error);
+        if (!res.headersSent) {
+          res.status(500).send(error instanceof Error ? error.message : String(error));
+        }
+      }
     };
 
     app.get(surfaceConfig.path, routeAuth, handleSessionRequest);
@@ -549,7 +814,7 @@ async function main(): Promise<void> {
     mountOpenAiRoutes(app, config, registry);
   }
 
-  app.listen(config.port, config.host, () => {
+  const server = app.listen(config.port, config.host, () => {
     console.error(`[Least] HTTP protocols: ${config.httpProtocols.join(", ")}`);
     if (config.httpProtocols.includes("mcp")) {
       if (config.dualClient) {
@@ -558,6 +823,11 @@ async function main(): Promise<void> {
       } else {
         console.error(`[Least] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
       }
+      console.error(
+        `[Least] MCP durability: resume=${config.httpSessionResume ? "on" : "off"} durable=${
+          config.httpSessionDurable ? "on" : "off"
+        } jsonResponse=${config.httpJsonResponse ? "on" : "off"} sessionTtlMs=${config.httpSessionTtlMs}`
+      );
     }
     if (config.httpProtocols.includes("openai")) {
       console.error(
@@ -575,6 +845,12 @@ async function main(): Promise<void> {
       console.error(`[Least] Dashboard failed to start: ${err.message}`);
     });
   });
+
+  // Long-lived MCP + Funnel: avoid premature socket kills during model think time / tool runs.
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
+  // Node 18+: requestTimeout 0 = no hard request timeout (tools may run a while).
+  (server as typeof server & { requestTimeout?: number }).requestTimeout = 0;
 }
 
 main().catch((error) => {

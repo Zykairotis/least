@@ -144,6 +144,20 @@ Yes, with `--dual-client` on a public HTTPS tunnel (Tailscale Funnel, Cloudflare
 
 Both clients point at the same workspace and share the same Least bearer token. If both edit files at the same time, resolve conflicts in git like any other multi-editor workflow.
 
+## ChatGPT says nitz connection failed but the connector still lists tools
+
+That is usually public DNS, not a bad `open_current_workspace` call. Cloudflare's resolver (`1.1.1.1`) often returns NXDOMAIN for Tailscale Funnel `*.ts.net` names. ChatGPT still has a cached tool schema from an earlier handshake.
+
+Keep Tailscale for your own machines. Point ChatGPT at a hostname Cloudflare can resolve:
+
+```bash
+npx wrangler login
+least relay-deploy
+least start --tunnel workers-relay
+```
+
+Or use an ngrok reserved domain / a Cloudflare named tunnel on a domain you own. After changing the ChatGPT Server URL, open a new chat.
+
 ## Can I use the same ChatGPT app URL every day?
 
 Yes, if you use a stable hostname.

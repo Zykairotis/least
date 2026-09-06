@@ -213,12 +213,28 @@ export interface RunHooksOptions {
   failClosed?: boolean;
 }
 
+function shouldEnforceHooksInYolo(
+  settings: LoadedSettings | null,
+  event: HookEvent,
+  toolName?: string
+): boolean {
+  // Default ON: safety hooks still block under --yolo (agent-browser ok, rm -rf / not).
+  const enforce = settings?.effective?.hooks?.enforceInYolo;
+  if (enforce === false) return false;
+  if (event === "PreBash") return true;
+  if (event === "PreToolUse" && (toolName === "bash" || toolName === "Bash")) return true;
+  // Other pre-mutation hooks also stay hard by default.
+  if (event === "PreWrite" || event === "PreEdit") return true;
+  return false;
+}
+
 export async function runHooks(
   settings: LoadedSettings | null,
   workspaceRoot: string,
   options: RunHooksOptions
 ): Promise<HookResult[]> {
   const { event, toolName, toolInput, workspace, context, failClosed = true, yoloMode = false } = options;
+  const yoloBypassAllowed = yoloMode && !shouldEnforceHooksInYolo(settings, event, toolName);
 
   const specs = getHooksForEvent(event, settings, workspaceRoot, toolName);
   if (specs.length === 0) return [];
@@ -228,7 +244,7 @@ export async function runHooks(
     kind: "hook:start",
     toolName,
     level: "info",
-    payload: { event, hookCount: specs.length }
+    payload: { event, hookCount: specs.length, yoloBypassAllowed }
   });
 
   const payload: HookPayload = {
@@ -249,10 +265,10 @@ export async function runHooks(
         event,
         toolName,
         trusted: false,
-        decision: failClosed && !yoloMode ? "deny" : "allow",
+        decision: failClosed && !yoloBypassAllowed ? "deny" : "allow",
         reason: trust.reason ?? "Hook not trusted."
       });
-      if (failClosed && !yoloMode) {
+      if (failClosed && !yoloBypassAllowed) {
         emitDashboardEvent({
           kind: "hook:end",
           toolName,
@@ -286,13 +302,13 @@ export async function runHooks(
   }));
 
   const denied = executed.find((result) => result.decision === "deny" || result.decision === "error");
-  if (denied && failClosed && !yoloMode) {
+  if (denied && failClosed && !yoloBypassAllowed) {
     emitDashboardEvent({
       kind: "hook:end",
       toolName,
       level: denied.decision === "error" ? "error" : "warn",
       durationMs: Date.now() - batchStarted,
-      payload: { event, decisions: [denied.decision], reason: denied.reason }
+      payload: { event, decisions: [denied.decision], reason: denied.reason, enforcedInYolo: yoloMode }
     });
     return [denied];
   }

@@ -5,11 +5,21 @@ import fs from "node:fs";
 import url from "node:url";
 import type { LeastConfig } from "./config.js";
 import type { DashboardEvent } from "./dashboardTypes.js";
-import { subscribeDashboardEvents, getDashboardEventsSince } from "./dashboardEvents.js";
+import {
+  subscribeDashboardEvents,
+  getDashboardEventsSince,
+  getRecentDashboardEvents,
+  getTimelineHistory,
+  hydrateDashboardEventsFromStore,
+  setDashboardMaxEvents,
+  setDashboardHistoryMaxAgeMs
+} from "./dashboardEvents.js";
 import { buildDashboardSnapshot, setDashboardConfig, setDashboardStarted, setDashboardClientCount, setDashboardStreaming, updateGitSnapshot } from "./dashboardSnapshot.js";
 import { createDashboardAuthMiddleware } from "./dashboardAuth.js";
 import * as dashboardStore from "./dashboardStore.js";
 import type { PerfWindowName } from "./perf.js";
+
+const TIMELINE_HISTORY_MS = 3 * 24 * 60 * 60 * 1000;
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const DIST_DIR = path.resolve(__dirname, "..", "dist", "dashboard");
@@ -34,7 +44,24 @@ export async function startDashboardServer(config: LeastConfig): Promise<http.Se
   setDashboardConfig(config);
   setDashboardStarted();
   setDashboardMaxEvents(config.dashboardMaxEvents);
+  setDashboardHistoryMaxAgeMs(TIMELINE_HISTORY_MS);
   dashboardStore.initDashboardStore(config.dashboardDbPath || ".least/dashboard.db");
+  const hydrated = hydrateDashboardEventsFromStore({
+    maxAgeMs: TIMELINE_HISTORY_MS,
+    limit: Math.min(config.dashboardMaxEvents, dashboardStore.DEFAULT_TIMELINE_HYDRATE_LIMIT)
+  });
+  if (hydrated > 0) {
+    console.error(`[Least] Dashboard timeline hydrated ${hydrated} events from SQLite (≤3 days)`);
+  }
+  // Periodic prune so the DB never grows past the retention window.
+  const pruneTimer = setInterval(() => {
+    try {
+      dashboardStore.pruneDashboardHistory(TIMELINE_HISTORY_MS);
+    } catch {
+      // best-effort
+    }
+  }, 60 * 60 * 1000);
+  pruneTimer.unref?.();
 
   const app = express();
   const auth = createDashboardAuthMiddleware(config);
@@ -51,7 +78,40 @@ export async function startDashboardServer(config: LeastConfig): Promise<http.Se
   api.get("/snapshot", (req: any, res: any) => {
     const windowName = (req.query.window as PerfWindowName) ?? "session";
     const snapshot = buildDashboardSnapshot(200, windowName);
-    res.json({ ok: true, ...snapshot });
+    // Seed timeline on refresh from SQLite-backed history (not just this process's live ring).
+    const recentEvents = getTimelineHistory(Math.min(config.dashboardMaxEvents, 5_000));
+    res.json({
+      ok: true,
+      ...snapshot,
+      recentEvents,
+      history: {
+        maxAgeMs: TIMELINE_HISTORY_MS,
+        maxAgeDays: 3,
+        eventCount: recentEvents.length,
+        dbPath: dashboardStore.getDashboardStorePath()
+      }
+    });
+  });
+
+  api.get("/timeline", (req: any, res: any) => {
+    const limitRaw = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : 5_000;
+    const sinceRaw = typeof req.query.since === "string" ? Number.parseInt(req.query.since, 10) : 0;
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 20_000)) : 5_000;
+    const sinceId = Number.isFinite(sinceRaw) && sinceRaw > 0 ? sinceRaw : 0;
+    const events =
+      sinceId > 0
+        ? getDashboardEventsSince(sinceId, limit)
+        : getTimelineHistory(limit);
+    res.json({
+      ok: true,
+      events,
+      history: {
+        maxAgeMs: TIMELINE_HISTORY_MS,
+        maxAgeDays: 3,
+        eventCount: events.length,
+        dbPath: dashboardStore.getDashboardStorePath()
+      }
+    });
   });
 
   api.get("/config", (_req: any, res: any) => {
@@ -113,11 +173,24 @@ export async function startDashboardServer(config: LeastConfig): Promise<http.Se
         : 0;
 
     const snapshot = buildDashboardSnapshot(200);
-    sendSSE(res, "snapshot", { ok: true, ...snapshot });
-    if (sinceId > 0) {
-      const backlog = getDashboardEventsSince(sinceId);
-      for (const event of backlog) sendSSE(res, "dashboard", event, event.id);
-    }
+    const recentEvents = getTimelineHistory(Math.min(config.dashboardMaxEvents, 5_000));
+    sendSSE(res, "snapshot", {
+      ok: true,
+      ...snapshot,
+      recentEvents,
+      history: {
+        maxAgeMs: TIMELINE_HISTORY_MS,
+        maxAgeDays: 3,
+        eventCount: recentEvents.length,
+        dbPath: dashboardStore.getDashboardStorePath()
+      }
+    });
+    // Always replay backlog so a browser refresh still paints the timeline.
+    const backlog =
+      sinceId > 0
+        ? getDashboardEventsSince(sinceId)
+        : getRecentDashboardEvents(Math.min(config.dashboardMaxEvents, 5_000));
+    for (const event of backlog) sendSSE(res, "dashboard", event, event.id);
     _connectedClients.add(clientId);
     setDashboardClientCount(_connectedClients.size);
     setDashboardStreaming(true);
@@ -182,10 +255,6 @@ function ensureGitPolling(config: LeastConfig): void {
 
 function stopGitPolling(): void {
   if (_gitInterval) { clearInterval(_gitInterval); _gitInterval = undefined; }
-}
-
-function setDashboardMaxEvents(n: number): void {
-  import("./dashboardEvents.js").then((mod) => mod.setDashboardMaxEvents(n)).catch(() => {});
 }
 
 const BUILD_ERROR_HTML = `<!doctype html>

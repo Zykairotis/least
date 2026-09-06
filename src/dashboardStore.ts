@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS agent_terminal_sessions (
   metadata_json TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_log_events_session_started ON log_events(session_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_log_events_started_at ON log_events(started_at);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session_started ON tool_calls(session_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_task_id ON agent_jobs(task_id);
@@ -111,7 +112,14 @@ CREATE INDEX IF NOT EXISTS idx_agent_terminal_sessions_backend ON agent_terminal
   ensureAgentJobColumn("idempotency_key", "TEXT NULL");
   ensureAgentJobColumn("launch_phase", "TEXT NULL");
   ensureAgentJobColumn("launch_error", "TEXT NULL");
+  // Keep timeline history bounded (default 3 days).
+  pruneDashboardHistory(DEFAULT_HISTORY_MAX_AGE_MS);
 }
+
+/** Default timeline retention window. */
+export const DEFAULT_HISTORY_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
+/** Cap rows returned for UI hydration (memory + payload size). */
+export const DEFAULT_TIMELINE_HYDRATE_LIMIT = 8_000;
 
 export function getDashboardStorePath(): string | undefined {
   return dbFile;
@@ -230,6 +238,131 @@ export function listStoredSessionEvents(sessionId: string, limit = 500): unknown
   flushDashboardEvents();
   if (!db) return [];
   return db.prepare("SELECT * FROM log_events WHERE session_id = ? ORDER BY started_at ASC LIMIT ?").all(sessionId, limit);
+}
+
+function parseJsonObject(raw: unknown): Record<string, unknown> | undefined {
+  if (raw == null) return undefined;
+  if (typeof raw === "object" && !Array.isArray(raw)) return raw as Record<string, unknown>;
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+function rowToDashboardEvent(row: Record<string, unknown>): DashboardEvent | null {
+  const idNum = Number(row.id);
+  if (!Number.isFinite(idNum) || idNum <= 0) return null;
+  const kind = typeof row.event_type === "string" ? row.event_type : "";
+  if (!kind) return null;
+  const meta = parseJsonObject(row.metadata_json) ?? {};
+  const payloadFromMeta = parseJsonObject(meta.payload);
+  const surfaceRaw = meta.surface;
+  const surface =
+    surfaceRaw === "chatgpt" || surfaceRaw === "grok" || surfaceRaw === "openai" || surfaceRaw === "dashboard"
+      ? surfaceRaw
+      : undefined;
+  const levelRaw = typeof row.level === "string" ? row.level : undefined;
+  const level =
+    levelRaw === "debug" || levelRaw === "info" || levelRaw === "warn" || levelRaw === "error"
+      ? levelRaw
+      : undefined;
+  return {
+    id: idNum,
+    ts: typeof row.started_at === "string" ? row.started_at : new Date().toISOString(),
+    kind: kind as DashboardEvent["kind"],
+    workspaceId: typeof meta.workspaceId === "string" ? meta.workspaceId : undefined,
+    sessionId: typeof row.session_id === "string" ? row.session_id : undefined,
+    surface,
+    toolName: typeof meta.toolName === "string" ? meta.toolName : undefined,
+    level,
+    durationMs: typeof row.duration_ms === "number" ? row.duration_ms : undefined,
+    payload: payloadFromMeta
+  };
+}
+
+/**
+ * Load timeline events from SQLite for the last maxAgeMs (default 3 days),
+ * ordered ascending by id/time for ring-buffer hydration and UI seed.
+ */
+export function listTimelineDashboardEvents(options: {
+  maxAgeMs?: number;
+  limit?: number;
+  sinceId?: number;
+} = {}): DashboardEvent[] {
+  flushDashboardEvents();
+  if (!db) return [];
+  const maxAgeMs = options.maxAgeMs ?? DEFAULT_HISTORY_MAX_AGE_MS;
+  const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_TIMELINE_HYDRATE_LIMIT, 50_000));
+  const sinceId = options.sinceId != null && Number.isFinite(options.sinceId) ? options.sinceId : 0;
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  try {
+    const rows = db
+      .prepare(
+        `SELECT id, session_id, event_type, level, message, started_at, duration_ms, metadata_json
+         FROM log_events
+         WHERE started_at >= ?
+           AND CAST(id AS INTEGER) > ?
+         ORDER BY CAST(id AS INTEGER) ASC
+         LIMIT ?`
+      )
+      .all(cutoff, sinceId, limit) as Record<string, unknown>[];
+    const out: DashboardEvent[] = [];
+    for (const row of rows) {
+      const event = rowToDashboardEvent(row);
+      if (event) out.push(event);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+export function getMaxStoredTimelineEventId(): number {
+  flushDashboardEvents();
+  if (!db) return 0;
+  try {
+    const row = db.prepare("SELECT MAX(CAST(id AS INTEGER)) AS max_id FROM log_events").get() as
+      | { max_id?: number | null }
+      | undefined;
+    const n = Number(row?.max_id ?? 0);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Delete timeline rows older than maxAgeMs. Returns approximate deleted event count. */
+export function pruneDashboardHistory(maxAgeMs = DEFAULT_HISTORY_MAX_AGE_MS): number {
+  if (!db) return 0;
+  flushDashboardEvents();
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  try {
+    db.exec("BEGIN");
+    const before = db.prepare("SELECT COUNT(*) AS c FROM log_events WHERE started_at < ?").get(cutoff) as {
+      c?: number;
+    };
+    db.prepare("DELETE FROM log_events WHERE started_at < ?").run(cutoff);
+    db.prepare("DELETE FROM tool_calls WHERE started_at < ?").run(cutoff);
+    // Drop sessions that no longer have events.
+    db.prepare(
+      `DELETE FROM log_sessions
+       WHERE id NOT IN (SELECT DISTINCT session_id FROM log_events)
+         AND started_at < ?`
+    ).run(cutoff);
+    db.exec("COMMIT");
+    return Number(before?.c ?? 0);
+  } catch {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // ignore
+    }
+    return 0;
+  }
 }
 
 export function listStoredToolCalls(sessionId: string, limit = 500): unknown[] {

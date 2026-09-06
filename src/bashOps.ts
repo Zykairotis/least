@@ -275,12 +275,54 @@ function isAllowedPackageScript(command: string): boolean {
   return packageScriptPattern.test(command);
 }
 
+/**
+ * Always-on destructive command blocks (even with --yolo / bash=full).
+ * Aligned with common Claude Code deny lists under ~/.claude/settings.json.
+ */
+const HARD_SAFETY_BLOCKED_PATTERNS: Array<{ re: RegExp; reason: string }> = [
+  { re: /(^|\s)rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)*(\/|\/\*|~\/\*|\~(\s|$)|\/etc|\/var|\/usr|\/boot|\/bin|\/sbin|\/lib|\/sys|\/proc|\/dev)/, reason: "recursive delete of system/home root paths" },
+  { re: /(^|\s)rm\s+.*\s\/\s*$/, reason: "rm targeting filesystem root" },
+  { re: /(^|\s)mkfs(\.|$|\s)/, reason: "filesystem format (mkfs)" },
+  { re: /(^|\s)dd\s+.*\bif=/, reason: "raw disk write via dd" },
+  { re: /(^|\s)dd\s+.*\bof=\/dev\//, reason: "raw write to /dev via dd" },
+  { re: /(^|\s)chmod\s+(-R\s+)?777\s+\/(\s|$)/, reason: "chmod 777 on filesystem root" },
+  { re: /(^|\s)chown\s+-R\b.*\s\/(\s|$)/, reason: "recursive chown of filesystem root" },
+  { re: /(^|\s)(sudo|su|doas)\s+/, reason: "privilege escalation" },
+  { re: /curl\b[^|\n]*\|\s*(ba)?sh\b/, reason: "pipe remote script into shell (curl|sh)" },
+  { re: /wget\b[^|\n]*\|\s*(ba)?sh\b/, reason: "pipe remote script into shell (wget|sh)" },
+  { re: /(^|\s)eval\s+/, reason: "eval of arbitrary code" },
+  { re: /(^|\s)git\s+reset\s+--hard\b/, reason: "destructive git reset --hard" },
+  { re: /(^|\s)git\s+push\s+.*--force\b/, reason: "force push" },
+  { re: /(^|\s)git\s+push\s+.*-f(\s|$)/, reason: "force push (-f)" },
+  { re: /(^|\s)git\s+clean\s+-[a-zA-Z]*f/, reason: "destructive git clean -f" },
+  { re: /:\(\)\s*\{\s*:\|:&\s*\};:/, reason: "fork bomb" },
+  { re: /(^|\s)shutdown\b|(^|\s)reboot\b|(^|\s)poweroff\b|(^|\s)halt\b/, reason: "system power control" },
+  { re: /(^|\s)mkfs\.|(^|\s)wipefs\b|(^|\s)parted\b.*rm\b/, reason: "disk destruction utilities" },
+  { re: />\s*\/dev\/sd[a-z]/, reason: "redirect into block device" }
+];
+
+function assertHardSafety(command: string): void {
+  const normalized = compact(command);
+  for (const { re, reason } of HARD_SAFETY_BLOCKED_PATTERNS) {
+    if (re.test(normalized)) {
+      throw new LeastError(
+        `Command blocked by hard safety policy (${reason}): ${normalized}\n` +
+          "This check applies even with --yolo / LEAST_BASH_MODE=full. " +
+          "Inspired by Claude Code deny rules (rm -rf /, mkfs, dd, curl|sh, force push, etc.)."
+      );
+    }
+  }
+}
+
 function assertSafeCommand(config: LeastConfig, command: string): void {
   if (config.bashMode === "off") {
     throw new LeastError(
       "bash tool is disabled. Start with LEAST_BASH_MODE=safe, LEAST_BASH_MODE=readonly, or LEAST_BASH_MODE=full to enable it."
     );
   }
+  // Always-on floor — yolo opens the allowlist, not nuclear options.
+  assertHardSafety(command);
+
   const effectiveMode = config.yoloMode ? "full" : config.bashMode;
   if (effectiveMode === "full") return;
 

@@ -107,6 +107,14 @@ export interface DashboardSnapshot {
     latestEventId: number;
     eventCount: number;
   };
+  /** SQLite-backed timeline seed (last ≤3 days). Present after server hydrate. */
+  recentEvents?: DashboardEvent[];
+  history?: {
+    maxAgeMs: number;
+    maxAgeDays: number;
+    eventCount: number;
+    dbPath?: string;
+  };
 }
 
 export interface DashboardEvent {
@@ -169,6 +177,21 @@ export async function fetchSnapshot(): Promise<DashboardSnapshot> {
   const res = await fetch("/api/snapshot", { cache: "no-store" });
   if (!res.ok) {
     throw new Error(`Snapshot failed: HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Explicit timeline history from SQLite (last 3 days). */
+export async function fetchTimeline(limit = 5000, sinceId = 0): Promise<{
+  events: DashboardEvent[];
+  history?: DashboardSnapshot["history"];
+}> {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  if (sinceId > 0) params.set("since", String(sinceId));
+  const res = await fetch(`/api/timeline?${params.toString()}`, { cache: "no-store" });
+  if (!res.ok) {
+    throw new Error(`Timeline failed: HTTP ${res.status}`);
   }
   return res.json();
 }

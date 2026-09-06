@@ -29,6 +29,7 @@ export default function App() {
     error,
     eventRate,
     refreshSnapshot,
+    historyDays,
   } = useLiveDashboard(refreshIntervalMs);
 
   const totals = useMemo(() => {
@@ -101,7 +102,7 @@ export default function App() {
       case "timeline":
         return (
           <div className="page">
-            <TimelinePanel events={events} connected={connected} />
+            <TimelinePanel events={events} connected={connected} historyDays={historyDays} />
           </div>
         );
       case "hooks":

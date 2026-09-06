@@ -166,7 +166,7 @@ const unsupportedResult = runSync([
   '--tunnel', 'not-a-tunnel',
   '--no-profile'
 ], { ...process.env, LEAST_HOME: home });
-if (unsupportedResult.status === 0 || !unsupportedResult.stderr.includes('--tunnel must be none, cloudflare, cloudflare-named, ngrok, or tailscale-funnel')) {
+if (unsupportedResult.status === 0 || !unsupportedResult.stderr.includes('--tunnel must be none, cloudflare, cloudflare-named, ngrok, tailscale-funnel, or workers-relay')) {
   throw new Error(`unsupported tunnel validation did not fire\n${unsupportedResult.stdout}\n${unsupportedResult.stderr}`);
 }
 

@@ -1,0 +1,88 @@
+{
+  // Arch Linux harnesses launched as visible Agent Deck sessions.
+  "sessionManager": {
+    "kind": "agent-deck",
+    "executable": "/home/mewtwo/.local/bin/agent-deck",
+    "group": "Least",
+    "worktree": true,
+    "newBranch": true,
+    "noParent": true,
+    "titleLock": true,
+    "launchTimeoutMs": 120000
+  },
+  "groundcrew": {
+    "workspaceKind": "tmux",
+    "runner": "none"
+  },
+  "terminal": {
+    "preferredBackend": "tmux",
+    "logFallback": true
+  },
+  "agents": {
+    "codex": {
+      "provider": "codex",
+      "groundcrewProfile": "codex",
+      "cmd": "codex --yolo",
+      "promptVia": "interactive",
+      "defaultTimeoutMs": 3600000,
+      "idleTimeoutMs": 900000,
+      "writePolicy": "worktree",
+      "enabled": true,
+      "requiredExecutables": ["codex"],
+      "smokeArgs": ["--version"],
+      "dangerousFlags": ["--yolo"],
+      "allowDangerousFlags": true,
+      "notes": "Native Arch Codex harness. Agent Deck creates the isolated worktree before --yolo is used."
+    },
+    "piv-build": {
+      "provider": "custom",
+      "groundcrewProfile": "piv-build",
+      "cmd": "piv --piv-mode build --piv-allow-bash",
+      "promptVia": "interactive",
+      "defaultTimeoutMs": 3600000,
+      "idleTimeoutMs": 900000,
+      "writePolicy": "worktree",
+      "enabled": true,
+      "requiredExecutables": ["piv"],
+      "smokeArgs": ["--version"],
+      "notes": "Native Piv build harness. This intentionally invokes piv, never omp or pi."
+    },
+    "claude-code": {
+      "provider": "claude",
+      "groundcrewProfile": "claude-code",
+      "cmd": "claude",
+      "promptVia": "interactive",
+      "defaultTimeoutMs": 3600000,
+      "idleTimeoutMs": 900000,
+      "writePolicy": "worktree",
+      "enabled": true,
+      "requiredExecutables": ["claude"],
+      "smokeArgs": ["--version"],
+      "notes": "Native Claude Code interactive harness."
+    },
+    "grok-build": {
+      "provider": "grok",
+      "groundcrewProfile": "grok-build",
+      "cmd": "agent --yolo",
+      "promptVia": "interactive",
+      "defaultTimeoutMs": 7200000,
+      "idleTimeoutMs": 1200000,
+      "writePolicy": "worktree",
+      "enabled": true,
+      "requiredExecutables": ["agent"],
+      "smokeArgs": ["--version"],
+      "dangerousFlags": ["--yolo"],
+      "allowDangerousFlags": true,
+      "notes": "Native Grok Build harness. Agent Deck creates the isolated worktree before --yolo is used."
+    },
+    "codex-host": {
+      "enabled": false
+    },
+    "codex-wsl": {
+      "enabled": false
+    },
+    "oh-my-pi": {
+      "enabled": false
+    }
+  }
+}
